@@ -49,14 +49,18 @@ pub fn execute_buffer(
         match &packet {
             Packet::Type3 { opcode, .. } => {
                 stats.pending_type3 += 1;
+                let name = crate::pm4::lookup(*opcode)
+                    .map(|i| i.name)
+                    .unwrap_or("UNKNOWN");
                 log::warn!(
-                    "bridge: type3 {:02x} @{:08x} pending, skipping",
+                    "bridge: {} {:02x} @{:08x} pending, skipping",
+                    name,
                     opcode,
                     off
                 );
                 xenos.stats.unsupported += 1;
                 xenos.stats.last_unsupported =
-                    Some(format!("type3 {:02x} skipped by bridge", opcode));
+                    Some(format!("{} {:02x} skipped by bridge", name, opcode));
             }
             _ => xenos.dispatch(&packet)?,
         }

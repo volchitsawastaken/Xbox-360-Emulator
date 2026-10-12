@@ -77,7 +77,7 @@ mod integration {
         let mut gpu = x360_gpu::Xenos::new();
         assert!(gpu.decode_header(1u32 << 30, 0).is_err());
         // Type3 dispatch is pending-M5, never fake draw.
-        let header = (3u32 << 30) | ((0x12u32) << 8);
+        let header = (3u32 << 30) | ((0x22u32) << 8);
         let words = [header, 0];
         let (p, _) = gpu.decode_packet(&words, 0).unwrap();
         assert!(gpu.dispatch(&p).is_err());

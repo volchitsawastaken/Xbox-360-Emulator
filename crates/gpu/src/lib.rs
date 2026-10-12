@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use x360_common::{EmuError, Result};
 
 pub mod bridge;
+pub mod pm4;
 pub mod validation;
 
 /// Packet classes (PM4-style).
@@ -54,6 +55,8 @@ impl Xenos {
     /// Decode one packet from a real ringbuffer slice.
     /// `words[0]` is the header, following words are payload.
     /// Copies real payload values, never synthesizes zeros.
+    /// Type-0 layout per reference: `ttcccccc cccccccc oiiiiiii iiiiiiii`
+    /// (15-bit index, `o` = one-register flag).
     pub fn decode_packet(&mut self, words: &[u32], offset: u32) -> Result<(Packet, usize)> {
         if words.is_empty() {
             return Err(EmuError::UnimplementedGpuPacket("empty ringbuffer".into()));
@@ -63,7 +66,10 @@ impl Xenos {
         match ptype {
             0 => {
                 let count = (((word >> 16) & 0x3FFF) + 1) as usize;
-                let reg = (word & 0xFFFF) * 4;
+                // 15-bit index; bit 15 is the one-register flag.
+                let reg = (word & 0x7FFF) * 4;
+                let one_reg = word & 0x8000 != 0;
+                let count = if one_reg { 1 } else { count };
                 if words.len() < 1 + count {
                     return Err(EmuError::UnimplementedGpuPacket(format!(
                         "type0 truncated: need {} have {}",
@@ -135,6 +141,8 @@ impl Xenos {
     /// - Type0 applies register state (real work).
     /// - Type2 nop succeeds.
     /// - Type3 always reports pending-M5 until a real wgpu encoder exists.
+    ///   Known opcodes are named from the ported table; unknown bytes are
+    ///   reported as unknown rather than guessed.
     pub fn dispatch(&mut self, p: &Packet) -> Result<()> {
         match p {
             Packet::Type0 { reg, values } => {
@@ -145,8 +153,10 @@ impl Xenos {
             }
             Packet::Type2 { .. } => Ok(()),
             Packet::Type3 { opcode, payload } => {
+                let name = pm4::lookup(*opcode).map(|i| i.name).unwrap_or("UNKNOWN");
                 let msg = format!(
-                    "type3 opcode={:02x} len={} pending-M5 (no encoder yet)",
+                    "{} ({:02x}) len={} pending-M5 (no encoder yet)",
+                    name,
                     opcode,
                     payload.len()
                 );
@@ -242,12 +252,13 @@ mod tests {
         assert!(g.decode_header(word, 16).is_err());
     }
     #[test]
-    fn type3_is_pending_not_draw() {
+    fn type3_names_draw_opcodes() {
         let mut g = Xenos::new();
-        let header = (3u32 << 30) | ((0x12u32) << 8);
+        let header = (3u32 << 30) | ((0x22u32) << 8);
         let words = [header, 0];
         let (p, _) = g.decode_packet(&words, 0).unwrap();
-        assert!(g.dispatch(&p).is_err());
+        let err = g.dispatch(&p).unwrap_err().to_string();
+        assert!(err.contains("PM4_DRAW_INDX"), "names opcode: {}", err);
         assert_eq!(g.stats.draws, 0);
     }
     #[test]

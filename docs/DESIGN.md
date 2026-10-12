@@ -19,7 +19,10 @@
 - Prior work studied: Xenia (BSD) — PPC recompiler, Xenos Vulkan/D3D12
   translation, XAM HLE, XNet bridging to BSD sockets, Canary Netplay fork
   for System Link tunneling. This project does not reuse Xenia code;
-  architecture notes only.
+  architecture notes only. Format data ported with attribution:
+  XEX directory keys/model from `xex2_info.h`, PM4 Type-3 opcode table
+  from `xenos.h` (`gpu/src/pm4.rs`). Reference clone lives outside this
+  repo and is never compiled in.
 
 ## 2. Dependency assessment
 
