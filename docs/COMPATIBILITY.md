@@ -63,5 +63,6 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 |---|---|---|
 | Library launch + per-game config | partial | scan_library reads real FS; identify errors surfaced per-entry; labels state untested/playable explicitly |
 | Step execution | partial | Steps all 6 threads; syscall errors propagated to log/status; r0=id convention |
+| Boot loading screen | partial | Staged parse→map→gpu→run with progress + per-stage detail, all stages real; failures shown with dismiss |
 | Debugger disasm/regs/mem/breakpoints | partial | Backed by real CPU state; shown in UI (disasm@pc, regs, GPU stats) |
 | Compat indicators | partial | Labels say loads/not-verified; see matrix, no playable claims |

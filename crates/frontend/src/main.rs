@@ -14,6 +14,69 @@ pub struct GameEntry {
     pub status: String,
 }
 
+/// Staged boot state. Progress reflects completed real stages only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootStage {
+    Idle,
+    Parse,
+    Map,
+    GpuInit,
+    Run,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct BootSession {
+    pub stage: BootStage,
+    pub progress: f32,
+    pub detail: String,
+    pub exit_code: Option<u32>,
+}
+
+impl Default for BootSession {
+    fn default() -> Self {
+        Self::idle()
+    }
+}
+
+impl BootSession {
+    pub fn new() -> Self {
+        Self {
+            stage: BootStage::Parse,
+            progress: 0.0,
+            detail: "starting".into(),
+            exit_code: None,
+        }
+    }
+
+    pub fn idle() -> Self {
+        Self {
+            stage: BootStage::Idle,
+            progress: 0.0,
+            detail: String::new(),
+            exit_code: None,
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        !matches!(
+            self.stage,
+            BootStage::Idle | BootStage::Done | BootStage::Failed
+        )
+    }
+
+    fn advance(&mut self, next: BootStage, progress: f32) {
+        self.stage = next;
+        self.progress = progress;
+    }
+
+    fn fail(&mut self, msg: &str) {
+        self.stage = BootStage::Failed;
+        self.detail = msg.to_string();
+    }
+}
+
 pub struct EmuApp {
     pub cfg: EmuConfig,
     pub games: Vec<GameEntry>,
@@ -29,6 +92,7 @@ pub struct EmuApp {
     pub net_log: Vec<String>,
     pub active_thread: usize,
     pub lobby_endpoint_edit: String,
+    pub boot: BootSession,
 }
 
 impl EmuApp {
@@ -56,6 +120,7 @@ impl EmuApp {
             net_log: Vec::new(),
             active_thread: 0,
             lobby_endpoint_edit,
+            boot: BootSession::idle(),
         }
     }
 
@@ -141,6 +206,80 @@ impl EmuApp {
                 self.status_line = format!("boot failed: {}", e);
                 self.log_lines.push(self.status_line.clone());
                 Err(e)
+            }
+        }
+    }
+
+    /// Start a staged demo boot. Each `poll_boot` call performs one real
+    /// stage so the UI loading screen reflects actual work.
+    pub fn begin_boot_demo(&mut self) {
+        self.boot = BootSession::new();
+        self.kernel.console.clear();
+    }
+
+    /// Advance the staged boot by one stage. Returns true when terminal.
+    pub fn poll_boot(&mut self) -> bool {
+        use x360_kernel::boot::{demo_guest_words, run_until_exit};
+        const ENTRY: u32 = 0x8200_1000;
+        match self.boot.stage {
+            BootStage::Idle | BootStage::Done | BootStage::Failed => true,
+            BootStage::Parse => {
+                let words = demo_guest_words();
+                if words.is_empty() || !ENTRY.is_multiple_of(4) {
+                    self.boot.fail("demo guest empty or entry misaligned");
+                } else {
+                    self.boot.detail = format!("{} words, entry={:08x}", words.len(), ENTRY);
+                    self.boot.advance(BootStage::Map, 0.25);
+                }
+                false
+            }
+            BootStage::Map => {
+                let mut ok = true;
+                for (i, w) in demo_guest_words().iter().enumerate() {
+                    if let Err(e) = self.mem.write_u32(ENTRY + i as u32 * 4, *w) {
+                        self.boot.fail(&e.to_string());
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    self.xenon = x360_cpu::Xenon::new(ENTRY);
+                    self.boot.detail = "guest mapped".into();
+                    self.boot.advance(BootStage::GpuInit, 0.5);
+                }
+                false
+            }
+            BootStage::GpuInit => {
+                match x360_gpu::Xenos::validate_triangle() {
+                    Ok(true) => {
+                        self.boot.detail = "host GPU ok".into();
+                        self.boot.advance(BootStage::Run, 0.75);
+                    }
+                    Ok(false) => {
+                        self.boot.detail = "no adapter, continuing headless".into();
+                        self.boot.advance(BootStage::Run, 0.75);
+                    }
+                    Err(e) => self.boot.fail(&e.to_string()),
+                }
+                false
+            }
+            BootStage::Run => {
+                match run_until_exit(&mut self.mem, &mut self.xenon, &mut self.kernel, 1024) {
+                    Ok(exit) => {
+                        self.boot.exit_code = Some(exit.code);
+                        self.boot.detail = format!(
+                            "exit={} steps={} out={:?}",
+                            exit.code,
+                            exit.steps,
+                            String::from_utf8_lossy(&exit.output)
+                        );
+                        self.boot.advance(BootStage::Done, 1.0);
+                        self.status_line = format!("booted: {}", self.boot.detail);
+                        self.log_lines.push(self.status_line.clone());
+                    }
+                    Err(e) => self.boot.fail(&e.to_string()),
+                }
+                true
             }
         }
     }
@@ -250,6 +389,11 @@ impl EmuApp {
 
 impl eframe::App for EmuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Advance staged boot one stage per frame; stages do real work.
+        if self.boot.active() {
+            self.poll_boot();
+            ctx.request_repaint();
+        }
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("x360-rs");
@@ -267,7 +411,7 @@ impl eframe::App for EmuApp {
                     }
                 }
                 if ui.button("Boot demo").clicked() {
-                    let _ = self.boot_demo();
+                    self.begin_boot_demo();
                 }
                 if ui.button("Test audio").clicked() {
                     let _ = self.test_audio();
@@ -298,6 +442,41 @@ impl eframe::App for EmuApp {
             ui.label(format!("audio frames: {}", self.audio.frames_pushed));
         });
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Loading screen: only while stages are running or failed.
+            if self.boot.active() || self.boot.stage == BootStage::Failed {
+                ui.heading("Booting…");
+                ui.add(
+                    egui::ProgressBar::new(self.boot.progress)
+                        .show_percentage()
+                        .animate(true),
+                );
+                for (name, done) in [
+                    ("parse", BootStage::Parse),
+                    ("map", BootStage::Map),
+                    ("gpu", BootStage::GpuInit),
+                    ("run", BootStage::Run),
+                ] {
+                    let mark = if self.boot.progress
+                        >= match done {
+                            BootStage::Parse => 0.25,
+                            BootStage::Map => 0.5,
+                            BootStage::GpuInit => 0.75,
+                            _ => 1.0,
+                        } {
+                        "✓"
+                    } else if self.boot.stage == done {
+                        "…"
+                    } else {
+                        "·"
+                    };
+                    ui.monospace(format!("{} {}", mark, name));
+                }
+                ui.monospace(&self.boot.detail);
+                if self.boot.stage == BootStage::Failed && ui.button("Dismiss").clicked() {
+                    self.boot = BootSession::idle();
+                }
+                ui.separator();
+            }
             ui.horizontal(|ui| {
                 ui.heading(format!("CPU ({} threads)", self.xenon.threads.len()));
                 egui::ComboBox::from_label("thread")
@@ -352,4 +531,40 @@ fn main() -> eframe::Result<()> {
     let app = EmuApp::new(cfg);
     let opts = eframe::NativeOptions::default();
     eframe::run_native("x360-rs", opts, Box::new(|_| Ok(Box::new(app))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boot_session_parse_to_map() {
+        let mut app = EmuApp::new(EmuConfig::default());
+        app.begin_boot_demo();
+        assert_eq!(app.boot.stage, BootStage::Parse);
+        assert!(app.boot.active());
+        assert!(!app.poll_boot()); // Parse -> Map
+        assert_eq!(app.boot.stage, BootStage::Map);
+        assert!(!app.poll_boot()); // Map -> GpuInit (writes memory)
+        assert_eq!(app.boot.stage, BootStage::GpuInit);
+        // First demo word landed at entry.
+        assert_eq!(app.mem.fetch_u32(0x8200_1000).unwrap(), 0x3800_0002);
+    }
+
+    #[test]
+    fn boot_session_full_run() {
+        let mut app = EmuApp::new(EmuConfig::default());
+        app.begin_boot_demo();
+        let mut terminal = false;
+        for _ in 0..8 {
+            terminal = app.poll_boot();
+            if terminal {
+                break;
+            }
+        }
+        assert!(terminal);
+        assert_eq!(app.boot.stage, BootStage::Done);
+        assert_eq!(app.boot.exit_code, Some(0));
+        assert_eq!(app.boot.progress, 1.0);
+    }
 }
