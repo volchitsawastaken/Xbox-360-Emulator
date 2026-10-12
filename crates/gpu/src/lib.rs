@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use x360_common::{EmuError, Result};
 
+pub mod bridge;
 pub mod validation;
 
 /// Packet classes (PM4-style).

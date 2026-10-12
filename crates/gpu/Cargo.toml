@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 x360-common = { path = "../common" }
+x360-memory = { path = "../memory" }
 log = "0.4"
 wgpu = "22"
 pollster = "0.3"

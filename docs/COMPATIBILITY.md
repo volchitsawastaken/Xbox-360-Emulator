@@ -24,7 +24,9 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 | Area | Status | Notes |
 |---|---|---|
 | Packet decode (type0/2/3) | partial | Real ringbuffer copy via decode_packet; header-only reports truncation; type1 errors |
-| Type0 state | partial | Register file applied and tested |
+| Type0 state | partial | Register file applied and tested, including from guest RAM via bridge |
+| Command bridge (guest RAM → dispatch) | partial | `execute_buffer` reads PM4 from guest memory; Type3 counted/skipped with stats; tested |
+| Host clear from guest state | partial | Harness clear-color reg → `render_clear` readback; convention labeled, hardware mapping pending |
 | Draw/state/texture/RT packets | unsupported | Type3 dispatch returns pending-M5, draws stays 0 |
 | Shader translate | unsupported | Hash + cache tracked, explicit UnimplementedShader |
 | eDRAM tile/resolve | not-started | |

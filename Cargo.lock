@@ -4659,6 +4659,7 @@ dependencies = [
  "pollster",
  "wgpu 22.1.0",
  "x360-common",
+ "x360-memory",
 ]
 
 [[package]]
