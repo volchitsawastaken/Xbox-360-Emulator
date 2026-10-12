@@ -124,6 +124,39 @@ pub enum Decoded {
         ra: u32,
         d: i16,
     },
+    // D-form update / algebraic-halfword loads and byte/half stores.
+    // Primary opcodes per reference ppc_opcode_disasm_gen.cc
+    // (lbzu=0x8c, stbu=0x9c, lhzu=0xa4, lha=0xa8, lhau=0xac, sthu=0xb4).
+    Lbzu {
+        rt: u32,
+        ra: u32,
+        d: i16,
+    },
+    Lhzu {
+        rt: u32,
+        ra: u32,
+        d: i16,
+    },
+    Lha {
+        rt: u32,
+        ra: u32,
+        d: i16,
+    },
+    Lhau {
+        rt: u32,
+        ra: u32,
+        d: i16,
+    },
+    Stbu {
+        rs: u32,
+        ra: u32,
+        d: i16,
+    },
+    Sthu {
+        rs: u32,
+        ra: u32,
+        d: i16,
+    },
     // X-form ALU
     Add {
         rt: u32,
@@ -211,6 +244,80 @@ pub enum Decoded {
         ra: u32,
         rb: u32,
     },
+    // X-form indexed byte/half loads/stores and word-update store.
+    // XO values per reference ppc_opcode_disasm_gen.cc base encodings
+    // (lbzx=87, lbzux=119, stwux=183, stbx=215, stbux=247, lhzx=279,
+    // lhzux=311, lhax=343, lhaux=375, sthx=407, sthux=439).
+    Lbzx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lbzux {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stbx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stbux {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lhzx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lhzux {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lhax {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lhaux {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Sthx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Sthux {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stwux {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    // X-form algebraic shifts. sraw XO=792, srawi XO=824; srawi shift
+    // amount rides in the RB field (see reference ppc_emit_alu.cc
+    // InstrEmit_srawix, which reads i.X.RB as the count).
+    Sraw {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+    },
+    Srawi {
+        rs: u32,
+        ra: u32,
+        sh: u32,
+        rc: bool,
+    },
     // SPR moves
     Mfcr {
         rt: u32,
@@ -235,6 +342,67 @@ pub enum Decoded {
     Eieio,
     Sc,
     Trap,
+    // Trap-word instructions. tw XO=4 (opcode 31), twi primary opcode 3;
+    // TO in the RT field, per reference ppc_opcode_disasm_gen.cc
+    // (0x7c000008 "tw", 0x0c000000 "twi").
+    Tw {
+        to: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Twi {
+        to: u32,
+        ra: u32,
+        simm: i16,
+    },
+    // Condition-register moves and logical ops (opcode 19 XL form).
+    // mcrf XO=0 (0x4c000000); CR logical XOs per reference base
+    // encodings: crnor=33, crandc=129, crxor=193, crnand=225,
+    // crand=257, creqv=289, crorc=417, cror=449.
+    Mcrf {
+        crfd: u32,
+        crfs: u32,
+    },
+    Crand {
+        bt: u32,
+        ba: u32,
+        bb: u32,
+    },
+    Crandc {
+        bt: u32,
+        ba: u32,
+        bb: u32,
+    },
+    Cror {
+        bt: u32,
+        ba: u32,
+        bb: u32,
+    },
+    Crorc {
+        bt: u32,
+        ba: u32,
+        bb: u32,
+    },
+    Crxor {
+        bt: u32,
+        ba: u32,
+        bb: u32,
+    },
+    Crnor {
+        bt: u32,
+        ba: u32,
+        bb: u32,
+    },
+    Crnand {
+        bt: u32,
+        ba: u32,
+        bb: u32,
+    },
+    Creqv {
+        bt: u32,
+        ba: u32,
+        bb: u32,
+    },
     Nop,
     // VMX128 (tracked, not executed yet)
     Vmx {
@@ -271,6 +439,11 @@ pub fn decode(word: u32) -> Result<Decoded> {
     let rb = (word >> 11) & 0x1F;
     let d = (word & 0xFFFF) as u16;
     match opc {
+        3 => Ok(Decoded::Twi {
+            to: rt,
+            ra,
+            simm: d as i16,
+        }),
         4 => Ok(Decoded::Vmx { word }),
         7 => Ok(Decoded::Mulli {
             rt,
@@ -308,9 +481,22 @@ pub fn decode(word: u32) -> Result<Decoded> {
             let xo = (word >> 1) & 0x3FF;
             let bo = (word >> 21) & 0x1F;
             let bi = (word >> 16) & 0x1F;
+            let bb = (word >> 11) & 0x1F;
             let lk = word & 1 != 0;
             match xo {
+                0 => Ok(Decoded::Mcrf {
+                    crfd: bo >> 2,
+                    crfs: bi >> 2,
+                }),
                 16 => Ok(Decoded::Bclr { bo, bi, lk }),
+                33 => Ok(Decoded::Crnor { bt: bo, ba: bi, bb }),
+                129 => Ok(Decoded::Crandc { bt: bo, ba: bi, bb }),
+                193 => Ok(Decoded::Crxor { bt: bo, ba: bi, bb }),
+                225 => Ok(Decoded::Crnand { bt: bo, ba: bi, bb }),
+                257 => Ok(Decoded::Crand { bt: bo, ba: bi, bb }),
+                289 => Ok(Decoded::Creqv { bt: bo, ba: bi, bb }),
+                417 => Ok(Decoded::Crorc { bt: bo, ba: bi, bb }),
+                449 => Ok(Decoded::Cror { bt: bo, ba: bi, bb }),
                 528 => Ok(Decoded::Bcctr { bo, bi, lk }),
                 150 => Ok(Decoded::Isync),
                 _ => Ok(Decoded::Unsupported {
@@ -330,23 +516,29 @@ pub fn decode(word: u32) -> Result<Decoded> {
             let rc = word & 1 != 0;
             let oe = (word >> 10) & 1 != 0;
             match xo {
+                4 => Ok(Decoded::Tw { to: rt, ra, rb }),
                 20 => Ok(Decoded::Lwarx { rt, ra, rb }),
                 23 => Ok(Decoded::Lwzx { rt, ra, rb }),
                 28 => Ok(Decoded::And { rs: rt, ra, rb, rc }),
-                32 => {
-                    // trap word / sc share area; tw XO=4, but handle generic
-                    Ok(Decoded::Unsupported {
-                        opc,
-                        word,
-                        reason: "xo31-32",
-                    })
-                }
                 // Add/Subf: top XO bit is OE, so accept both OE=0/1 forms.
                 40 | 552 => Ok(Decoded::Subf { rt, ra, rb, rc, oe }),
-                87 => Ok(Decoded::Unsupported {
-                    opc,
-                    word,
-                    reason: "lbzx-todo",
+                87 => Ok(Decoded::Lbzx { rt, ra, rb }),
+                119 => Ok(Decoded::Lbzux { rt, ra, rb }),
+                183 => Ok(Decoded::Stwux { rs: rt, ra, rb }),
+                215 => Ok(Decoded::Stbx { rs: rt, ra, rb }),
+                247 => Ok(Decoded::Stbux { rs: rt, ra, rb }),
+                279 => Ok(Decoded::Lhzx { rt, ra, rb }),
+                311 => Ok(Decoded::Lhzux { rt, ra, rb }),
+                343 => Ok(Decoded::Lhax { rt, ra, rb }),
+                375 => Ok(Decoded::Lhaux { rt, ra, rb }),
+                407 => Ok(Decoded::Sthx { rs: rt, ra, rb }),
+                439 => Ok(Decoded::Sthux { rs: rt, ra, rb }),
+                792 => Ok(Decoded::Sraw { rs: rt, ra, rb, rc }),
+                824 => Ok(Decoded::Srawi {
+                    rs: rt,
+                    ra,
+                    sh: rb,
+                    rc,
                 }),
                 144 => Ok(Decoded::Mtcrf {
                     rs: rt,
@@ -373,11 +565,6 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 598 => Ok(Decoded::Sync {
                     l: (word >> 21) & 3,
                 }),
-                824 => Ok(Decoded::Unsupported {
-                    opc,
-                    word,
-                    reason: "srawi-todo",
-                }),
                 854 => Ok(Decoded::Eieio),
                 922 => Ok(Decoded::Extsh { rs: rt, ra, rc }),
                 954 => Ok(Decoded::Extsb { rs: rt, ra, rc }),
@@ -403,6 +590,11 @@ pub fn decode(word: u32) -> Result<Decoded> {
             ra,
             d: d as i16,
         }),
+        35 => Ok(Decoded::Lbzu {
+            rt,
+            ra,
+            d: d as i16,
+        }),
         36 => Ok(Decoded::Stw {
             rs: rt,
             ra,
@@ -418,12 +610,37 @@ pub fn decode(word: u32) -> Result<Decoded> {
             ra,
             d: d as i16,
         }),
+        39 => Ok(Decoded::Stbu {
+            rs: rt,
+            ra,
+            d: d as i16,
+        }),
         40 => Ok(Decoded::Lhz {
             rt,
             ra,
             d: d as i16,
         }),
+        41 => Ok(Decoded::Lhzu {
+            rt,
+            ra,
+            d: d as i16,
+        }),
+        42 => Ok(Decoded::Lha {
+            rt,
+            ra,
+            d: d as i16,
+        }),
+        43 => Ok(Decoded::Lhau {
+            rt,
+            ra,
+            d: d as i16,
+        }),
         44 => Ok(Decoded::Sth {
+            rs: rt,
+            ra,
+            d: d as i16,
+        }),
+        45 => Ok(Decoded::Sthu {
             rs: rt,
             ra,
             d: d as i16,

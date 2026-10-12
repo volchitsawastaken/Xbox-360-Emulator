@@ -4669,6 +4669,7 @@ dependencies = [
  "log",
  "x360-common",
  "x360-cpu",
+ "x360-debugger",
  "x360-memory",
 ]
 

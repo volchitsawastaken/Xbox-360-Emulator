@@ -100,4 +100,53 @@ mod integration {
         assert_eq!(exit.code, 0);
         assert_eq!(exit.output, b"HI");
     }
+
+    /// Throughput measurement, not a timing assert: machines vary, so this
+    /// prints MIPS for the log and only asserts correctness. Track the
+    /// printed number across commits; it must not silently regress.
+    #[test]
+    fn interpreter_throughput_mips() {
+        use std::time::Instant;
+        // 2-word loop: addi r3,r3,1 ; b -4 (li=-4).
+        let entry = 0x63000;
+        let mut mem = Memory::new();
+        mem.write_u32(entry, 0x3863_0001).unwrap();
+        mem.write_u32(entry + 4, 0x4BFF_FFFC).unwrap();
+        let mut cpu = Interpreter::new(0, entry);
+        let target = 200_000u64;
+        let start = Instant::now();
+        for _ in 0..target {
+            assert!(cpu.step(&mut mem).unwrap().is_none());
+        }
+        let secs = start.elapsed().as_secs_f64().max(1e-9);
+        let mips = target as f64 / secs / 1e6;
+        println!("interpreter: {:.2} MIPS ({} steps)", mips, target);
+        assert_eq!(cpu.t.gpr[3], (target / 2) as u32);
+    }
+
+    /// Bridge throughput over a 4K-word guest command buffer.
+    #[test]
+    fn bridge_throughput_kwords() {
+        use std::time::Instant;
+        use x360_gpu::bridge::{execute_buffer, HARNESS_CLEAR_COLOR_REG};
+        let mut mem = Memory::new();
+        let addr = 0x74000u32;
+        // 2048 Type0 packets, 1 value each: header + color word.
+        for i in 0..2048u32 {
+            let header = HARNESS_CLEAR_COLOR_REG / 4;
+            mem.write_u32(addr + i * 8, header).unwrap();
+            mem.write_u32(addr + i * 8 + 4, 0x1122_3344).unwrap();
+        }
+        let mut gpu = x360_gpu::Xenos::new();
+        let start = Instant::now();
+        let stats = execute_buffer(&mut gpu, &mem, addr, 4096).unwrap();
+        let secs = start.elapsed().as_secs_f64().max(1e-9);
+        println!(
+            "bridge: {:.0} Kwords/s ({} packets)",
+            4096.0 / secs / 1e3,
+            stats.packets
+        );
+        assert_eq!(stats.packets, 2048);
+        assert_eq!(stats.pending_type3, 0);
+    }
 }

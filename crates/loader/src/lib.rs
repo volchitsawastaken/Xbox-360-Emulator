@@ -6,11 +6,26 @@
 //! - fixed header, then `header_count` directory entries of 8 bytes:
 //!   key:u32 BE, value-or-offset:u32 BE
 //! - key low byte selects storage: `0x00`/`0x01` = value inline,
-//!   anything else = value is an offset to sized data (first u32 = size)
+//!   anything else = value is an offset to sized data (first u32 = size
+//!   for size-prefixed tables; fixed-size structs start directly)
 //! - entry point key `0x00010100`, image base `0x00010201`,
 //!   stack size `0x00020200`, execution info `0x00040006`
 //! - optional security header at `security_offset` carries image size
-//!   (+0x04) and load address (+0x110)
+//!   (+0x04), image flags (+0x10C), load address (+0x110),
+//!   export table (+0x160), page descriptor count (+0x180),
+//!   then page descriptors at +0x184 (each 0x18 bytes:
+//!   value:u32 BE then 20-byte digest), per `xex2_security_info` and
+//!   `xex2_page_descriptor` in the reference header; descriptor value
+//!   low 4 bits are the section kind (1/2/3), high 28 bits page count
+//! - TLS info key `0x00020104` is a fixed 0x10-byte struct
+//!   (`xex2_opt_tls_info`: slot_count, raw_data_address, data_size,
+//!   raw_data_size); static libraries key `0x000200FF` is size-prefixed
+//!   (`xex2_opt_static_libraries`: size then 0x10-byte entries with
+//!   8-byte names), count = (size-4)/0x10
+//! - directory walk structure follows the `Load`/`ReadImage` flow in the
+//!   reference `xex_module.cc` (lookup by key, offset from header base,
+//!   per-key struct decode); import resolution is intentionally not
+//!   performed here, static names are recorded only.
 
 use x360_common::{EmuError, Result};
 use x360_memory::Memory;
@@ -26,8 +41,23 @@ pub const KEY_DEFAULT_STACK_SIZE: u32 = 0x0002_0200;
 pub const KEY_EXECUTION_INFO: u32 = 0x0004_0006;
 pub const KEY_IMPORT_LIBRARIES: u32 = 0x0001_03FF;
 pub const KEY_SYSTEM_FLAGS: u32 = 0x0003_0000;
+pub const KEY_TLS_INFO: u32 = 0x0002_0104;
+pub const KEY_STATIC_LIBRARIES: u32 = 0x0002_00FF;
 
 pub const DEFAULT_BASE_ADDRESS: u32 = 0x8200_0000;
+
+// Security header field offsets from `security_offset` (reference
+// `xex2_security_info` layout facts).
+const SEC_IMAGE_SIZE_OFF: usize = 0x04;
+const SEC_IMAGE_FLAGS_OFF: usize = 0x10C;
+const SEC_LOAD_ADDRESS_OFF: usize = 0x110;
+const SEC_EXPORT_TABLE_OFF: usize = 0x160;
+const SEC_PAGE_COUNT_OFF: usize = 0x180;
+const SEC_FIXED_SIZE: usize = 0x184;
+const PAGE_DESCRIPTOR_SIZE: usize = 0x18;
+const TLS_INFO_SIZE: usize = 0x10;
+const STATIC_LIB_ENTRY_SIZE: usize = 0x10;
+const EXECUTION_INFO_SIZE: usize = 0x18;
 
 #[derive(Debug, Clone)]
 pub struct XexHeader {
@@ -53,6 +83,39 @@ pub enum XexDirData {
     AtOffset { offset: u32, size: u32 },
 }
 
+/// Section kind from a page descriptor value (low 4 bits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionKind {
+    Code,
+    Data,
+    ReadOnlyData,
+}
+
+/// One decoded page descriptor (digest bytes are validated in-bounds
+/// but not retained).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageDescriptor {
+    pub section_kind: SectionKind,
+    pub page_count: u32,
+}
+
+/// Decoded TLS header (`xex2_opt_tls_info` layout facts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsInfo {
+    pub slot_count: u32,
+    pub raw_data_address: u32,
+    pub data_size: u32,
+    pub raw_data_size: u32,
+}
+
+/// One recorded static library name (`xex2_opt_static_library`
+/// layout facts: 8-byte name, versions/approval recorded nowhere;
+/// import resolution is out of scope for the loader).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticLib {
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct XexInfo {
     pub entry_point: u32,
@@ -63,6 +126,29 @@ pub struct XexInfo {
     pub size: usize,
     /// Validated directory table for later stages (relocations, imports).
     pub dirs: Vec<XexDir>,
+    /// Security `image_size` (+0x04); `None` when the security header
+    /// is absent or truncated. Added field, defaults to `None`.
+    pub image_size: Option<u32>,
+    /// Security `image_flags` (+0x10C); `None` when absent/truncated.
+    /// Added field, defaults to `None`.
+    pub image_flags: Option<u32>,
+    /// Security `export_table` (+0x160); `None` when absent/truncated.
+    /// Added field, defaults to `None`.
+    pub export_table: Option<u32>,
+    /// Security `page_descriptor_count` (+0x180); `None` when the
+    /// security header is absent or truncated. Added field, defaults
+    /// to `None`. A present-but-OOB count is an explicit error, never
+    /// silently clamped.
+    pub page_descriptor_count: Option<u32>,
+    /// Decoded page descriptors; empty when the security header is
+    /// absent or truncated. Added field, defaults to empty.
+    pub page_descriptors: Vec<PageDescriptor>,
+    /// Decoded TLS header when key `0x00020104` is present. Added
+    /// field, defaults to `None`.
+    pub tls_info: Option<TlsInfo>,
+    /// Recorded static library names when key `0x000200FF` is present.
+    /// Added field, defaults to empty. No import resolution performed.
+    pub static_libs: Vec<StaticLib>,
 }
 
 fn read_u32(image: &[u8], off: usize) -> Result<u32> {
@@ -75,6 +161,151 @@ fn read_u32(image: &[u8], off: usize) -> Result<u32> {
         image[off + 2],
         image[off + 3],
     ]))
+}
+
+struct SecurityParsed {
+    image_size: Option<u32>,
+    image_flags: Option<u32>,
+    load_address: Option<u32>,
+    export_table: Option<u32>,
+    page_count: Option<u32>,
+    pages: Vec<PageDescriptor>,
+}
+
+fn parse_security(image: &[u8], security_offset: u32) -> Result<SecurityParsed> {
+    if security_offset == 0 {
+        return Ok(SecurityParsed {
+            image_size: None,
+            image_flags: None,
+            load_address: None,
+            export_table: None,
+            page_count: None,
+            pages: Vec::new(),
+        });
+    }
+    let base = security_offset as usize;
+    if base >= image.len() {
+        log::warn!("xex: security_offset OOB (tracked)");
+        return Ok(SecurityParsed {
+            image_size: None,
+            image_flags: None,
+            load_address: None,
+            export_table: None,
+            page_count: None,
+            pages: Vec::new(),
+        });
+    }
+    if base + SEC_FIXED_SIZE > image.len() {
+        log::debug!("xex: security header truncated (tracked)");
+        return Ok(SecurityParsed {
+            image_size: None,
+            image_flags: None,
+            load_address: None,
+            export_table: None,
+            page_count: None,
+            pages: Vec::new(),
+        });
+    }
+    let image_size = Some(read_u32(image, base + SEC_IMAGE_SIZE_OFF)?);
+    let image_flags = Some(read_u32(image, base + SEC_IMAGE_FLAGS_OFF)?);
+    let load_address = Some(read_u32(image, base + SEC_LOAD_ADDRESS_OFF)?);
+    let export_table = Some(read_u32(image, base + SEC_EXPORT_TABLE_OFF)?);
+    let page_count = read_u32(image, base + SEC_PAGE_COUNT_OFF)?;
+    let array_off = base + SEC_FIXED_SIZE;
+    let needed = (u64::from(page_count))
+        .checked_mul(PAGE_DESCRIPTOR_SIZE as u64)
+        .ok_or_else(|| EmuError::InvalidExecutable("page count overflow".into()))?;
+    if (array_off as u64) + needed > image.len() as u64 {
+        return Err(EmuError::InvalidExecutable(format!(
+            "page descriptor array OOB (off {} count {} size {})",
+            array_off, page_count, needed
+        )));
+    }
+    let mut descs = Vec::new();
+    for i in 0..page_count {
+        let off = array_off + (i as usize) * PAGE_DESCRIPTOR_SIZE;
+        let value = read_u32(image, off)?;
+        let info = value & 0xF;
+        let pages = value >> 4;
+        let kind = match info {
+            1 => SectionKind::Code,
+            2 => SectionKind::Data,
+            3 => SectionKind::ReadOnlyData,
+            _ => {
+                return Err(EmuError::InvalidExecutable(format!(
+                    "unknown page descriptor kind {} at index {}",
+                    info, i
+                )));
+            }
+        };
+        descs.push(PageDescriptor {
+            section_kind: kind,
+            page_count: pages,
+        });
+    }
+    Ok(SecurityParsed {
+        image_size,
+        image_flags,
+        load_address,
+        export_table,
+        page_count: Some(page_count),
+        pages: descs,
+    })
+}
+
+fn parse_tls(image: &[u8], data_off: usize) -> Result<TlsInfo> {
+    if data_off + TLS_INFO_SIZE > image.len() {
+        return Err(EmuError::InvalidExecutable("tls info truncated".into()));
+    }
+    Ok(TlsInfo {
+        slot_count: read_u32(image, data_off)?,
+        raw_data_address: read_u32(image, data_off + 4)?,
+        data_size: read_u32(image, data_off + 8)?,
+        raw_data_size: read_u32(image, data_off + 12)?,
+    })
+}
+
+fn parse_static_libs(image: &[u8], data_off: usize) -> Result<(u32, Vec<StaticLib>)> {
+    if data_off + 4 > image.len() {
+        return Err(EmuError::InvalidExecutable(
+            "static libraries truncated".into(),
+        ));
+    }
+    let size = read_u32(image, data_off)?;
+    if size < 4 {
+        return Err(EmuError::InvalidExecutable(format!(
+            "static libraries size {} too small",
+            size
+        )));
+    }
+    if (size - 4) % (STATIC_LIB_ENTRY_SIZE as u32) != 0 {
+        return Err(EmuError::InvalidExecutable(format!(
+            "static libraries size {} malformed",
+            size
+        )));
+    }
+    if (data_off as u64) + (u64::from(size)) > image.len() as u64 {
+        return Err(EmuError::InvalidExecutable(format!(
+            "static libraries data OOB (off {} size {})",
+            data_off, size
+        )));
+    }
+    let count = (size - 4) / (STATIC_LIB_ENTRY_SIZE as u32);
+    let mut libs = Vec::new();
+    for l in 0..count {
+        let ent = data_off + 4 + (l as usize) * STATIC_LIB_ENTRY_SIZE;
+        if ent + STATIC_LIB_ENTRY_SIZE > image.len() {
+            return Err(EmuError::InvalidExecutable(format!(
+                "static library {} truncated",
+                l
+            )));
+        }
+        let raw = &image[ent..ent + 8];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(8);
+        let name = String::from_utf8_lossy(&raw[..end]).into_owned();
+        libs.push(StaticLib { name });
+    }
+    Ok((size, libs))
 }
 
 /// Parse XEX1/XEX2 header directory. Returns entry point for the kernel.
@@ -104,26 +335,18 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
         return Err(EmuError::InvalidExecutable("header_size OOB".into()));
     }
 
-    // Optional security header: image size (+0x04), load address (+0x110).
-    let mut sec_image_size: Option<u32> = None;
-    let mut sec_load_address: Option<u32> = None;
-    if security_offset != 0 {
-        if (security_offset as usize) > image.len() {
-            log::warn!("xex: security_offset OOB (tracked)");
-        } else if (security_offset as usize) + 0x114 <= image.len() {
-            sec_image_size = Some(read_u32(image, security_offset as usize + 4)?);
-            sec_load_address = Some(read_u32(image, security_offset as usize + 0x110)?);
-        } else {
-            log::debug!("xex: security header truncated (tracked)");
-        }
-    }
-    let _ = sec_image_size;
+    // Security header: image size/flags/export/page descriptors plus
+    // load-address fallback. Absent or truncated headers yield Nones;
+    // a present header with an OOB page count is an explicit error.
+    let sec = parse_security(image, security_offset)?;
 
     let mut entry_point: Option<u32> = None;
     let mut image_base: Option<u32> = None;
     let mut original_base: Option<u32> = None;
     let mut stack_size: Option<u32> = None;
     let mut title_id: Option<u32> = None;
+    let mut tls_info: Option<TlsInfo> = None;
+    let mut static_libs: Vec<StaticLib> = Vec::new();
     let mut dirs = Vec::new();
 
     for i in 0..header_count {
@@ -157,34 +380,68 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
                         key
                     )));
                 }
-                let size = if data_off + 4 <= image.len() {
-                    read_u32(image, data_off)?
-                } else {
-                    0
-                };
-                if (data_off as u64) + (size as u64) > image.len() as u64 {
-                    return Err(EmuError::InvalidExecutable(format!(
-                        "dir key {:08x} data OOB (off {} size {})",
-                        key, data_off, size
-                    )));
-                }
-                dirs.push(XexDir {
-                    key,
-                    data: XexDirData::AtOffset {
-                        offset: value,
-                        size,
-                    },
-                });
-                // Known offset-keyed structures with fixed layouts.
+                // Known fixed layouts first (retail structures).
                 if key == KEY_EXECUTION_INFO {
                     // media_id +0x00, version +0x04, base_version +0x08,
                     // title_id +0x0C, platform/exec-table/disc +0x10..13.
-                    if size >= 0x18 {
-                        title_id = Some(read_u32(image, data_off + 0x0C)?);
-                    } else {
+                    if data_off + EXECUTION_INFO_SIZE > image.len() {
                         log::warn!("xex: execution info truncated (tracked)");
+                        dirs.push(XexDir {
+                            key,
+                            data: XexDirData::AtOffset {
+                                offset: value,
+                                size: 0,
+                            },
+                        });
+                    } else {
+                        dirs.push(XexDir {
+                            key,
+                            data: XexDirData::AtOffset {
+                                offset: value,
+                                size: EXECUTION_INFO_SIZE as u32,
+                            },
+                        });
+                        title_id = Some(read_u32(image, data_off + 0x0C)?);
                     }
+                } else if key == KEY_TLS_INFO {
+                    let info = parse_tls(image, data_off)?;
+                    dirs.push(XexDir {
+                        key,
+                        data: XexDirData::AtOffset {
+                            offset: value,
+                            size: TLS_INFO_SIZE as u32,
+                        },
+                    });
+                    tls_info = Some(info);
+                } else if key == KEY_STATIC_LIBRARIES {
+                    let (size, mut libs) = parse_static_libs(image, data_off)?;
+                    dirs.push(XexDir {
+                        key,
+                        data: XexDirData::AtOffset {
+                            offset: value,
+                            size,
+                        },
+                    });
+                    static_libs.append(&mut libs);
                 } else {
+                    let size = if data_off + 4 <= image.len() {
+                        read_u32(image, data_off)?
+                    } else {
+                        0
+                    };
+                    if (data_off as u64) + (size as u64) > image.len() as u64 {
+                        return Err(EmuError::InvalidExecutable(format!(
+                            "dir key {:08x} data OOB (off {} size {})",
+                            key, data_off, size
+                        )));
+                    }
+                    dirs.push(XexDir {
+                        key,
+                        data: XexDirData::AtOffset {
+                            offset: value,
+                            size,
+                        },
+                    });
                     log::debug!("xex: offset key {:08x} (tracked)", key);
                 }
             }
@@ -199,7 +456,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
 
     let base = image_base
         .or(original_base)
-        .or(sec_load_address)
+        .or(sec.load_address)
         .unwrap_or(DEFAULT_BASE_ADDRESS);
 
     Ok((
@@ -218,6 +475,13 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
             is_dll: module_flags & 0x08 != 0,
             size: image.len(),
             dirs,
+            image_size: sec.image_size,
+            image_flags: sec.image_flags,
+            export_table: sec.export_table,
+            page_descriptor_count: sec.page_count,
+            page_descriptors: sec.pages,
+            tls_info,
+            static_libs,
         },
     ))
 }
@@ -241,6 +505,58 @@ mod tests {
         v[20..24].copy_from_slice(&1u32.to_be_bytes()); // count
         v[24..28].copy_from_slice(&KEY_ENTRY_POINT.to_be_bytes());
         v[28..32].copy_from_slice(&entry.to_be_bytes());
+        v
+    }
+
+    fn put_u32(v: &mut [u8], off: usize, val: u32) {
+        v[off..off + 4].copy_from_slice(&val.to_be_bytes());
+    }
+
+    /// Image with a security header at 0x100 holding the given page
+    /// descriptor values (already-encoded value words).
+    fn security_image(page_values: &[u32]) -> Vec<u8> {
+        let sec_base = 0x100usize;
+        let total = sec_base + SEC_FIXED_SIZE + page_values.len() * PAGE_DESCRIPTOR_SIZE;
+        let mut v = vec![0u8; total.max(0x200)];
+        v[0..4].copy_from_slice(b"XEX2");
+        put_u32(&mut v, 8, 32);
+        put_u32(&mut v, 16, sec_base as u32);
+        put_u32(&mut v, 20, 1);
+        put_u32(&mut v, 24, KEY_ENTRY_POINT);
+        put_u32(&mut v, 28, 0x8200_1000);
+        put_u32(&mut v, sec_base + SEC_IMAGE_SIZE_OFF, 0x0012_0000);
+        put_u32(&mut v, sec_base + SEC_IMAGE_FLAGS_OFF, 0x0000_0400);
+        put_u32(&mut v, sec_base + SEC_LOAD_ADDRESS_OFF, 0x8200_0000);
+        put_u32(&mut v, sec_base + SEC_EXPORT_TABLE_OFF, 0x0000_9000);
+        put_u32(
+            &mut v,
+            sec_base + SEC_PAGE_COUNT_OFF,
+            page_values.len() as u32,
+        );
+        for (i, w) in page_values.iter().enumerate() {
+            put_u32(
+                &mut v,
+                sec_base + SEC_FIXED_SIZE + i * PAGE_DESCRIPTOR_SIZE,
+                *w,
+            );
+        }
+        v
+    }
+
+    /// Directory image with one entry-point plus one offset entry whose
+    /// payload bytes are provided.
+    fn dir_image_with_payload(key: u32, payload: &[u8]) -> Vec<u8> {
+        let data_off = (24 + 16) as u32;
+        let total = (data_off as usize) + payload.len();
+        let mut v = vec![0u8; total];
+        v[0..4].copy_from_slice(b"XEX2");
+        put_u32(&mut v, 8, 24 + 16);
+        put_u32(&mut v, 20, 2);
+        put_u32(&mut v, 24, KEY_ENTRY_POINT);
+        put_u32(&mut v, 28, 0x8200_1000);
+        put_u32(&mut v, 32, key);
+        put_u32(&mut v, 36, data_off);
+        v[(data_off as usize)..].copy_from_slice(payload);
         v
     }
 
@@ -322,5 +638,121 @@ mod tests {
         v[24..28].copy_from_slice(&KEY_IMPORT_LIBRARIES.to_be_bytes());
         v[28..32].copy_from_slice(&0xFFFFu32.to_be_bytes());
         assert!(parse_xex(&v).is_err());
+    }
+
+    #[test]
+    fn absent_security_yields_nones() {
+        let img = minimal_xex(0x8200_1000);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.image_size, None);
+        assert_eq!(info.image_flags, None);
+        assert_eq!(info.export_table, None);
+        assert_eq!(info.page_descriptor_count, None);
+        assert!(info.page_descriptors.is_empty());
+        assert_eq!(info.tls_info, None);
+        assert!(info.static_libs.is_empty());
+    }
+
+    #[test]
+    fn security_fields_and_pages() {
+        let code = (2u32 << 4) | 1;
+        let data = (4u32 << 4) | 2;
+        let ro = (1u32 << 4) | 3;
+        let img = security_image(&[code, data, ro]);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.image_size, Some(0x0012_0000));
+        assert_eq!(info.image_flags, Some(0x0000_0400));
+        assert_eq!(info.export_table, Some(0x0000_9000));
+        assert_eq!(info.page_descriptor_count, Some(3));
+        assert_eq!(info.page_descriptors.len(), 3);
+        assert_eq!(info.page_descriptors[0].section_kind, SectionKind::Code);
+        assert_eq!(info.page_descriptors[0].page_count, 2);
+        assert_eq!(info.page_descriptors[1].section_kind, SectionKind::Data);
+        assert_eq!(info.page_descriptors[1].page_count, 4);
+        assert_eq!(
+            info.page_descriptors[2].section_kind,
+            SectionKind::ReadOnlyData
+        );
+        assert_eq!(info.page_descriptors[2].page_count, 1);
+        assert_eq!(info.base_address, 0x8200_0000);
+    }
+
+    #[test]
+    fn security_page_count_oob_rejected() {
+        let mut img = security_image(&[(1u32 << 4) | 1]);
+        let sec_base = 0x100usize;
+        put_u32(&mut img, sec_base + SEC_PAGE_COUNT_OFF, 64);
+        let err = parse_xex(&img).unwrap_err();
+        assert!(matches!(err, EmuError::InvalidExecutable(_)));
+    }
+
+    #[test]
+    fn page_descriptor_unknown_kind_rejected() {
+        let bad = (1u32 << 4) | 7;
+        let img = security_image(&[bad]);
+        let err = parse_xex(&img).unwrap_err();
+        assert!(matches!(err, EmuError::InvalidExecutable(_)));
+    }
+
+    #[test]
+    fn page_descriptor_zero_kind_rejected() {
+        let bad = 1u32 << 4;
+        let img = security_image(&[bad]);
+        assert!(parse_xex(&img).is_err());
+    }
+
+    #[test]
+    fn tls_info_parsed() {
+        let mut payload = vec![0u8; TLS_INFO_SIZE];
+        put_u32(&mut payload, 0, 64);
+        put_u32(&mut payload, 4, 0x8200_2000);
+        put_u32(&mut payload, 8, 0x100);
+        put_u32(&mut payload, 12, 0x80);
+        let img = dir_image_with_payload(KEY_TLS_INFO, &payload);
+        let (_, info) = parse_xex(&img).unwrap();
+        let tls = info.tls_info.expect("tls present");
+        assert_eq!(tls.slot_count, 64);
+        assert_eq!(tls.raw_data_address, 0x8200_2000);
+        assert_eq!(tls.data_size, 0x100);
+        assert_eq!(tls.raw_data_size, 0x80);
+    }
+
+    #[test]
+    fn tls_truncated_rejected() {
+        let payload = vec![0u8; 8];
+        let img = dir_image_with_payload(KEY_TLS_INFO, &payload);
+        let err = parse_xex(&img).unwrap_err();
+        assert!(matches!(err, EmuError::InvalidExecutable(_)));
+    }
+
+    #[test]
+    fn static_libs_parsed() {
+        let mut payload = vec![0u8; 4 + 2 * STATIC_LIB_ENTRY_SIZE];
+        put_u32(&mut payload, 0, (4 + 2 * STATIC_LIB_ENTRY_SIZE) as u32);
+        payload[4..7].copy_from_slice(b"xam");
+        payload[4 + STATIC_LIB_ENTRY_SIZE..4 + STATIC_LIB_ENTRY_SIZE + 8]
+            .copy_from_slice(b"xboxkrnl");
+        let img = dir_image_with_payload(KEY_STATIC_LIBRARIES, &payload);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.static_libs.len(), 2);
+        assert_eq!(info.static_libs[0].name, "xam");
+        assert_eq!(info.static_libs[1].name, "xboxkrnl");
+    }
+
+    #[test]
+    fn static_libs_malformed_size_rejected() {
+        let mut payload = vec![0u8; 8];
+        put_u32(&mut payload, 0, 5);
+        let img = dir_image_with_payload(KEY_STATIC_LIBRARIES, &payload);
+        assert!(parse_xex(&img).is_err());
+    }
+
+    #[test]
+    fn static_libs_oob_rejected() {
+        let mut payload = vec![0u8; 4];
+        put_u32(&mut payload, 0, 0x100);
+        let img = dir_image_with_payload(KEY_STATIC_LIBRARIES, &payload);
+        let err = parse_xex(&img).unwrap_err();
+        assert!(matches!(err, EmuError::InvalidExecutable(_)));
     }
 }

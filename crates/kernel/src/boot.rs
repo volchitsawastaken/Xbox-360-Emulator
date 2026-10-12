@@ -54,6 +54,18 @@ pub fn run_until_exit(
     kernel: &mut Kernel,
     max_steps: u64,
 ) -> Result<GuestExit> {
+    run_until_exit_traced(mem, xenon, kernel, max_steps, None)
+}
+
+/// Run thread 0 until exit, optionally recording each executed
+/// instruction into `trace`. `None` costs nothing (no fetch, no format).
+pub fn run_until_exit_traced(
+    mem: &mut Memory,
+    xenon: &mut Xenon,
+    kernel: &mut Kernel,
+    max_steps: u64,
+    mut trace: Option<&mut x360_debugger::TraceBuffer>,
+) -> Result<GuestExit> {
     let mut steps = 0u64;
     loop {
         if steps >= max_steps {
@@ -61,6 +73,13 @@ pub fn run_until_exit(
                 "step limit {} exceeded without exit",
                 max_steps
             )));
+        }
+        if let Some(tb) = trace.as_mut() {
+            // Extra fetch only on the tracing path; hot path untouched.
+            let pc = xenon.threads[0].t.pc;
+            if let Ok(word) = mem.fetch_u32(pc) {
+                tb.push(pc, word);
+            }
         }
         let trap = xenon.threads[0].step(mem)?;
         steps += 1;
@@ -130,6 +149,25 @@ mod tests {
         let mut kernel = Kernel::new();
         let r = run_until_exit(&mut mem, &mut xenon, &mut kernel, 10);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn traced_run_records_instructions() {
+        use x360_debugger::TraceBuffer;
+        let mut mem = Memory::new();
+        let entry = 0x8200_7000;
+        for (i, w) in demo_guest_words().iter().enumerate() {
+            mem.write_u32(entry + i as u32 * 4, *w).unwrap();
+        }
+        let mut xenon = Xenon::new(entry);
+        let mut kernel = Kernel::new();
+        let mut trace = TraceBuffer::default();
+        let exit = run_until_exit_traced(&mut mem, &mut xenon, &mut kernel, 100, Some(&mut trace))
+            .unwrap();
+        assert_eq!(exit.code, 0);
+        assert_eq!(trace.len() as u64, exit.steps);
+        // First recorded instruction is the demo's addi.
+        assert!(trace.iter().next().unwrap().disasm.contains("Addi"));
     }
 
     #[test]

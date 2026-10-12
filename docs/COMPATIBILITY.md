@@ -56,7 +56,7 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 |---|---|---|
 | XSocket UDP bridge | partial | Loopback send/recv tested |
 | System Link discovery | partial | UDP beacon send/recv tested between two instances on loopback; broadcast + NAT pending M8 |
-| Custom lobby | not-started | Endpoint configurable; health check explicit Unsupported when empty; no server claims |
+| Custom lobby | partial | Endpoint configurable; health check explicit Unsupported when empty; no server claims |
 | Official Live compat | unsupported | Not claimed, not attempted |
 
 ## Frontend / Debugger

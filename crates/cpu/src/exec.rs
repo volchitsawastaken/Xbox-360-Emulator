@@ -60,6 +60,69 @@ fn update_cr0(t: &mut ThreadState, v: u32) {
     t.cr.set_cr0(v as i32, so);
 }
 
+/// Read one CR bit by PowerPC bit number (0 = CR0.LT MSB .. 31 = CR7.SO).
+fn cr_bit(t: &ThreadState, b: u32) -> u32 {
+    (t.cr.0 >> (31 - b)) & 1
+}
+
+fn set_cr_bit(t: &mut ThreadState, b: u32, v: u32) {
+    let shift = 31 - b;
+    if v & 1 != 0 {
+        t.cr.0 |= 1 << shift;
+    } else {
+        t.cr.0 &= !(1 << shift);
+    }
+}
+
+/// Trap-condition test per PowerPC trap semantics (see reference
+/// ppc_emit_control.cc InstrEmit_trap): TO bit 0x10 fires when a<b
+/// signed, 0x08 when a>b signed, 0x04 when equal, 0x02 when a<b
+/// unsigned, 0x01 when a>b unsigned.
+fn trap_fires(to: u32, a: u32, b: u32) -> bool {
+    if to & 0x10 != 0 && (a as i32) < b as i32 {
+        return true;
+    }
+    if to & 0x08 != 0 && (a as i32) > b as i32 {
+        return true;
+    }
+    if to & 0x04 != 0 && a == b {
+        return true;
+    }
+    if to & 0x02 != 0 && a < b {
+        return true;
+    }
+    if to & 0x01 != 0 && a > b {
+        return true;
+    }
+    false
+}
+
+/// 32-bit shift-right-algebraic core shared by sraw/srawi.
+/// Port of InstrEmit_srawx/InstrEmit_srawix (reference ppc_emit_alu.cc):
+/// the result is the arithmetic shift and CA is set when the source is
+/// negative and any shifted-out bit is 1 (cleared for a zero shift).
+fn sraw_core(rs_val: u32, n: u32) -> (u32, bool) {
+    let v = (rs_val as i32).wrapping_shr(n) as u32;
+    let ca = n != 0 && rs_val >> 31 != 0 && v.wrapping_shl(n) != rs_val;
+    (v, ca)
+}
+
+fn read_half_be(mem: &Memory, ea: u32) -> Result<u16> {
+    if !ea.is_multiple_of(2) {
+        return Err(EmuError::AlignmentFault { addr: ea });
+    }
+    let b = mem.read_bytes(ea, 2)?;
+    Ok(u16::from_be_bytes([b[0], b[1]]))
+}
+
+fn write_half_be(mem: &mut Memory, ea: u32, v: u16) -> Result<()> {
+    if !ea.is_multiple_of(2) {
+        return Err(EmuError::AlignmentFault { addr: ea });
+    }
+    mem.write_bytes(ea, &v.to_be_bytes())?;
+    Ok(())
+}
+
 /// Execute one decoded instruction. Updates PC. Returns optional syscall.
 pub fn execute(
     d: Decoded,
@@ -122,11 +185,13 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Subfic { rt, ra, simm } => {
-            let (v, _) = (simm as i32 as u32).overflowing_sub(t.gpr[ra as usize]);
-            // CA = NOT borrow: simm_ext >= ra (unsigned 64-bit compare).
-            let a = t.gpr[ra as usize] as u64;
-            let b = simm as i32 as i64 as u64;
-            t.xer.set_ca(b >= a);
+            // RT <- EXTS(SI) - (RA); CA set on NOT-borrow, i.e. the
+            // unsigned 32-bit subtrahend covers the minuend. Only CA is
+            // affected (no OV/SO/CR0 update for D-form arithmetic).
+            let b = simm as i32 as u32;
+            let a = t.gpr[ra as usize];
+            let (v, borrow) = b.overflowing_sub(a);
+            t.xer.set_ca(!borrow);
             t.gpr[rt as usize] = v;
             t.pc = next;
             Ok(None)
@@ -264,6 +329,81 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Lbzu { rt, ra, d } => {
+            if ra == 0 || ra == rt {
+                return Err(EmuError::Unsupported(format!(
+                    "lbzu with ra=0 or ra=rt word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_imm(ra, t, d);
+            let v = mem.read_u8(ea)? as u32;
+            t.gpr[rt as usize] = v;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lhzu { rt, ra, d } => {
+            if ra == 0 || ra == rt {
+                return Err(EmuError::Unsupported(format!(
+                    "lhzu with ra=0 or ra=rt word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_imm(ra, t, d);
+            let v = read_half_be(mem, ea)? as u32;
+            t.gpr[rt as usize] = v;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lha { rt, ra, d } => {
+            let ea = ea_imm(ra, t, d);
+            let v = read_half_be(mem, ea)? as i16 as i32 as u32;
+            t.gpr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lhau { rt, ra, d } => {
+            if ra == 0 || ra == rt {
+                return Err(EmuError::Unsupported(format!(
+                    "lhau with ra=0 or ra=rt word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_imm(ra, t, d);
+            let v = read_half_be(mem, ea)? as i16 as i32 as u32;
+            t.gpr[rt as usize] = v;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stbu { rs, ra, d } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "stbu with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_imm(ra, t, d);
+            mem.write_u8(ea, t.gpr[rs as usize] as u8)?;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Sthu { rs, ra, d } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "sthu with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_imm(ra, t, d);
+            write_half_be(mem, ea, t.gpr[rs as usize] as u16)?;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Add { rt, ra, rb, rc, oe } => {
             let a = t.gpr[ra as usize];
             let b = t.gpr[rb as usize];
@@ -387,9 +527,143 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Sraw { rs, ra, rb, rc } => {
+            // n mirrors the reference clamp in InstrEmit_srawx
+            // (reference ppc_emit_alu.cc): low 6 bits, clamped to 31.
+            let n = (t.gpr[rb as usize] & 0x3F).min(31);
+            let (v, ca) = sraw_core(t.gpr[rs as usize], n);
+            t.xer.set_ca(ca);
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Srawi { rs, ra, sh, rc } => {
+            let (v, ca) = sraw_core(t.gpr[rs as usize], sh & 0x1F);
+            t.xer.set_ca(ca);
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Lwzx { rt, ra, rb } => {
             let ea = ea_idx(ra, rb, t);
             t.gpr[rt as usize] = mem.read_u32(ea)?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lbzx { rt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            t.gpr[rt as usize] = mem.read_u8(ea)? as u32;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lbzux { rt, ra, rb } => {
+            if ra == 0 || ra == rt {
+                return Err(EmuError::Unsupported(format!(
+                    "lbzux with ra=0 or ra=rt word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            let v = mem.read_u8(ea)? as u32;
+            t.gpr[rt as usize] = v;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stbx { rs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            mem.write_u8(ea, t.gpr[rs as usize] as u8)?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stbux { rs, ra, rb } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "stbux with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            mem.write_u8(ea, t.gpr[rs as usize] as u8)?;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lhzx { rt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            t.gpr[rt as usize] = read_half_be(mem, ea)? as u32;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lhzux { rt, ra, rb } => {
+            if ra == 0 || ra == rt {
+                return Err(EmuError::Unsupported(format!(
+                    "lhzux with ra=0 or ra=rt word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            let v = read_half_be(mem, ea)? as u32;
+            t.gpr[rt as usize] = v;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lhax { rt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            t.gpr[rt as usize] = read_half_be(mem, ea)? as i16 as i32 as u32;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lhaux { rt, ra, rb } => {
+            if ra == 0 || ra == rt {
+                return Err(EmuError::Unsupported(format!(
+                    "lhaux with ra=0 or ra=rt word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            let v = read_half_be(mem, ea)? as i16 as i32 as u32;
+            t.gpr[rt as usize] = v;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Sthx { rs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            write_half_be(mem, ea, t.gpr[rs as usize] as u16)?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Sthux { rs, ra, rb } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "sthux with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            write_half_be(mem, ea, t.gpr[rs as usize] as u16)?;
+            t.gpr[ra as usize] = ea;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stwux { rs, ra, rb } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "stwux with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            mem.write_u32(ea, t.gpr[rs as usize])?;
+            t.gpr[ra as usize] = ea;
             t.pc = next;
             Ok(None)
         }
@@ -482,6 +756,87 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Tw { to, ra, rb } => {
+            // Trap words never go silent: a fired condition is an
+            // explicit Unsupported trap error with opcode+pc context.
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            if trap_fires(to, a, b) {
+                return Err(EmuError::Unsupported(format!(
+                    "tw trap fired to={:05b} ra={} rb={} word={:08x} pc={:08x}",
+                    to, ra, rb, word, t.pc
+                )));
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Twi { to, ra, simm } => {
+            let a = t.gpr[ra as usize];
+            let b = simm as i32 as u32;
+            if trap_fires(to, a, b) {
+                return Err(EmuError::Unsupported(format!(
+                    "twi trap fired to={:05b} ra={} simm={} word={:08x} pc={:08x}",
+                    to, ra, simm, word, t.pc
+                )));
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Mcrf { crfd, crfs } => {
+            // Whole-field copy; no XER/CR0 side effects.
+            let v = t.cr.field(crfs);
+            t.cr.set_field(crfd, v);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Crand { bt, ba, bb } => {
+            let v = cr_bit(t, ba) & cr_bit(t, bb);
+            set_cr_bit(t, bt, v);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Crandc { bt, ba, bb } => {
+            let v = cr_bit(t, ba) & (cr_bit(t, bb) ^ 1);
+            set_cr_bit(t, bt, v);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Cror { bt, ba, bb } => {
+            let v = cr_bit(t, ba) | cr_bit(t, bb);
+            set_cr_bit(t, bt, v);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Crorc { bt, ba, bb } => {
+            let v = cr_bit(t, ba) | (cr_bit(t, bb) ^ 1);
+            set_cr_bit(t, bt, v);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Crxor { bt, ba, bb } => {
+            let v = cr_bit(t, ba) ^ cr_bit(t, bb);
+            set_cr_bit(t, bt, v);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Crnor { bt, ba, bb } => {
+            let v = (cr_bit(t, ba) | cr_bit(t, bb)) ^ 1;
+            set_cr_bit(t, bt, v);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Crnand { bt, ba, bb } => {
+            let v = (cr_bit(t, ba) & cr_bit(t, bb)) ^ 1;
+            set_cr_bit(t, bt, v);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Creqv { bt, ba, bb } => {
+            let v = (cr_bit(t, ba) ^ cr_bit(t, bb)) ^ 1;
+            set_cr_bit(t, bt, v);
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Vmx { word } => Err(EmuError::Unsupported(format!(
             "VMX128 word={:08x} pc={:08x}",
             word, t.pc
@@ -509,6 +864,36 @@ mod tests {
     fn run_word(word: u32, t: &mut ThreadState, m: &mut Memory) {
         let d = decode(word).unwrap();
         execute(d, word, t, m).unwrap();
+    }
+
+    fn dform(opc: u32, rt: u32, ra: u32, d: i16) -> u32 {
+        (opc << 26) | (rt << 21) | (ra << 16) | (d as u16 as u32)
+    }
+
+    fn xform(rt: u32, ra: u32, rb: u32, xo: u32, rc: u32) -> u32 {
+        (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (xo << 1) | rc
+    }
+
+    fn xlform(bo: u32, bi: u32, bb: u32, xo: u32) -> u32 {
+        (19 << 26) | (bo << 21) | (bi << 16) | (bb << 11) | (xo << 1)
+    }
+
+    fn expect_unsupported(word: u32, t: &mut ThreadState, m: &mut Memory) -> String {
+        let d = decode(word).unwrap();
+        match execute(d, word, t, m) {
+            Err(EmuError::Unsupported(msg)) => msg,
+            Err(e) => panic!("expected Unsupported, got {:?}", e),
+            Ok(_) => panic!("expected Unsupported, executed Ok"),
+        }
+    }
+
+    fn expect_align(word: u32, t: &mut ThreadState, m: &mut Memory) -> u32 {
+        let d = decode(word).unwrap();
+        match execute(d, word, t, m) {
+            Err(EmuError::AlignmentFault { addr }) => addr,
+            Err(e) => panic!("expected AlignmentFault, got {:?}", e),
+            Ok(_) => panic!("expected AlignmentFault, executed Ok"),
+        }
     }
 
     #[test]
@@ -586,5 +971,511 @@ mod tests {
         execute(d, word, &mut t, &mut m).unwrap();
         assert_eq!(t.gpr[5], 0x8000_0000);
         assert!(t.xer.so());
+    }
+
+    // --- Update-form stores ---
+
+    #[test]
+    fn stwux_store_updates_ra() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 4;
+        t.gpr[5] = 0xDEAD_BEEF;
+        let w = xform(5, 3, 4, 183, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Stwux { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(m.read_u32(0x2004).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(t.gpr[3], 0x2004);
+    }
+
+    #[test]
+    fn stwux_ra0_rejected() {
+        let (mut t, mut m) = setup();
+        t.gpr[4] = 4;
+        t.gpr[5] = 1;
+        let msg = expect_unsupported(xform(5, 0, 4, 183, 0), &mut t, &mut m);
+        assert!(msg.contains("stwux"));
+    }
+
+    #[test]
+    fn stbu_store_updates_ra() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[5] = 0xAB;
+        run_word(dform(39, 5, 3, 1), &mut t, &mut m);
+        assert_eq!(m.read_u8(0x2001).unwrap(), 0xAB);
+        assert_eq!(t.gpr[3], 0x2001);
+    }
+
+    #[test]
+    fn stbu_ra0_rejected() {
+        let (mut t, mut m) = setup();
+        let msg = expect_unsupported(dform(39, 5, 0, 0), &mut t, &mut m);
+        assert!(msg.contains("stbu"));
+    }
+
+    #[test]
+    fn sthu_store_updates_ra() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[5] = 0x1234;
+        run_word(dform(45, 5, 3, 2), &mut t, &mut m);
+        assert_eq!(m.read_bytes(0x2002, 2).unwrap(), &[0x12, 0x34]);
+        assert_eq!(t.gpr[3], 0x2002);
+    }
+
+    #[test]
+    fn sthu_misaligned_faults() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2001;
+        t.gpr[5] = 0x1234;
+        assert_eq!(expect_align(dform(45, 5, 3, 0), &mut t, &mut m), 0x2001);
+    }
+
+    // --- Update-form loads ---
+
+    #[test]
+    fn lbzu_basic() {
+        let (mut t, mut m) = setup();
+        m.write_u8(0x2002, 0x7F).unwrap();
+        t.gpr[3] = 0x2000;
+        let w = dform(35, 4, 3, 2);
+        assert!(matches!(decode(w).unwrap(), Decoded::Lbzu { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0x7F);
+        assert_eq!(t.gpr[3], 0x2002);
+    }
+
+    #[test]
+    fn lbzu_invalid_forms_rejected() {
+        let (mut t, mut m) = setup();
+        expect_unsupported(dform(35, 4, 0, 0), &mut t, &mut m);
+        expect_unsupported(dform(35, 3, 3, 1), &mut t, &mut m);
+    }
+
+    #[test]
+    fn lhau_sign_extends_and_updates() {
+        let (mut t, mut m) = setup();
+        m.write_bytes(0x2000, &0x8001u16.to_be_bytes()).unwrap();
+        t.gpr[3] = 0x2000;
+        let w = dform(43, 4, 3, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Lhau { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0xFFFF_8001);
+        assert_eq!(t.gpr[3], 0x2000);
+    }
+
+    #[test]
+    fn lhau_invalid_forms_rejected() {
+        let (mut t, mut m) = setup();
+        expect_unsupported(dform(43, 4, 0, 0), &mut t, &mut m);
+        expect_unsupported(dform(43, 3, 3, 0), &mut t, &mut m);
+    }
+
+    #[test]
+    fn lhzu_zero_extends_and_updates() {
+        let (mut t, mut m) = setup();
+        m.write_bytes(0x2004, &0x80FFu16.to_be_bytes()).unwrap();
+        t.gpr[3] = 0x2000;
+        run_word(dform(41, 4, 3, 4), &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0x80FF);
+        assert_eq!(t.gpr[3], 0x2004);
+    }
+
+    #[test]
+    fn lha_ra0_sign_extends() {
+        let (mut t, mut m) = setup();
+        m.write_bytes(0x2000, &0xFF00u16.to_be_bytes()).unwrap();
+        let w = dform(42, 4, 0, 0x2000);
+        assert!(matches!(decode(w).unwrap(), Decoded::Lha { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0xFFFF_FF00);
+    }
+
+    // --- Indexed byte/halfword ---
+
+    #[test]
+    fn lbzx_ra0_indexed() {
+        let (mut t, mut m) = setup();
+        m.write_u8(0x2005, 0x42).unwrap();
+        t.gpr[4] = 0x2005;
+        let w = xform(5, 0, 4, 87, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Lbzx { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0x42);
+    }
+
+    #[test]
+    fn lbzux_basic() {
+        let (mut t, mut m) = setup();
+        m.write_u8(0x2004, 0x11).unwrap();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 4;
+        run_word(xform(5, 3, 4, 119, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0x11);
+        assert_eq!(t.gpr[3], 0x2004);
+    }
+
+    #[test]
+    fn stbx_basic() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 8;
+        t.gpr[5] = 0x99;
+        run_word(xform(5, 3, 4, 215, 0), &mut t, &mut m);
+        assert_eq!(m.read_u8(0x2008).unwrap(), 0x99);
+        // Non-update form leaves RA alone.
+        assert_eq!(t.gpr[3], 0x2000);
+    }
+
+    #[test]
+    fn stbux_basic_and_ra0_rejected() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 2;
+        t.gpr[5] = 0x5A;
+        run_word(xform(5, 3, 4, 247, 0), &mut t, &mut m);
+        assert_eq!(m.read_u8(0x2002).unwrap(), 0x5A);
+        assert_eq!(t.gpr[3], 0x2002);
+        expect_unsupported(xform(5, 0, 4, 247, 0), &mut t, &mut m);
+    }
+
+    #[test]
+    fn lhzx_basic() {
+        let (mut t, mut m) = setup();
+        m.write_bytes(0x2010, &0xABCDu16.to_be_bytes()).unwrap();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 0x10;
+        let w = xform(5, 3, 4, 279, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Lhzx { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0xABCD);
+    }
+
+    #[test]
+    fn lhzx_misaligned_faults() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 1;
+        assert_eq!(expect_align(xform(5, 3, 4, 279, 0), &mut t, &mut m), 0x2001);
+    }
+
+    #[test]
+    fn lhzux_basic() {
+        let (mut t, mut m) = setup();
+        m.write_bytes(0x2004, &0x00EEu16.to_be_bytes()).unwrap();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 4;
+        run_word(xform(5, 3, 4, 311, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0x00EE);
+        assert_eq!(t.gpr[3], 0x2004);
+    }
+
+    #[test]
+    fn lhax_sign_extends_indexed() {
+        let (mut t, mut m) = setup();
+        m.write_bytes(0x2006, &0x8002u16.to_be_bytes()).unwrap();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 6;
+        run_word(xform(5, 3, 4, 343, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0xFFFF_8002);
+    }
+
+    #[test]
+    fn lhaux_basic_and_invalid_rejected() {
+        let (mut t, mut m) = setup();
+        m.write_bytes(0x2008, &0x0001u16.to_be_bytes()).unwrap();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 8;
+        run_word(xform(5, 3, 4, 375, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[5], 1);
+        assert_eq!(t.gpr[3], 0x2008);
+        expect_unsupported(xform(5, 0, 4, 375, 0), &mut t, &mut m);
+        expect_unsupported(xform(3, 3, 4, 375, 0), &mut t, &mut m);
+    }
+
+    #[test]
+    fn sthx_basic() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 6;
+        t.gpr[5] = 0xBEEF;
+        let w = xform(5, 3, 4, 407, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Sthx { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(m.read_bytes(0x2006, 2).unwrap(), &[0xBE, 0xEF]);
+        assert_eq!(t.gpr[3], 0x2000);
+    }
+
+    #[test]
+    fn sthx_misaligned_faults() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        assert_eq!(expect_align(xform(5, 3, 4, 407, 0), &mut t, &mut m), 0x2003);
+    }
+
+    #[test]
+    fn sthux_basic() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x2000;
+        t.gpr[4] = 4;
+        t.gpr[5] = 0xCAFE;
+        run_word(xform(5, 3, 4, 439, 0), &mut t, &mut m);
+        assert_eq!(m.read_bytes(0x2004, 2).unwrap(), &[0xCA, 0xFE]);
+        assert_eq!(t.gpr[3], 0x2004);
+    }
+
+    // --- Shifts ---
+
+    #[test]
+    fn sraw_shifts_and_clears_ca() {
+        let (mut t, mut m) = setup();
+        // Positive value: exact shift, CA stays clear.
+        t.gpr[5] = 0x4000_0000;
+        t.gpr[6] = 2;
+        let w = xform(5, 4, 6, 792, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Sraw { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0x1000_0000);
+        assert!(!t.xer.ca());
+        // Positive value with bits shifted out: CA still clear.
+        t.gpr[5] = 0x0000_0003;
+        t.gpr[6] = 1;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 1);
+        assert!(!t.xer.ca());
+        // Zero shift clears a sticky CA.
+        t.xer.set_ca(true);
+        t.gpr[6] = 0;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0x0000_0003);
+        assert!(!t.xer.ca());
+    }
+
+    #[test]
+    fn sraw_negative_sets_ca_and_cr0() {
+        let (mut t, mut m) = setup();
+        t.gpr[5] = 0x8000_0001;
+        t.gpr[6] = 1;
+        run_word(xform(5, 4, 6, 792, 1), &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0xC000_0000);
+        assert!(t.xer.ca());
+        assert_eq!(t.cr.field(0), 0b1000);
+    }
+
+    #[test]
+    fn srawi_immediate_with_ca() {
+        let (mut t, mut m) = setup();
+        // sh rides in the RB field; XO=824.
+        let w = xform(5, 4, 4, 824, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Srawi { .. }));
+        // -256 >> 4 = -16, low nibble was zero so CA stays clear.
+        t.gpr[5] = 0xFFFF_FF00;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0xFFFF_FFF0);
+        assert!(!t.xer.ca());
+        // Shifted-out 1-bit on a negative value sets CA.
+        t.gpr[5] = 0xFFFF_FF01;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0xFFFF_FFF0);
+        assert!(t.xer.ca());
+    }
+
+    #[test]
+    fn srawi_zero_sets_cr0_eq() {
+        let (mut t, mut m) = setup();
+        t.gpr[5] = 0;
+        run_word(xform(5, 4, 5, 824, 1), &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0);
+        assert!(!t.xer.ca());
+        assert_eq!(t.cr.field(0), 0b0010);
+    }
+
+    // --- subfic / cntlzw verification ---
+
+    #[test]
+    fn subfic_ca_semantics() {
+        let (mut t, mut m) = setup();
+        // 10 - 3 = 7, no borrow: CA set.
+        t.gpr[3] = 3;
+        run_word(dform(8, 4, 3, 10), &mut t, &mut m);
+        assert_eq!(t.gpr[4], 7);
+        assert!(t.xer.ca());
+        // 3 - 10 borrows: CA clear.
+        t.gpr[3] = 10;
+        run_word(dform(8, 4, 3, 3), &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0xFFFF_FFF9);
+        assert!(!t.xer.ca());
+        // Negative-immediate regression: -5 - 0xFFFFFFFE borrows (CA=0).
+        t.gpr[3] = 0xFFFF_FFFE;
+        run_word(dform(8, 4, 3, -5), &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0xFFFF_FFFD);
+        assert!(!t.xer.ca());
+        // D-form arithmetic leaves CR0 alone.
+        t.cr.set_field(0, 0b0100);
+        t.gpr[3] = 1;
+        run_word(dform(8, 4, 3, 2), &mut t, &mut m);
+        assert_eq!(t.cr.field(0), 0b0100);
+    }
+
+    #[test]
+    fn cntlzw_counts_and_sets_cr0() {
+        let (mut t, mut m) = setup();
+        t.gpr[5] = 0x00F0_0000;
+        let w = xform(5, 4, 0, 26, 1);
+        assert!(matches!(decode(w).unwrap(), Decoded::Cntlzw { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 8);
+        assert_eq!(t.cr.field(0), 0b0100);
+        t.gpr[5] = 0;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 32);
+        assert_eq!(t.cr.field(0), 0b0100);
+        t.gpr[5] = 0x8000_0000;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.gpr[4], 0);
+        assert_eq!(t.cr.field(0), 0b0010);
+    }
+
+    // --- Traps: never silent ---
+
+    #[test]
+    fn tw_to0_and_no_fire_advance() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 1;
+        t.gpr[4] = 2;
+        run_word(xform(0, 3, 4, 4, 0), &mut t, &mut m);
+        assert_eq!(t.pc, 0x1004);
+        // EQ-only trap that does not fire also advances.
+        run_word(xform(0x04, 3, 4, 4, 0), &mut t, &mut m);
+        assert_eq!(t.pc, 0x1008);
+    }
+
+    #[test]
+    fn tw_eq_fires_unsupported() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 7;
+        t.gpr[4] = 7;
+        let w = xform(0x04, 3, 4, 4, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Tw { .. }));
+        let msg = expect_unsupported(w, &mut t, &mut m);
+        assert!(msg.contains("tw trap fired"));
+        assert!(msg.contains("pc="));
+    }
+
+    #[test]
+    fn tw_signed_unsigned_conditions() {
+        let (mut t, mut m) = setup();
+        // -1 < 1 signed fires SLT (0x10).
+        t.gpr[3] = 0xFFFF_FFFF;
+        t.gpr[4] = 1;
+        expect_unsupported(xform(0x10, 3, 4, 4, 0), &mut t, &mut m);
+        // Same pair fires UGT (0x01) unsigned.
+        expect_unsupported(xform(0x01, 3, 4, 4, 0), &mut t, &mut m);
+        // But not SGT (0x08): -1 > 1 signed is false.
+        run_word(xform(0x08, 3, 4, 4, 0), &mut t, &mut m);
+    }
+
+    #[test]
+    fn twi_fires_and_passes() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 5;
+        let w = dform(3, 0x04, 3, 5);
+        assert!(matches!(decode(w).unwrap(), Decoded::Twi { .. }));
+        let msg = expect_unsupported(w, &mut t, &mut m);
+        assert!(msg.contains("twi trap fired"));
+        // Non-equal passes through.
+        run_word(dform(3, 0x04, 3, 6), &mut t, &mut m);
+        assert_eq!(t.pc, 0x1004);
+        // TO=0 never traps.
+        run_word(dform(3, 0, 3, 5), &mut t, &mut m);
+        assert_eq!(t.pc, 0x1008);
+    }
+
+    // --- Condition register ---
+
+    #[test]
+    fn mcrf_copies_field() {
+        let (mut t, mut m) = setup();
+        t.cr.set_field(2, 0b1010);
+        t.cr.set_field(5, 0b0000);
+        // crfd=5 (BO=20), crfs=2 (BI=8), XO=0.
+        let w = xlform(20, 8, 0, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Mcrf { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.cr.field(5), 0b1010);
+        assert_eq!(t.cr.field(2), 0b1010);
+        assert_eq!(t.cr.field(0), 0);
+    }
+
+    #[test]
+    fn crand_sets_bit() {
+        let (mut t, mut m) = setup();
+        // ba=0 -> 1, bb=1 -> 0.
+        t.cr.0 = 0x8000_0000;
+        run_word(xlform(2, 0, 1, 257), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 0);
+        assert_eq!(t.cr.0 & !0x2000_0000, 0x8000_0000);
+    }
+
+    #[test]
+    fn cror_sets_bit() {
+        let (mut t, mut m) = setup();
+        t.cr.0 = 0x8000_0000;
+        run_word(xlform(2, 0, 1, 449), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 1);
+    }
+
+    #[test]
+    fn crxor_sets_bit() {
+        let (mut t, mut m) = setup();
+        t.cr.0 = 0x8000_0000;
+        run_word(xlform(2, 0, 1, 193), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 1);
+        // Same bits cancel.
+        t.cr.0 = 0xC000_0000;
+        run_word(xlform(2, 0, 1, 193), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 0);
+    }
+
+    #[test]
+    fn crnor_clears_bit() {
+        let (mut t, mut m) = setup();
+        t.cr.0 = 0x8000_0000;
+        run_word(xlform(2, 0, 1, 33), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 0);
+        // Both clear -> NOR sets.
+        t.cr.0 = 0;
+        run_word(xlform(2, 0, 1, 33), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 1);
+    }
+
+    #[test]
+    fn cr_complements_behave() {
+        let (mut t, mut m) = setup();
+        // ba=1, bb=0: crandc -> 1, crorc -> 1, creqv -> 0, crnand -> 1.
+        t.cr.0 = 0x8000_0000;
+        run_word(xlform(2, 0, 1, 129), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 1);
+        t.cr.0 = 0x8000_0000;
+        run_word(xlform(2, 0, 1, 417), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 1);
+        t.cr.0 = 0x8000_0000;
+        run_word(xlform(2, 0, 1, 289), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 0);
+        t.cr.0 = 0x8000_0000;
+        run_word(xlform(2, 0, 1, 225), &mut t, &mut m);
+        assert_eq!((t.cr.0 >> 29) & 1, 1);
+    }
+
+    #[test]
+    fn unknown_xo31_stays_unsupported() {
+        let (mut t, mut m) = setup();
+        let w = xform(0, 0, 0, 100, 0);
+        assert!(matches!(decode(w).unwrap(), Decoded::Unsupported { .. }));
+        let msg = expect_unsupported(w, &mut t, &mut m);
+        assert!(msg.contains("xo31"));
     }
 }

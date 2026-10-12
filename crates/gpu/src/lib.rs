@@ -9,6 +9,7 @@ use x360_common::{EmuError, Result};
 
 pub mod bridge;
 pub mod pm4;
+pub mod regs;
 pub mod validation;
 
 /// Packet classes (PM4-style).
