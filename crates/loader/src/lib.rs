@@ -51,6 +51,24 @@ pub const KEY_ORIGINAL_PE_NAME: u32 = 0x0001_83FF;
 pub const KEY_MULTIDISC_MEDIA_IDS: u32 = 0x0004_06FF;
 pub const KEY_ALTERNATE_TITLE_IDS: u32 = 0x0004_07FF;
 
+/// Encryption types from the file-format-info structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XexEncryption {
+    None,
+    Normal,
+    Unknown(u16),
+}
+
+/// Compression types from the file-format-info structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XexCompression {
+    None,
+    Basic,
+    Normal,
+    Delta,
+    Unknown(u16),
+}
+
 pub const DEFAULT_BASE_ADDRESS: u32 = 0x8200_0000;
 
 // Security header field offsets from `security_offset` (reference
@@ -158,6 +176,17 @@ pub struct XexInfo {
     /// Recorded static library names when key `0x000200FF` is present.
     /// Added field, defaults to empty. No import resolution performed.
     pub static_libs: Vec<StaticLib>,
+    /// File-format info when key `0x000003FF` is present: encryption and
+    /// compression of the image body. Absent = unknown, never assumed.
+    pub format_info: Option<FormatInfo>,
+}
+
+/// File-format info (`xex2_opt_file_format_info` layout facts:
+/// size u32, encryption u16, compression u16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatInfo {
+    pub encryption: XexEncryption,
+    pub compression: XexCompression,
 }
 
 fn read_u32(image: &[u8], off: usize) -> Result<u32> {
@@ -274,6 +303,37 @@ fn parse_tls(image: &[u8], data_off: usize) -> Result<TlsInfo> {
     })
 }
 
+/// File-format info needs 8 bytes: size u32, encryption u16,
+/// compression u16. Unknown codes are recorded, never guessed.
+fn parse_format_info(image: &[u8], data_off: usize) -> Result<(u32, FormatInfo)> {
+    if data_off + 8 > image.len() {
+        return Err(EmuError::InvalidExecutable(
+            "file format info truncated".into(),
+        ));
+    }
+    let size = read_u32(image, data_off)?;
+    let raw = read_u32(image, data_off + 4)?;
+    let encryption = match (raw >> 16) as u16 {
+        0 => XexEncryption::None,
+        1 => XexEncryption::Normal,
+        other => XexEncryption::Unknown(other),
+    };
+    let compression = match (raw & 0xFFFF) as u16 {
+        0 => XexCompression::None,
+        1 => XexCompression::Basic,
+        2 => XexCompression::Normal,
+        3 => XexCompression::Delta,
+        other => XexCompression::Unknown(other),
+    };
+    Ok((
+        size,
+        FormatInfo {
+            encryption,
+            compression,
+        },
+    ))
+}
+
 fn parse_static_libs(image: &[u8], data_off: usize) -> Result<(u32, Vec<StaticLib>)> {
     if data_off + 4 > image.len() {
         return Err(EmuError::InvalidExecutable(
@@ -355,6 +415,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
     let mut stack_size: Option<u32> = None;
     let mut title_id: Option<u32> = None;
     let mut tls_info: Option<TlsInfo> = None;
+    let mut format_info: Option<FormatInfo> = None;
     let mut static_libs: Vec<StaticLib> = Vec::new();
     let mut dirs = Vec::new();
 
@@ -432,6 +493,22 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
                         },
                     });
                     static_libs.append(&mut libs);
+                } else if key == KEY_FILE_FORMAT_INFO {
+                    let (size, info) = parse_format_info(image, data_off)?;
+                    if (data_off as u64) + (size as u64) > image.len() as u64 {
+                        return Err(EmuError::InvalidExecutable(format!(
+                            "file format info OOB (off {} size {})",
+                            data_off, size
+                        )));
+                    }
+                    dirs.push(XexDir {
+                        key,
+                        data: XexDirData::AtOffset {
+                            offset: value,
+                            size,
+                        },
+                    });
+                    format_info = Some(info);
                 } else {
                     // Only these keys are documented size-prefixed (first
                     // word = total size). Anything else (timestamps,
@@ -512,6 +589,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
             page_descriptors: sec.pages,
             tls_info,
             static_libs,
+            format_info,
         },
     ))
 }
@@ -671,6 +749,23 @@ mod tests {
         assert!(parse_xex(&v).is_err());
     }
 
+    #[test]
+    fn format_info_encryption_kinds() {
+        // size=8, encryption=1 (normal), compression=2 (normal).
+        let payload = [0u8, 0, 0, 8, 0, 1, 0, 2];
+        let img = dir_image_with_payload(KEY_FILE_FORMAT_INFO, &payload);
+        let (_, info) = parse_xex(&img).unwrap();
+        let fmt = info.format_info.expect("format info parsed");
+        assert_eq!(fmt.encryption, XexEncryption::Normal);
+        assert_eq!(fmt.compression, XexCompression::Normal);
+    }
+
+    #[test]
+    fn format_info_truncated_rejected() {
+        let img = dir_image_with_payload(KEY_FILE_FORMAT_INFO, &[0u8; 4]);
+        assert!(parse_xex(&img).is_err());
+    }
+
     /// Retail validation: parse every `.xex` in `$X360_FW_DIR`.
     /// Skipped when unset (CI, clean machines). Firmware never enters git.
     #[test]
@@ -691,7 +786,7 @@ mod tests {
             let bytes = std::fs::read(path).expect("read xex");
             match parse_xex(&bytes) {
                 Ok((_, info)) => println!(
-                    "{}: entry={} base={:08x} title={:?} stack={:?} dll={}",
+                    "{}: entry={} base={:08x} title={:?} stack={:?} dll={} enc={:?} comp={:?}",
                     path.file_name().unwrap().to_string_lossy(),
                     info.entry_point
                         .map(|e| format!("{:08x}", e))
@@ -699,7 +794,9 @@ mod tests {
                     info.base_address,
                     info.title_id.map(|t| format!("{:08x}", t)),
                     info.stack_size,
-                    info.is_dll
+                    info.is_dll,
+                    info.format_info.map(|f| format!("{:?}", f.encryption)),
+                    info.format_info.map(|f| format!("{:?}", f.compression)),
                 ),
                 Err(e) => panic!(
                     "{}: rejected: {}",

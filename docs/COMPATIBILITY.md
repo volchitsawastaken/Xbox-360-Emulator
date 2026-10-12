@@ -36,7 +36,7 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 
 | Area | Status | Notes |
 |---|---|---|
-| XEX2 header/directory parse | partial | Real XEX1/XEX2 model: 8-byte entries, inline (low byte 00/01) vs offset data, entry/base/stack/title keys, security load address; OOB rejected; tests |
+| XEX2 header/directory parse | partial | Real XEX1/XEX2 model: 8-byte entries, inline (low byte 00/01) vs offset data, entry/base/stack/title/TLS/static-lib/format-info keys, security load address; OOB rejected; 26 retail headers verified; tests |
 | Relocations/imports/TLS | not-started | Directory slices validated; semantic interpretation pending |
 | Threads/events/mutexes/sems | partial | create_thread/event/set/wait with queued waiters; blocking wait pending M6 |
 | Syscalls | partial | 0=time, 2=putc console tested; others explicit UnimplementedSyscall; 1=exit handled by boot runner |
