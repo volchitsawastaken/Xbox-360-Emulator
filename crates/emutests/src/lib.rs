@@ -89,4 +89,19 @@ mod integration {
         let mut k = x360_kernel::Kernel::new();
         assert!(k.syscall(9999, &[]).is_err());
     }
+
+    #[test]
+    fn demo_guest_boots_end_to_end() {
+        use x360_kernel::boot::{demo_guest_words, run_until_exit};
+        let mut mem = Memory::new();
+        let entry = 0x8200_9000;
+        for (i, w) in demo_guest_words().iter().enumerate() {
+            mem.write_u32(entry + i as u32 * 4, *w).unwrap();
+        }
+        let mut xenon = x360_cpu::Xenon::new(entry);
+        let mut kernel = x360_kernel::Kernel::new();
+        let exit = run_until_exit(&mut mem, &mut xenon, &mut kernel, 64).unwrap();
+        assert_eq!(exit.code, 0);
+        assert_eq!(exit.output, b"HI");
+    }
 }

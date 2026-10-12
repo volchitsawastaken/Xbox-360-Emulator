@@ -37,7 +37,8 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 | XEX2 header/directory parse | partial | Magic + bounds + entry validation, OOB dir entries rejected; tests |
 | Relocations/imports/TLS | not-started | Explicitly not parsed yet |
 | Threads/events/mutexes/sems | partial | create_thread/event/set/wait with queued waiters; blocking wait pending M6 |
-| Syscalls | unsupported | Table returns UnimplementedSyscall except id 0 (time); convention r0=id |
+| Syscalls | partial | 0=time, 2=putc console tested; others explicit UnimplementedSyscall; 1=exit handled by boot runner |
+| Boot | partial | Demo guest (putc "HI" + exit 0) verified end-to-end via `run_until_exit`; retail boot not-started |
 | ISO/GDFX/STFS/extracted dir | partial | identify + default.xex resolve; ISO/STFS payload parsing not-started |
 
 ## Audio

@@ -1,8 +1,16 @@
 //! Threads, sync primitives, syscalls, XAM services.
+//!
+//! Guest syscall convention (M4, pending-M6 formal ABI):
+//! guest `r0` holds the id at `sc` time.
+//! - 0: time in ms (returns value)
+//! - 1: exit with code in `r3` (handled by the boot runner)
+//! - 2: console putc of low byte of `r3` (returns 0)
 
 use std::collections::{HashMap, VecDeque};
 use x360_common::{EmuError, Result};
 use x360_cpu::regs::ThreadState;
+
+pub mod boot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle(pub u32);
@@ -29,6 +37,8 @@ pub struct Kernel {
     events: HashMap<u32, Event>,
     pub syscall_count: u64,
     pub unimplemented_syscalls: HashMap<u32, u64>,
+    /// Guest console bytes from syscall 2 (putc). Bounded to 1 MB.
+    pub console: Vec<u8>,
 }
 
 impl Kernel {
@@ -40,6 +50,7 @@ impl Kernel {
             events: HashMap::new(),
             syscall_count: 0,
             unimplemented_syscalls: HashMap::new(),
+            console: Vec::new(),
         }
     }
 
@@ -122,7 +133,8 @@ impl Kernel {
 
     /// Syscall dispatch. Implemented numbers grow with M6; others are
     /// explicit UnimplementedSyscall, never fake success.
-    pub fn syscall(&mut self, id: u32, _args: &[u32]) -> Result<u32> {
+    /// id 1 (exit) is handled by the boot runner, not here.
+    pub fn syscall(&mut self, id: u32, args: &[u32]) -> Result<u32> {
         self.syscall_count += 1;
         match id {
             // 0: GetTickCount-style stub with real time base.
@@ -130,6 +142,14 @@ impl Kernel {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u32)
                 .unwrap_or(0)),
+            // 2: console putc, low byte of first arg.
+            2 => {
+                let b = args.first().copied().unwrap_or(0) as u8;
+                if self.console.len() < 1024 * 1024 {
+                    self.console.push(b);
+                }
+                Ok(0)
+            }
             _ => {
                 *self.unimplemented_syscalls.entry(id).or_insert(0) += 1;
                 log::warn!("kernel: unimplemented syscall {}", id);

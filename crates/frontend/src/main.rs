@@ -117,6 +117,34 @@ impl EmuApp {
         Ok(info.entry_point)
     }
 
+    /// Place the demo guest at entry and run it to exit. Real execution.
+    pub fn boot_demo(&mut self) -> Result<()> {
+        use x360_kernel::boot::{demo_guest_words, run_until_exit};
+        let entry = 0x8200_1000;
+        for (i, w) in demo_guest_words().iter().enumerate() {
+            self.mem.write_u32(entry + i as u32 * 4, *w)?;
+        }
+        self.xenon = x360_cpu::Xenon::new(entry);
+        self.kernel.console.clear();
+        match run_until_exit(&mut self.mem, &mut self.xenon, &mut self.kernel, 1024) {
+            Ok(exit) => {
+                self.status_line = format!(
+                    "booted: exit={} steps={} out={:?}",
+                    exit.code,
+                    exit.steps,
+                    String::from_utf8_lossy(&exit.output)
+                );
+                self.log_lines.push(self.status_line.clone());
+                Ok(())
+            }
+            Err(e) => {
+                self.status_line = format!("boot failed: {}", e);
+                self.log_lines.push(self.status_line.clone());
+                Err(e)
+            }
+        }
+    }
+
     /// Step all 6 hardware threads once (round-robin).
     pub fn step_cpu(&mut self) -> Result<()> {
         let traps = self.xenon.step_all(&mut self.mem)?;
@@ -237,6 +265,9 @@ impl eframe::App for EmuApp {
                         self.status_line = format!("step fault: {}", e);
                         self.log_lines.push(self.status_line.clone());
                     }
+                }
+                if ui.button("Boot demo").clicked() {
+                    let _ = self.boot_demo();
                 }
                 if ui.button("Test audio").clicked() {
                     let _ = self.test_audio();
