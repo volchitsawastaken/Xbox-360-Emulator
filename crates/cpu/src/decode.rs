@@ -73,6 +73,57 @@ pub enum Decoded {
         bi: u32,
         lk: bool,
     },
+    // Rotate-and-mask (M-form)
+    Rlwimi {
+        rs: u32,
+        ra: u32,
+        sh: u32,
+        mb: u32,
+        me: u32,
+        rc: bool,
+    },
+    Rlwinm {
+        rs: u32,
+        ra: u32,
+        sh: u32,
+        mb: u32,
+        me: u32,
+        rc: bool,
+    },
+    Rlwnm {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        mb: u32,
+        me: u32,
+        rc: bool,
+    },
+    // Compares (D-form with BF/L)
+    Cmpi {
+        bf: u32,
+        l: bool,
+        ra: u32,
+        simm: i16,
+    },
+    Cmpli {
+        bf: u32,
+        l: bool,
+        ra: u32,
+        uimm: u16,
+    },
+    // X-form register compares (XO 0 = cmp, XO 32 = cmpl)
+    Cmp {
+        bf: u32,
+        l: bool,
+        ra: u32,
+        rb: u32,
+    },
+    Cmpl {
+        bf: u32,
+        l: bool,
+        ra: u32,
+        rb: u32,
+    },
     // Loads/stores D-form
     Lwz {
         rt: u32,
@@ -455,6 +506,18 @@ pub fn decode(word: u32) -> Result<Decoded> {
             ra,
             simm: d as i16,
         }),
+        10 => Ok(Decoded::Cmpli {
+            bf: (word >> 23) & 0x7,
+            l: word & 0x20_0000 != 0,
+            ra,
+            uimm: d,
+        }),
+        11 => Ok(Decoded::Cmpi {
+            bf: (word >> 23) & 0x7,
+            l: word & 0x20_0000 != 0,
+            ra,
+            simm: d as i16,
+        }),
         14 => Ok(Decoded::Addi {
             rt,
             ra,
@@ -476,6 +539,30 @@ pub fn decode(word: u32) -> Result<Decoded> {
             li: ex_li(word),
             aa: word & 2 != 0,
             lk: word & 1 != 0,
+        }),
+        20 => Ok(Decoded::Rlwimi {
+            rs: rt,
+            ra,
+            sh: rb,
+            mb: (word >> 6) & 0x1F,
+            me: (word >> 1) & 0x1F,
+            rc: word & 1 != 0,
+        }),
+        21 => Ok(Decoded::Rlwinm {
+            rs: rt,
+            ra,
+            sh: rb,
+            mb: (word >> 6) & 0x1F,
+            me: (word >> 1) & 0x1F,
+            rc: word & 1 != 0,
+        }),
+        23 => Ok(Decoded::Rlwnm {
+            rs: rt,
+            ra,
+            rb,
+            mb: (word >> 6) & 0x1F,
+            me: (word >> 1) & 0x1F,
+            rc: word & 1 != 0,
         }),
         19 => {
             let xo = (word >> 1) & 0x3FF;
@@ -516,10 +603,22 @@ pub fn decode(word: u32) -> Result<Decoded> {
             let rc = word & 1 != 0;
             let oe = (word >> 10) & 1 != 0;
             match xo {
+                0 => Ok(Decoded::Cmp {
+                    bf: rt >> 2,
+                    l: rt & 0x2 != 0,
+                    ra,
+                    rb,
+                }),
                 4 => Ok(Decoded::Tw { to: rt, ra, rb }),
                 20 => Ok(Decoded::Lwarx { rt, ra, rb }),
                 23 => Ok(Decoded::Lwzx { rt, ra, rb }),
                 28 => Ok(Decoded::And { rs: rt, ra, rb, rc }),
+                32 => Ok(Decoded::Cmpl {
+                    bf: rt >> 2,
+                    l: rt & 0x2 != 0,
+                    ra,
+                    rb,
+                }),
                 // Add/Subf: top XO bit is OE, so accept both OE=0/1 forms.
                 40 | 552 => Ok(Decoded::Subf { rt, ra, rb, rc, oe }),
                 87 => Ok(Decoded::Lbzx { rt, ra, rb }),

@@ -4679,6 +4679,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "x360-common",
+ "x360-cpu",
  "x360-memory",
 ]
 

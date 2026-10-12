@@ -60,6 +60,36 @@ fn update_cr0(t: &mut ThreadState, v: u32) {
     t.cr.set_cr0(v as i32, so);
 }
 
+/// CR field from an ordered comparison. SO copied from XER; XER otherwise
+/// untouched (compares never set CA/OV).
+fn update_cr_bf(t: &mut ThreadState, bf: u32, lt: bool, gt: bool, eq: bool) {
+    let v = ((lt as u8) << 3) | ((gt as u8) << 2) | ((eq as u8) << 1) | (t.xer.so() as u8);
+    t.cr.set_field(bf, v);
+}
+
+fn cmp_signed(t: &mut ThreadState, bf: u32, a: i32, b: i32) {
+    update_cr_bf(t, bf, a < b, a > b, a == b);
+}
+
+fn cmp_unsigned(t: &mut ThreadState, bf: u32, a: u32, b: u32) {
+    update_cr_bf(t, bf, a < b, a > b, a == b);
+}
+
+/// Rotate-and-mask helper: 1s from MB to ME inclusive, wrapping at bit 0.
+/// Bit numbering matches registers (bit 0 = MSB).
+fn rlw_mask(mb: u32, me: u32) -> u32 {
+    let mut mask = 0u32;
+    let mut i = mb & 0x1F;
+    loop {
+        mask |= 1 << (31 - i);
+        if i == (me & 0x1F) {
+            break;
+        }
+        i = (i + 1) & 0x1F;
+    }
+    mask
+}
+
 /// Read one CR bit by PowerPC bit number (0 = CR0.LT MSB .. 31 = CR7.SO).
 fn cr_bit(t: &ThreadState, b: u32) -> u32 {
     (t.cr.0 >> (31 - b)) & 1
@@ -181,6 +211,103 @@ pub fn execute(
             let a = t.gpr[ra as usize] as i32 as i64;
             let v = a.wrapping_mul(simm as i64) as u32;
             t.gpr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Cmpi { bf, l, ra, simm } => {
+            if l {
+                return Err(EmuError::Unsupported(format!(
+                    "cmpi L=1 needs 64-bit regs word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            cmp_signed(t, bf, t.gpr[ra as usize] as i32, simm as i32);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Cmpli { bf, l, ra, uimm } => {
+            if l {
+                return Err(EmuError::Unsupported(format!(
+                    "cmpli L=1 needs 64-bit regs word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            cmp_unsigned(t, bf, t.gpr[ra as usize], uimm as u32);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Cmp { bf, l, ra, rb } => {
+            if l {
+                return Err(EmuError::Unsupported(format!(
+                    "cmp L=1 needs 64-bit regs word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            cmp_signed(t, bf, t.gpr[ra as usize] as i32, t.gpr[rb as usize] as i32);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Cmpl { bf, l, ra, rb } => {
+            if l {
+                return Err(EmuError::Unsupported(format!(
+                    "cmpl L=1 needs 64-bit regs word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            cmp_unsigned(t, bf, t.gpr[ra as usize], t.gpr[rb as usize]);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Rlwimi {
+            rs,
+            ra,
+            sh,
+            mb,
+            me,
+            rc,
+        } => {
+            let r = t.gpr[rs as usize].rotate_left(sh);
+            let mask = rlw_mask(mb, me);
+            let v = (r & mask) | (t.gpr[ra as usize] & !mask);
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Rlwinm {
+            rs,
+            ra,
+            sh,
+            mb,
+            me,
+            rc,
+        } => {
+            let r = t.gpr[rs as usize].rotate_left(sh);
+            let v = r & rlw_mask(mb, me);
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Rlwnm {
+            rs,
+            ra,
+            rb,
+            mb,
+            me,
+            rc,
+        } => {
+            let sh = t.gpr[rb as usize] & 0x1F;
+            let r = t.gpr[rs as usize].rotate_left(sh);
+            let v = r & rlw_mask(mb, me);
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0(t, v);
+            }
             t.pc = next;
             Ok(None)
         }
@@ -971,6 +1098,113 @@ mod tests {
         execute(d, word, &mut t, &mut m).unwrap();
         assert_eq!(t.gpr[5], 0x8000_0000);
         assert!(t.xer.so());
+    }
+
+    // --- Rotate-and-mask + compares (retail prologue staples) ---
+
+    fn mform(opc: u32, rs: u32, ra: u32, sh: u32, mb: u32, me: u32, rc: u32) -> u32 {
+        (opc << 26) | (rs << 21) | (ra << 16) | (sh << 11) | (mb << 6) | (me << 1) | rc
+    }
+
+    #[test]
+    fn rlwinm_extracts_field() {
+        // rlwinm r5,r3,0,24,31 — low byte extract.
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0xDEAD_BEEF;
+        run_word(mform(21, 3, 5, 0, 24, 31, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0xEF);
+    }
+
+    #[test]
+    fn rlwinm_rotate_and_wrap_mask() {
+        // rlwinm r5,r3,4,0,27 — rotate 4, keep top 28 bits.
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x1234_5678;
+        run_word(mform(21, 3, 5, 4, 0, 27, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[5], t.gpr[3].rotate_left(4) & 0xFFFF_FFF0);
+    }
+
+    #[test]
+    fn rlwimi_inserts() {
+        // rlwimi r5,r3,16,0,15 — insert low half of r3 into top of r5.
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x0000_ABCD;
+        t.gpr[5] = 0x1234_5678;
+        run_word(mform(20, 3, 5, 16, 0, 15, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0xABCD_5678);
+    }
+
+    #[test]
+    fn rlwnm_uses_rb_shift() {
+        // rlwnm r5,r3,r4,0,31 (full mask) with r4=8.
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0x0000_0001;
+        t.gpr[4] = 8;
+        run_word(mform(23, 3, 5, 4, 0, 31, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0x100);
+    }
+
+    #[test]
+    fn rlwinm_rc_sets_cr0() {
+        let (mut t, mut m) = setup();
+        t.gpr[3] = 0;
+        run_word(mform(21, 3, 5, 0, 0, 31, 1), &mut t, &mut m);
+        assert_eq!(t.cr.field(0) & 0b0010, 0b0010); // EQ
+    }
+
+    #[test]
+    fn cmpli_conditions() {
+        let (mut t, mut m) = setup();
+        // cmpli cr1,r0,5 ; r3=5 -> EQ in cr1
+        t.gpr[3] = 5;
+        let w = (10u32 << 26) | (1 << 23) | (3 << 16) | 5;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.cr.field(1), 0b0010);
+        // cmpli cr1,r0,6 ; 5<6 -> LT
+        let w = (10u32 << 26) | (1 << 23) | (3 << 16) | 6;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.cr.field(1) >> 3 & 1, 1);
+        // unsigned: 0xFFFFFFFF > 6 -> GT
+        t.gpr[3] = 0xFFFF_FFFF;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.cr.field(1) >> 2 & 1, 1);
+    }
+
+    #[test]
+    fn cmpi_signed() {
+        let (mut t, mut m) = setup();
+        // cmpi cr0,r3,-1 ; r3=-5 < -1 -> LT
+        t.gpr[3] = (-5i32) as u32;
+        let w = (11u32 << 26) | (3 << 16) | 0xFFFF;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.cr.field(0) >> 3 & 1, 1);
+    }
+
+    #[test]
+    fn cmp_l64_is_explicit() {
+        let (mut t, mut m) = setup();
+        // cmpli with L=1 (bit 21).
+        let w = (10u32 << 26) | (1 << 21) | (3 << 16) | 5;
+        let d = decode(w).unwrap();
+        assert!(execute(d, w, &mut t, &mut m).is_err());
+    }
+
+    #[test]
+    fn cmp_and_cmpl_registers() {
+        let (mut t, mut m) = setup();
+        // cmplw cr6,r9,r11: XO=32, RT=(6<<2)|0=24.
+        t.gpr[9] = 10;
+        t.gpr[11] = 20;
+        let w = (31u32 << 26) | (24 << 21) | (9 << 16) | (11 << 11) | (32 << 1);
+        assert!(matches!(decode(w).unwrap(), Decoded::Cmpl { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.cr.field(6), 0b1000); // LT
+                                           // cmpw cr6,r9,r11 with equal values -> EQ.
+        t.gpr[11] = 10;
+        let w = (31u32 << 26) | (24 << 21) | (9 << 16) | (11 << 11);
+        assert!(matches!(decode(w).unwrap(), Decoded::Cmp { .. }));
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.cr.field(6), 0b0010); // EQ
     }
 
     // --- Update-form stores ---

@@ -509,6 +509,59 @@ mod tests {
         assert_eq!(mem.read_u32(0x8200_1000).unwrap(), 0xDEAD_BEEF);
     }
 
+    /// Retail proof: `dash.xex` sections load into guest memory and its
+    /// entry-point code disassembles with our own decoder. Prints the
+    /// first instructions plus supported/unsupported counts.
+    #[test]
+    fn retail_entry_disassembles() {
+        use super::super::parse_xex;
+        use x360_cpu::decode;
+        use x360_memory::Memory;
+        let dir = match std::env::var("X360_FW_DIR") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let path = std::path::Path::new(&dir).join("dash.xex");
+        let file = std::fs::read(&path).expect("read dash.xex");
+        let (hdr, info) = parse_xex(&file).expect("dash header parses");
+        let entry = info.entry_point.expect("dash has entry");
+        let image = loadable_image(&file, &hdr, &info).expect("dash decompresses");
+        let sections = parse_pe_sections(&image).expect("dash PE parses");
+        let mut mem = Memory::new();
+        load_sections_to_guest(&mut mem, &image, info.base_address, &sections)
+            .expect("dash sections load");
+        let mut supported = 0u32;
+        let mut unsupported = 0u32;
+        for i in 0..32u32 {
+            let addr = entry.wrapping_add(i * 4);
+            let word = mem
+                .fetch_u32(addr)
+                .unwrap_or_else(|e| panic!("dash fetch {:08x}: {}", addr, e));
+            match decode::decode(word) {
+                Ok(d) => {
+                    if matches!(d, decode::Decoded::Unsupported { .. }) {
+                        unsupported += 1;
+                        println!("{:08x}: <unimplemented: {:?}>", addr, d);
+                    } else {
+                        supported += 1;
+                        if supported <= 8 {
+                            println!("{:08x}: {}", addr, decode::disasm(word));
+                        }
+                    }
+                }
+                Err(e) => {
+                    unsupported += 1;
+                    println!("{:08x}: <decode error: {}>", addr, e);
+                }
+            }
+        }
+        println!("supported={} unsupported={}", supported, unsupported);
+        // Entry itself must be real code, and a retail prologue is
+        // overwhelmingly plain integer ops our decoder covers.
+        assert!(supported >= 24, "too much retail code undecodable");
+        let _ = unsupported;
+    }
+
     /// Retail proof: every unencrypted Basic XEX in `$X360_FW_DIR`
     /// decompresses to a PPCBE PE whose sections cover its entry point.
     /// Encrypted (AES/LZX) files report explicit Unsupported and are
