@@ -410,11 +410,31 @@ pub fn parse_pe_sections(image: &[u8]) -> Result<Vec<PeSection>> {
     Ok(sections)
 }
 
+/// Place a decompressed/decrypted XEX body flat at `base`.
+///
+/// The body is already the in-memory image: the reference
+/// (`xex_module.cc` `ReadImageBasicCompressed`/`ReadImageUncompressed`)
+/// copies decompressed blocks straight to `base_address_` with no
+/// section remapping, and import-record addresses are plain
+/// `base + offset` into it (verified on retail Braid: record slots
+/// read correctly only under flat placement; per-section remapping
+/// scrambles them because `PointerToRawData != VirtualAddress`).
+/// The PE section table is metadata only (bounds, entry coverage).
+pub fn load_image_to_guest(mem: &mut Memory, image: &[u8], base: u32) -> Result<()> {
+    mem.write_bytes(base, image)
+        .map_err(|e| EmuError::InvalidExecutable(format!("image placement: {}", e)))?;
+    log::info!(
+        "loader: placed image ({} bytes) at {:08x}",
+        image.len(),
+        base
+    );
+    Ok(())
+}
+
 /// Copy sections to guest memory at `base + virt_addr`, zero-filling BSS.
-/// Sections fully past the image end are not mapped: skipped with a log,
-/// never an error (retail linkers emit such sections). Partially mapped
-/// sections load their present bytes; missing tails stay zero. Ranges are
-/// validated; failures name the section.
+/// Only for file-layout images (e.g. synthetic/homebrew) where raw data
+/// must be relocated by `VirtualAddress`. Retail XEX bodies are already
+/// memory-layout and must use [`load_image_to_guest`] instead.
 pub fn load_sections_to_guest(
     mem: &mut Memory,
     image: &[u8],
@@ -656,6 +676,19 @@ mod tests {
         assert_eq!(mem.read_u8(0x8200_203F).unwrap(), 0xCC);
         assert_eq!(mem.read_u8(0x8200_2040).unwrap(), 0x00);
         assert_eq!(mem.read_u8(0x8200_204F).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn flat_image_placement_preserves_offsets() {
+        use x360_memory::Memory;
+        let mut mem = Memory::new();
+        // Memory-layout image: a record slot at offset 0x400 must land
+        // at base+0x400 untouched (the Braid import-table property).
+        let mut image = vec![0u8; 0x800];
+        image[0x400..0x404].copy_from_slice(&0x0100_028Bu32.to_be_bytes());
+        load_image_to_guest(&mut mem, &image, 0x8200_0000).unwrap();
+        assert_eq!(mem.read_u32(0x8200_0400).unwrap(), 0x0100_028B);
+        assert_eq!(mem.read_u32(0x8200_0000).unwrap(), 0);
     }
 
     #[test]

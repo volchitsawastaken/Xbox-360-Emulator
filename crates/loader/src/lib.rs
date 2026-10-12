@@ -146,7 +146,9 @@ pub struct StaticLib {
 
 /// One import library from `IMPORT_LIBRARIES` (`xex2_import_library`
 /// layout facts: size-prefixed entries after a padded string table;
-/// per-record thunk patching happens at load time, not here).
+/// each entry carries name index, id, versions, import count, then
+/// `count` guest-virtual record addresses at +0x28. Record patching
+/// itself is load-time work in `image::apply_imports`.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportLibrary {
     pub name: String,
@@ -154,6 +156,8 @@ pub struct ImportLibrary {
     pub version: u32,
     pub min_version: u32,
     pub import_count: u16,
+    /// Guest-virtual record addresses (`import_table` in the reference).
+    pub records: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -493,12 +497,26 @@ fn parse_import_libraries(image: &[u8], data_off: usize) -> Result<(u32, Vec<Imp
                 count
             )));
         }
+        let need = 0x28usize
+            .checked_add(count as usize * 4)
+            .ok_or_else(|| EmuError::InvalidExecutable("import size overflow".into()))?;
+        if lib_size < need || off + need > end {
+            return Err(EmuError::InvalidExecutable(format!(
+                "import library size {} too small for {} records",
+                lib_size, count
+            )));
+        }
+        let mut records = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            records.push(read_u32(image, off + 0x28 + i * 4)?);
+        }
         libs.push(ImportLibrary {
             name: names[name_index & 0xFF].clone(),
             id,
             version,
             min_version,
             import_count: count,
+            records,
         });
         off += lib_size;
     }
@@ -876,28 +894,36 @@ mod tests {
     }
 
     /// Synthetic import table: 2 strings, 2 libraries (3 + 1 imports).
+    /// Entry sizes follow the real layout: 0x28 + count * 4.
     fn import_payload() -> Vec<u8> {
         let mut strings = b"xboxkrnl.exe\0".to_vec();
         while !strings.len().is_multiple_of(4) {
             strings.push(0);
         }
         strings.extend_from_slice(b"xam.xex\0");
-        let mut p = vec![0u8; 12 + strings.len() + 44 + 44];
+        let sizes = [0x28 + 3 * 4, 0x28 + 4];
+        let mut p = vec![0u8; 12 + strings.len() + sizes[0] + sizes[1]];
         let total_len = p.len() as u32;
         put_u32(&mut p, 0, total_len);
         put_u32(&mut p, 4, strings.len() as u32);
         put_u32(&mut p, 8, 2);
         p[12..12 + strings.len()].copy_from_slice(&strings);
         let mut off = 12 + strings.len();
-        for (idx, count) in [(0u16, 3u16), (1u16, 1u16)] {
-            put_u32(&mut p, off, 44);
+        for (n, (idx, count)) in [(0u16, 3u16), (1u16, 1u16)].iter().enumerate() {
+            put_u32(&mut p, off, sizes[n] as u32);
             put_u32(&mut p, off + 0x18, 1); // id
             put_u32(&mut p, off + 0x1C, 2); // version
             put_u32(&mut p, off + 0x20, 1); // min version
-            put_u16(&mut p, off + 0x24, idx);
-            put_u16(&mut p, off + 0x26, count);
-            put_u32(&mut p, off + 0x28, 0xDEAD_0000 + idx as u32);
-            off += 44;
+            put_u16(&mut p, off + 0x24, *idx);
+            put_u16(&mut p, off + 0x26, *count);
+            for i in 0..*count as usize {
+                put_u32(
+                    &mut p,
+                    off + 0x28 + i * 4,
+                    0xDEAD_0000 + *idx as u32 * 0x100 + i as u32,
+                );
+            }
+            off += sizes[n];
         }
         p
     }
@@ -910,8 +936,20 @@ mod tests {
         assert_eq!(info.import_libs[0].name, "xboxkrnl.exe");
         assert_eq!(info.import_libs[0].import_count, 3);
         assert_eq!(info.import_libs[0].id, 1);
+        assert_eq!(info.import_libs[0].records.len(), 3);
+        assert_eq!(info.import_libs[0].records[0], 0xDEAD_0000);
         assert_eq!(info.import_libs[1].name, "xam.xex");
         assert_eq!(info.import_libs[1].import_count, 1);
+        assert_eq!(info.import_libs[1].records, vec![0xDEAD_0100]);
+    }
+
+    #[test]
+    fn import_short_table_rejected() {
+        // Declares 3 records but sizes the entry for 1.
+        let mut payload = import_payload();
+        put_u32(&mut payload, 12 + 24, 0x28 + 4);
+        let img = dir_image_with_payload(KEY_IMPORT_LIBRARIES, &payload);
+        assert!(parse_xex(&img).is_err());
     }
 
     #[test]

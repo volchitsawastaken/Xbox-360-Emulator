@@ -84,10 +84,27 @@ pub fn run_until_exit(
 
 /// Run thread 0 until exit, optionally recording each executed
 /// instruction into `trace`. `None` costs nothing (no fetch, no format).
+/// When `table` holds import thunks, an `sc` fired inside a thunk
+/// dispatches to the kernel export handler by return address
+/// (`thunk = pc_after_sc - 4`); all other traps use the `r0`-id
+/// convention. `None` table preserves the plain demo path exactly.
 pub fn run_until_exit_traced(
     mem: &mut Memory,
     xenon: &mut Xenon,
     kernel: &mut Kernel,
+    max_steps: u64,
+    trace: Option<&mut x360_debugger::TraceBuffer>,
+) -> Result<GuestExit> {
+    run_until_exit_traced_imports(mem, xenon, kernel, None, max_steps, trace)
+}
+
+/// Import-aware run: `table` maps rewritten thunk addresses to their
+/// resolved imports. See [`run_until_exit_traced`] for the fallback.
+pub fn run_until_exit_traced_imports(
+    mem: &mut Memory,
+    xenon: &mut Xenon,
+    kernel: &mut Kernel,
+    mut table: Option<&mut crate::imports::ImportTable>,
     max_steps: u64,
     mut trace: Option<&mut x360_debugger::TraceBuffer>,
 ) -> Result<GuestExit> {
@@ -109,6 +126,24 @@ pub fn run_until_exit_traced(
         let trap = xenon.threads[0].step(mem)?;
         steps += 1;
         let Some(t) = trap else { continue };
+        // Thunk trap? The rewriter leaves `sc` at the thunk address,
+        // so the post-`sc` pc minus 4 names the import.
+        let after = xenon.threads[t.thread].t.pc;
+        let thunk = after.wrapping_sub(4);
+        let imp = table.as_ref().and_then(|tab| tab.get(thunk).cloned());
+        if let Some(imp) = imp {
+            let tab = table.as_mut().expect("import was just found");
+            let thread_id = xenon.threads[t.thread].t.id as u32;
+            crate::dispatch::dispatch_import(
+                kernel,
+                mem,
+                tab,
+                thread_id,
+                &mut xenon.threads[t.thread].t,
+                &imp,
+            )?;
+            continue;
+        }
         let id = xenon.threads[t.thread].t.gpr[0];
         let r3 = xenon.threads[t.thread].t.gpr[3];
         match id {

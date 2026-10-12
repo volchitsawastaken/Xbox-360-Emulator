@@ -186,6 +186,12 @@ mod integration {
                 .map(|l| l.import_count as usize)
                 .sum::<usize>(),
         );
+        for l in &info.import_libs {
+            println!(
+                "import lib {} id={:08x} ver={:08x} min={:08x} count={}",
+                l.name, l.id, l.version, l.min_version, l.import_count
+            );
+        }
         assert!(!sections.is_empty());
         if let Some(entry) = info.entry_point {
             let rel = entry.wrapping_sub(info.base_address);
@@ -195,6 +201,189 @@ mod integration {
                     && rel < s.virt_addr + s.virt_size.max(1)),
                 "game entry not covered"
             );
+        }
+    }
+
+    /// Retail execution: load Braid into guest memory, resolve imports,
+    /// set up a stack, and step real guest instructions from the entry
+    /// point. Gated on `$X360_STFS_FILE`. Fails with the exact blocker
+    /// (pc, registers, last trace, import call tables) until the game
+    /// runs further. Package bytes stay out of git.
+    #[test]
+    fn retail_import_slots_dump() {
+        use x360_filesystem::stfs::StfsImage;
+        let path = match std::env::var("X360_STFS_FILE") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let bytes = std::fs::read(&path).expect("read package");
+        let stfs = StfsImage::open(&bytes).expect("open package");
+        let files = stfs.list_files().expect("list package");
+        let xex = files
+            .iter()
+            .find(|f| !f.is_dir && f.name.to_lowercase().ends_with(".xex"))
+            .expect("no .xex in package");
+        let data = stfs.read_file(xex).expect("extract xex");
+        let (hdr, info) = x360_loader::parse_xex(&data).expect("game header parses");
+        let image =
+            x360_loader::image::loadable_image(&data, &hdr, &info).expect("game decompresses");
+        let sections = x360_loader::image::parse_pe_sections(&image).expect("game PE parses");
+        println!(
+            "image_len={:08x} base={:08x}",
+            image.len(),
+            info.base_address
+        );
+        for s in &sections {
+            println!(
+                "sec {:8} virt={:08x} vsz={:08x} raw_off={:08x} raw_sz={:08x} avail={:08x} flags={:08x}",
+                s.name,
+                s.virt_addr,
+                s.virt_size,
+                s.raw_off,
+                s.raw_size,
+                s.raw_available,
+                s.characteristics
+            );
+        }
+        for lib in &info.import_libs {
+            println!("lib {} records={}", lib.name, lib.records.len());
+            for (i, r) in lib.records.iter().take(8).enumerate() {
+                let off = r.wrapping_sub(info.base_address);
+                let slot = if (off as usize) + 4 <= image.len() {
+                    u32::from_be_bytes([
+                        image[off as usize],
+                        image[off as usize + 1],
+                        image[off as usize + 2],
+                        image[off as usize + 3],
+                    ])
+                } else {
+                    0xEEEE_EEEE
+                };
+                println!(
+                    "  [{}] addr={:08x} off={:08x} slot={:08x} type={:02x} ord={:04x}",
+                    i,
+                    r,
+                    off,
+                    slot,
+                    slot >> 24,
+                    slot & 0xFFFF
+                );
+            }
+        }
+        let _ = hdr;
+    }
+    #[test]
+    fn retail_braid_steps() {
+        use x360_filesystem::stfs::StfsImage;
+        let path = match std::env::var("X360_STFS_FILE") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let bytes = std::fs::read(&path).expect("read package");
+        let stfs = StfsImage::open(&bytes).expect("open package");
+        let files = stfs.list_files().expect("list package");
+        let xex = files
+            .iter()
+            .find(|f| !f.is_dir && f.name.to_lowercase().ends_with(".xex"))
+            .expect("no .xex in package");
+        let data = stfs.read_file(xex).expect("extract xex");
+        let (hdr, info) = x360_loader::parse_xex(&data).expect("game header parses");
+        let image =
+            x360_loader::image::loadable_image(&data, &hdr, &info).expect("game decompresses");
+        let sections = x360_loader::image::parse_pe_sections(&image).expect("game PE parses");
+        if let Some(entry) = info.entry_point {
+            let rel = entry.wrapping_sub(info.base_address);
+            assert!(
+                sections.iter().any(|s| (s.virt_addr as usize) < image.len()
+                    && rel >= s.virt_addr
+                    && rel < s.virt_addr + s.virt_size.max(1)),
+                "game entry not covered"
+            );
+        }
+        let mut mem = Memory::new();
+        x360_loader::image::load_image_to_guest(&mut mem, &image, info.base_address)
+            .expect("load image");
+        let mut kernel = x360_kernel::Kernel::new();
+        kernel.set_module_info(
+            info.base_address,
+            image.len() as u32,
+            info.title_id.unwrap_or(0),
+        );
+        let hs = (hdr.header_size as usize).min(data.len());
+        kernel.set_xex_header(
+            data[..hs].to_vec(),
+            info.entry_point.unwrap_or(0),
+            xex.name.clone(),
+        );
+        let mut table = x360_kernel::imports::ImportTable::new();
+        let libs: Vec<(&str, &[u32])> = info
+            .import_libs
+            .iter()
+            .map(|l| (l.name.as_str(), l.records.as_slice()))
+            .collect();
+        let stats = x360_kernel::imports::apply(&mut mem, &mut kernel, &mut table, &libs)
+            .expect("apply imports");
+        println!(
+            "imports: {} functions + {} variables ({} thunks)",
+            stats.functions,
+            stats.variables,
+            table.len()
+        );
+        // Guest stack: 128 KiB of real zeroed bytes, r1 at the top.
+        let stack_size = 128 * 1024u32;
+        let stack_base = kernel.alloc_mem(stack_size, 16).expect("guest stack");
+        mem.write_bytes(stack_base, &vec![0u8; stack_size as usize])
+            .expect("zero stack");
+        kernel.set_stack(stack_base, stack_size);
+        let entry = info.entry_point.expect("game has entry");
+        for i in 0..16u32 {
+            let w = mem.read_u32(entry + i * 4).unwrap_or(0xFFFF_FFFF);
+            println!("entry+{:02x}: {:08x} {}", i * 4, w, x360_cpu::disasm(w));
+        }
+        let mut xenon = x360_cpu::Xenon::new(entry);
+        xenon.threads[0].t.gpr[1] = stack_base + stack_size - 16;
+        let mut trace = x360_debugger::TraceBuffer::new(256);
+        match x360_kernel::boot::run_until_exit_traced_imports(
+            &mut mem,
+            &mut xenon,
+            &mut kernel,
+            Some(&mut table),
+            200_000,
+            Some(&mut trace),
+        ) {
+            Ok(exit) => {
+                println!("retail exit code={} steps={}", exit.code, exit.steps);
+            }
+            Err(e) => {
+                let t = &xenon.threads[0].t;
+                println!("retail stopped after error: {}", e);
+                println!(
+                    "pc={:08x} lr={:08x} ctr={:08x} r1={:08x}",
+                    t.pc, t.lr, t.ctr, t.gpr[1]
+                );
+                for r in [3u32, 4, 5, 6, 7, 8, 9, 10] {
+                    println!("r{}={:08x}", r, t.gpr[r as usize]);
+                }
+                println!("--- last trace (oldest first) ---");
+                for ev in trace.iter() {
+                    println!("{:08x}: {}", ev.pc, ev.disasm);
+                }
+                let mut done: Vec<_> = table.implemented_calls.iter().collect();
+                done.sort();
+                println!("--- implemented calls ({}) ---", done.len());
+                for ((lib, ord), n) in done.iter().take(40) {
+                    let name = x360_kernel::imports::ImportTable::name_of(lib, *ord).unwrap_or("?");
+                    println!("{}!{} x{}", lib, name, n);
+                }
+                let mut missing: Vec<_> = table.unimplemented_calls.iter().collect();
+                missing.sort();
+                println!("--- unimplemented calls ({}) ---", missing.len());
+                for ((lib, ord), n) in missing {
+                    let name = x360_kernel::imports::ImportTable::name_of(lib, *ord).unwrap_or("?");
+                    println!("{}!{} x{}", lib, name, n);
+                }
+                panic!("retail boot stopped: {}", e);
+            }
         }
     }
 }

@@ -4645,6 +4645,7 @@ name = "x360-emutests"
 version = "0.1.0"
 dependencies = [
  "x360-cpu",
+ "x360-debugger",
  "x360-filesystem",
  "x360-gpu",
  "x360-kernel",
