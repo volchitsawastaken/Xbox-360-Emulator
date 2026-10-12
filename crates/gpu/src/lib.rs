@@ -281,8 +281,9 @@ mod tests {
         match crate::validation::triangle_pixels() {
             Ok(Some(px)) => {
                 assert_eq!(px.len(), 64 * 64 * 4);
-                assert!(px
-                    .chunks_exact(4)
+                let (chunks, _) = px.as_chunks::<4>();
+                assert!(chunks
+                    .iter()
                     .any(|p| p[0] > 128 && p[1] < 128 && p[2] < 128));
             }
             Ok(None) => {} // headless skip
