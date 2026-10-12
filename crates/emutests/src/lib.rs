@@ -38,7 +38,7 @@ mod integration {
         img[24..28].copy_from_slice(&0x0001_0100u32.to_be_bytes());
         img[28..32].copy_from_slice(&0x8200_2000u32.to_be_bytes());
         let (_, info) = x360_loader::parse_xex(&img).unwrap();
-        assert_eq!(info.entry_point, 0x8200_2000);
+        assert_eq!(info.entry_point, Some(0x8200_2000));
     }
 
     #[test]
@@ -52,10 +52,11 @@ mod integration {
         img[24..28].copy_from_slice(&0x0001_0100u32.to_be_bytes());
         img[28..32].copy_from_slice(&0x8200_1000u32.to_be_bytes());
         let (_, info) = x360_loader::parse_xex(&img).unwrap();
+        let entry = info.entry_point.expect("test image has entry");
         let mut mem = Memory::new();
         // Guest program: addi r3,0,7 at entry.
-        mem.write_u32(info.entry_point, 0x3860_0007).unwrap();
-        let mut cpu = Interpreter::new(0, info.entry_point);
+        mem.write_u32(entry, 0x3860_0007).unwrap();
+        let mut cpu = Interpreter::new(0, entry);
         assert!(cpu.step(&mut mem).unwrap().is_none());
         assert_eq!(cpu.t.gpr[3], 7);
     }

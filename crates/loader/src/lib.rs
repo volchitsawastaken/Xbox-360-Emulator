@@ -43,6 +43,13 @@ pub const KEY_IMPORT_LIBRARIES: u32 = 0x0001_03FF;
 pub const KEY_SYSTEM_FLAGS: u32 = 0x0003_0000;
 pub const KEY_TLS_INFO: u32 = 0x0002_0104;
 pub const KEY_STATIC_LIBRARIES: u32 = 0x0002_00FF;
+// Documented size-prefixed structures (first word = total size).
+pub const KEY_RESOURCE_INFO: u32 = 0x0000_02FF;
+pub const KEY_FILE_FORMAT_INFO: u32 = 0x0000_03FF;
+pub const KEY_BOUNDING_PATH: u32 = 0x0000_80FF;
+pub const KEY_ORIGINAL_PE_NAME: u32 = 0x0001_83FF;
+pub const KEY_MULTIDISC_MEDIA_IDS: u32 = 0x0004_06FF;
+pub const KEY_ALTERNATE_TITLE_IDS: u32 = 0x0004_07FF;
 
 pub const DEFAULT_BASE_ADDRESS: u32 = 0x8200_0000;
 
@@ -118,7 +125,9 @@ pub struct StaticLib {
 
 #[derive(Debug, Clone)]
 pub struct XexInfo {
-    pub entry_point: u32,
+    /// None for data-only modules (no executable entry). Booting one is
+    /// an explicit error at load-to-execute time, not at parse time.
+    pub entry_point: Option<u32>,
     pub base_address: u32,
     pub stack_size: Option<u32>,
     pub title_id: Option<u32>,
@@ -424,33 +433,54 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
                     });
                     static_libs.append(&mut libs);
                 } else {
-                    let size = if data_off + 4 <= image.len() {
-                        read_u32(image, data_off)?
+                    // Only these keys are documented size-prefixed (first
+                    // word = total size). Anything else (timestamps,
+                    // version pairs, logo blobs) must not be misread as a
+                    // size, so it is recorded with unverified length.
+                    const SIZE_PREFIXED: [u32; 7] = [
+                        KEY_RESOURCE_INFO,
+                        KEY_BOUNDING_PATH,
+                        KEY_ORIGINAL_PE_NAME,
+                        KEY_IMPORT_LIBRARIES,
+                        KEY_FILE_FORMAT_INFO,
+                        KEY_MULTIDISC_MEDIA_IDS,
+                        KEY_ALTERNATE_TITLE_IDS,
+                    ];
+                    if SIZE_PREFIXED.contains(&key) {
+                        let size = if data_off + 4 <= image.len() {
+                            read_u32(image, data_off)?
+                        } else {
+                            0
+                        };
+                        if (data_off as u64) + (size as u64) > image.len() as u64 {
+                            return Err(EmuError::InvalidExecutable(format!(
+                                "dir key {:08x} data OOB (off {} size {})",
+                                key, data_off, size
+                            )));
+                        }
+                        dirs.push(XexDir {
+                            key,
+                            data: XexDirData::AtOffset {
+                                offset: value,
+                                size,
+                            },
+                        });
                     } else {
-                        0
-                    };
-                    if (data_off as u64) + (size as u64) > image.len() as u64 {
-                        return Err(EmuError::InvalidExecutable(format!(
-                            "dir key {:08x} data OOB (off {} size {})",
-                            key, data_off, size
-                        )));
+                        dirs.push(XexDir {
+                            key,
+                            data: XexDirData::AtOffset {
+                                offset: value,
+                                size: 0,
+                            },
+                        });
                     }
-                    dirs.push(XexDir {
-                        key,
-                        data: XexDirData::AtOffset {
-                            offset: value,
-                            size,
-                        },
-                    });
                     log::debug!("xex: offset key {:08x} (tracked)", key);
                 }
             }
         }
     }
 
-    let entry = entry_point
-        .ok_or_else(|| EmuError::InvalidExecutable("no entry point directory entry".into()))?;
-    if entry == 0 {
+    if entry_point == Some(0) {
         return Err(EmuError::InvalidExecutable("entry point is zero".into()));
     }
 
@@ -468,7 +498,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
             header_count,
         },
         XexInfo {
-            entry_point: entry,
+            entry_point,
             base_address: base,
             stack_size,
             title_id,
@@ -564,7 +594,7 @@ mod tests {
     fn parses_minimal() {
         let img = minimal_xex(0x8200_1000);
         let (_, info) = parse_xex(&img).unwrap();
-        assert_eq!(info.entry_point, 0x8200_1000);
+        assert_eq!(info.entry_point, Some(0x8200_1000));
         assert_eq!(info.base_address, DEFAULT_BASE_ADDRESS);
         assert_eq!(info.dirs.len(), 1);
         assert_eq!(info.dirs[0].key, KEY_ENTRY_POINT);
@@ -623,11 +653,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_entry_rejected() {
+    fn missing_entry_parses_as_data_module() {
         let mut v = vec![0u8; 32];
         v[0..4].copy_from_slice(b"XEX2");
         v[20..24].copy_from_slice(&0u32.to_be_bytes());
-        assert!(parse_xex(&v).is_err());
+        let (_, info) = parse_xex(&v).unwrap();
+        assert_eq!(info.entry_point, None);
     }
 
     #[test]
@@ -638,6 +669,45 @@ mod tests {
         v[24..28].copy_from_slice(&KEY_IMPORT_LIBRARIES.to_be_bytes());
         v[28..32].copy_from_slice(&0xFFFFu32.to_be_bytes());
         assert!(parse_xex(&v).is_err());
+    }
+
+    /// Retail validation: parse every `.xex` in `$X360_FW_DIR`.
+    /// Skipped when unset (CI, clean machines). Firmware never enters git.
+    #[test]
+    fn retail_headers_parse() {
+        let dir = match std::env::var("X360_FW_DIR") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("X360_FW_DIR unreadable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "xex").unwrap_or(false))
+            .collect();
+        names.sort();
+        assert!(!names.is_empty(), "no .xex in $X360_FW_DIR");
+        for path in &names {
+            let bytes = std::fs::read(path).expect("read xex");
+            match parse_xex(&bytes) {
+                Ok((_, info)) => println!(
+                    "{}: entry={} base={:08x} title={:?} stack={:?} dll={}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    info.entry_point
+                        .map(|e| format!("{:08x}", e))
+                        .unwrap_or_else(|| "none(data)".into()),
+                    info.base_address,
+                    info.title_id.map(|t| format!("{:08x}", t)),
+                    info.stack_size,
+                    info.is_dll
+                ),
+                Err(e) => panic!(
+                    "{}: rejected: {}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    e
+                ),
+            }
+        }
     }
 
     #[test]

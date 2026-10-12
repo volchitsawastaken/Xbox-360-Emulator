@@ -174,12 +174,16 @@ impl EmuApp {
     }
 
     /// Load XEX bytes to guest and set thread-0 PC. Does not claim boot.
+    /// Data-only modules (no entry point) are an explicit error here.
     pub fn load_xex_bytes(&mut self, image: &[u8], load_addr: u32) -> Result<u32> {
         let (_hdr, info) = x360_loader::parse_xex(image)?;
+        let entry = info.entry_point.ok_or_else(|| {
+            EmuError::InvalidExecutable("no entry point (data module, not bootable)".into())
+        })?;
         x360_loader::load_bytes_to_guest(&mut self.mem, load_addr, image)?;
-        self.xenon.threads[0].t.pc = info.entry_point;
-        self.status_line = format!("loaded, entry={:08x} (not booted)", info.entry_point);
-        Ok(info.entry_point)
+        self.xenon.threads[0].t.pc = entry;
+        self.status_line = format!("loaded, entry={:08x} (not booted)", entry);
+        Ok(entry)
     }
 
     /// Place the demo guest at entry and run it to exit. Real execution.
