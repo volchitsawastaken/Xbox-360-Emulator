@@ -275,4 +275,18 @@ mod tests {
         let r = Xenos::validate_triangle();
         assert!(r.is_ok());
     }
+
+    #[test]
+    fn triangle_pixels_contain_red_or_skip() {
+        match crate::validation::triangle_pixels() {
+            Ok(Some(px)) => {
+                assert_eq!(px.len(), 64 * 64 * 4);
+                assert!(px
+                    .chunks_exact(4)
+                    .any(|p| p[0] > 128 && p[1] < 128 && p[2] < 128));
+            }
+            Ok(None) => {} // headless skip
+            Err(e) => panic!("triangle pixels failed: {}", e),
+        }
+    }
 }

@@ -132,12 +132,12 @@ fn read_pixels(device: &wgpu::Device, buf: &wgpu::Buffer) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Render and return true when the center pixel is red.
-/// Returns `Ok(false)` when no adapter is available (skip).
-pub fn validate_triangle() -> Result<bool> {
+/// Render the validation triangle and return raw RGBA8 pixels (64x64).
+/// `None` when no adapter exists (headless skip).
+pub fn triangle_pixels() -> Result<Option<Vec<u8>>> {
     pollster::block_on(async {
         let Some((device, queue)) = headless_device().await? else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -193,24 +193,32 @@ pub fn validate_triangle() -> Result<bool> {
             pass.draw(0..3, 0..1);
         }
         submit_copy(&queue, encoder, &texture, &buf);
-        let data = read_pixels(&device, &buf)?;
-
-        // Scan center rows for a red pixel (R high, G/B low).
-        let mut found = false;
-        for y in (H / 4)..(3 * H / 4) {
-            for x in 0..W {
-                let i = ((y * W + x) * 4) as usize;
-                if data[i] > 128 && data[i + 1] < 128 && data[i + 2] < 128 {
-                    found = true;
+        Ok(Some(read_pixels(&device, &buf)?))
+    })
+}
+/// Render and return true when the center pixel is red.
+/// Returns `Ok(false)` when no adapter is available (skip).
+pub fn validate_triangle() -> Result<bool> {
+    match triangle_pixels()? {
+        None => Ok(false),
+        Some(data) => {
+            // Scan center rows for a red pixel (R high, G/B low).
+            let mut found = false;
+            for y in (H / 4)..(3 * H / 4) {
+                for x in 0..W {
+                    let i = ((y * W + x) * 4) as usize;
+                    if data[i] > 128 && data[i + 1] < 128 && data[i + 2] < 128 {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
                     break;
                 }
             }
-            if found {
-                break;
-            }
+            Ok(found)
         }
-        Ok(found)
-    })
+    }
 }
 
 /// Clear to `color` (RGBA8) and check the center pixel matches exactly.
