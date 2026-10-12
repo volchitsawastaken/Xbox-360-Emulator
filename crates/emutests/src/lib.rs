@@ -31,14 +31,12 @@ mod integration {
 
     #[test]
     fn loader_then_pc_set() {
-        let mut img = vec![0u8; 64];
+        let mut img = vec![0u8; 32];
         img[0..4].copy_from_slice(b"XEX2");
-        img[8..12].copy_from_slice(&24u32.to_be_bytes());
+        img[8..12].copy_from_slice(&32u32.to_be_bytes());
         img[20..24].copy_from_slice(&1u32.to_be_bytes());
-        img[24..28].copy_from_slice(&0x0001_0000u32.to_be_bytes());
-        img[28..32].copy_from_slice(&48u32.to_be_bytes());
-        img[32..36].copy_from_slice(&4u32.to_be_bytes());
-        img[48..52].copy_from_slice(&0x8200_2000u32.to_be_bytes());
+        img[24..28].copy_from_slice(&0x0001_0100u32.to_be_bytes());
+        img[28..32].copy_from_slice(&0x8200_2000u32.to_be_bytes());
         let (_, info) = x360_loader::parse_xex(&img).unwrap();
         assert_eq!(info.entry_point, 0x8200_2000);
     }
@@ -47,14 +45,12 @@ mod integration {
     fn load_and_step_at_real_entry() {
         // End-to-end: parse XEX with high entry, place guest code there,
         // fetch via EXEC mirror and step once.
-        let mut img = vec![0u8; 64];
+        let mut img = vec![0u8; 32];
         img[0..4].copy_from_slice(b"XEX2");
-        img[8..12].copy_from_slice(&24u32.to_be_bytes());
+        img[8..12].copy_from_slice(&32u32.to_be_bytes());
         img[20..24].copy_from_slice(&1u32.to_be_bytes());
-        img[24..28].copy_from_slice(&0x0001_0000u32.to_be_bytes());
-        img[28..32].copy_from_slice(&48u32.to_be_bytes());
-        img[32..36].copy_from_slice(&4u32.to_be_bytes());
-        img[48..52].copy_from_slice(&0x8200_1000u32.to_be_bytes());
+        img[24..28].copy_from_slice(&0x0001_0100u32.to_be_bytes());
+        img[28..32].copy_from_slice(&0x8200_1000u32.to_be_bytes());
         let (_, info) = x360_loader::parse_xex(&img).unwrap();
         let mut mem = Memory::new();
         // Guest program: addi r3,0,7 at entry.
