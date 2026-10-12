@@ -184,9 +184,9 @@ impl EmuApp {
 
     /// Place the demo guest at entry and run it to exit. Real execution.
     pub fn boot_demo(&mut self) -> Result<()> {
-        use x360_kernel::boot::{demo_guest_words, run_until_exit};
+        use x360_kernel::boot::{boot_banner_words, run_until_exit};
         let entry = 0x8200_1000;
-        for (i, w) in demo_guest_words().iter().enumerate() {
+        for (i, w) in boot_banner_words().iter().enumerate() {
             self.mem.write_u32(entry + i as u32 * 4, *w)?;
         }
         self.xenon = x360_cpu::Xenon::new(entry);
@@ -219,12 +219,12 @@ impl EmuApp {
 
     /// Advance the staged boot by one stage. Returns true when terminal.
     pub fn poll_boot(&mut self) -> bool {
-        use x360_kernel::boot::{demo_guest_words, run_until_exit};
+        use x360_kernel::boot::{boot_banner_words, run_until_exit};
         const ENTRY: u32 = 0x8200_1000;
         match self.boot.stage {
             BootStage::Idle | BootStage::Done | BootStage::Failed => true,
             BootStage::Parse => {
-                let words = demo_guest_words();
+                let words = boot_banner_words();
                 if words.is_empty() || !ENTRY.is_multiple_of(4) {
                     self.boot.fail("demo guest empty or entry misaligned");
                 } else {
@@ -235,7 +235,7 @@ impl EmuApp {
             }
             BootStage::Map => {
                 let mut ok = true;
-                for (i, w) in demo_guest_words().iter().enumerate() {
+                for (i, w) in boot_banner_words().iter().enumerate() {
                     if let Err(e) = self.mem.write_u32(ENTRY + i as u32 * 4, *w) {
                         self.boot.fail(&e.to_string());
                         ok = false;
@@ -442,6 +442,18 @@ impl eframe::App for EmuApp {
             ui.label(format!("audio frames: {}", self.audio.frames_pushed));
         });
         egui::CentralPanel::default().show(ctx, |ui| {
+            // Boot screen: guest output once the boot run completes.
+            if self.boot.stage == BootStage::Done {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.heading(String::from_utf8_lossy(&self.kernel.console).to_string());
+                    ui.monospace(&self.boot.detail);
+                    if ui.button("Back to debugger").clicked() {
+                        self.boot = BootSession::idle();
+                    }
+                });
+                ui.separator();
+            }
             // Loading screen: only while stages are running or failed.
             if self.boot.active() || self.boot.stage == BootStage::Failed {
                 ui.heading("Booting…");

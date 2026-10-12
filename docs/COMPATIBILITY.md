@@ -34,8 +34,8 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 
 | Area | Status | Notes |
 |---|---|---|
-| XEX2 header/directory parse | partial | Magic + bounds + entry validation, OOB dir entries rejected; tests |
-| Relocations/imports/TLS | not-started | Explicitly not parsed yet |
+| XEX2 header/directory parse | partial | Magic + bounds + entry validation, OOB dir entries rejected; full table returned for later stages; tests |
+| Relocations/imports/TLS | not-started | Directory slices validated; semantic interpretation pending |
 | Threads/events/mutexes/sems | partial | create_thread/event/set/wait with queued waiters; blocking wait pending M6 |
 | Syscalls | partial | 0=time, 2=putc console tested; others explicit UnimplementedSyscall; 1=exit handled by boot runner |
 | Boot | partial | Demo guest (putc "HI" + exit 0) verified end-to-end via `run_until_exit`; retail boot not-started |

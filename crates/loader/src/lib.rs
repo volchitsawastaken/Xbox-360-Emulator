@@ -19,6 +19,16 @@ pub struct XexInfo {
     pub entry_point: u32,
     pub base_address: u32,
     pub size: usize,
+    /// Validated directory table for later stages (relocations, imports).
+    /// Semantics per key are pending; offsets/sizes are bounds-checked.
+    pub dirs: Vec<XexDir>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct XexDir {
+    pub key: u32,
+    pub offset: u32,
+    pub size: u32,
 }
 
 /// Parse XEX2 header directory. Returns entry point for the kernel.
@@ -60,6 +70,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
     // Walk directory entries (key: u32, offset: u32, size: u32).
     let mut entry_point: Option<u32> = None;
     let mut base_address: u32 = 0x8200_0000;
+    let mut dirs = Vec::new();
     for i in 0..header_count {
         let off = 24 + (i as usize) * 12;
         if off + 12 > image.len() {
@@ -88,6 +99,11 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
                 key, val_off, val_size
             )));
         }
+        dirs.push(XexDir {
+            key,
+            offset: val_off as u32,
+            size: val_size as u32,
+        });
         match key {
             0x0001_0000 => {
                 // Entry point
@@ -137,6 +153,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
             entry_point: entry,
             base_address,
             size: image.len(),
+            dirs,
         },
     ))
 }
@@ -170,6 +187,8 @@ mod tests {
         let img = minimal_xex(0x8200_1000);
         let (_, info) = parse_xex(&img).unwrap();
         assert_eq!(info.entry_point, 0x8200_1000);
+        assert_eq!(info.dirs.len(), 1);
+        assert_eq!(info.dirs[0].key, 0x0001_0000);
     }
 
     #[test]

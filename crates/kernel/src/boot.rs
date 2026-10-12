@@ -33,6 +33,20 @@ pub fn demo_guest_words() -> [u32; 8] {
     ]
 }
 
+/// Boot banner guest: prints "X360-RS BOOT" via putc then exits 0.
+/// This is what the boot screen displays. Same syscall convention.
+pub fn boot_banner_words() -> Vec<u32> {
+    let mut w = vec![0x3800_0002]; // addi r0,0,2 (putc)
+    for &c in b"X360-RS BOOT" {
+        w.push(0x3860_0000 | c as u32); // addi r3,0,c
+        w.push(0x4400_0002); // sc
+    }
+    w.push(0x3860_0000); // addi r3,0,0 (exit code)
+    w.push(0x3800_0001); // addi r0,0,1 (exit)
+    w.push(0x4400_0002); // sc
+    w
+}
+
 /// Run thread 0 until exit. Returns explicit errors for everything else.
 pub fn run_until_exit(
     mem: &mut Memory,
@@ -116,5 +130,21 @@ mod tests {
         let mut kernel = Kernel::new();
         let r = run_until_exit(&mut mem, &mut xenon, &mut kernel, 10);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn banner_boots_with_text_and_zero() {
+        let mut mem = Memory::new();
+        let entry = 0x8200_6000;
+        let words = boot_banner_words();
+        for (i, w) in words.iter().enumerate() {
+            mem.write_u32(entry + i as u32 * 4, *w).unwrap();
+        }
+        let mut xenon = Xenon::new(entry);
+        let mut kernel = Kernel::new();
+        let exit = run_until_exit(&mut mem, &mut xenon, &mut kernel, 128).unwrap();
+        assert_eq!(exit.code, 0);
+        assert_eq!(exit.output, b"X360-RS BOOT");
+        assert_eq!(exit.steps, words.len() as u64);
     }
 }
