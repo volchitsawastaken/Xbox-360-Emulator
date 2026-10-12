@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use x360_common::{EmuError, Result};
 
+pub mod stfs;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentKind {
     ExtractedDir,
@@ -36,6 +38,10 @@ pub fn identify(path: &Path) -> Result<ContentKind> {
     // GDFX/XDVDFS ISO starts with "MICRO" at sector 32; check common magics.
     if &magic == b"XEX2" {
         return Ok(ContentKind::Unknown); // single XEX, handled by loader
+    }
+    // STFS containers (CON/PIRS/LIVE, incl. extensionless GOD files).
+    if &magic == b"CON " || &magic == b"PIRS" || &magic == b"LIVE" {
+        return Ok(ContentKind::Stfs);
     }
     let ext = path
         .extension()

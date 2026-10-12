@@ -36,12 +36,14 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 
 | Area | Status | Notes |
 |---|---|---|
-| XEX2 header/directory parse | partial | Real XEX1/XEX2 model: 8-byte entries, inline (low byte 00/01) vs offset data, entry/base/stack/title/TLS/static-lib/format-info keys, security load address; OOB rejected; 26 retail headers verified; tests |
-| Relocations/imports/TLS | not-started | Directory slices validated; semantic interpretation pending |
+| XEX2 header/directory parse | partial | Real XEX1/XEX2 model: 8-byte entries, inline (low byte 00/01) vs offset data, entry/base/stack/title/TLS/static-lib/format-info keys, security load address + AES key (+0x150); OOB rejected; 26 retail headers verified; tests |
+| Image body (Basic decompression + AES) | partial | None+Basic and Normal+Basic verified: Braid default.xex (6,041,600 bytes) decrypts (AES-128-CBC, public retail key unwraps session key) + decompresses to PE with 8 sections, entry 0x8236EF38 covered, 517 imports; LZX stays explicit Unsupported; tests |
+| Relocations/imports/TLS | partial | Import library names/ids/versions/counts parsed (Braid: 517 across libs); record patching + TLS resolution pending — first retail boot blocker |
+| ISO/GDFX/STFS/extracted dir | partial | STFS read-only single-backing: CON/PIRS/LIVE magic, volume descriptor, hash-table block map, SHA1-verify per block, dir list + file extract; Braid GOD lists 15 entries, default.xex extracts byte-exact (XEX2 verified); dual-backing + SVOD explicit Unsupported |
 | Threads/events/mutexes/sems | partial | create_thread/event/set/wait with queued waiters; blocking wait pending M6 |
 | Syscalls | partial | 0=time, 2=putc console tested; others explicit UnimplementedSyscall; 1=exit handled by boot runner |
-| Boot | partial | Demo guest (putc "HI" + exit 0) verified end-to-end via `run_until_exit`; retail boot not-started |
-| ISO/GDFX/STFS/extracted dir | partial | identify + default.xex resolve; ISO/STFS payload parsing not-started |
+| Boot | partial | Demo guest (putc "HI" + exit 0) verified end-to-end via `run_until_exit`; retail boot blocked on import-record resolution (Braid: 517 imports need kernel export shims) |
+| ISO/GDFX/STFS/extracted dir | partial | identify + default.xex resolve; STFS payload parsing partial (see Loader rows above); ISO/GDFX pending |
 
 ## Audio
 

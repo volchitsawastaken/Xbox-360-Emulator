@@ -18,6 +18,60 @@ use x360_memory::Memory;
 
 use super::{XexCompression, XexDirData, XexEncryption, XexHeader, XexInfo, KEY_FILE_FORMAT_INFO};
 
+use aes::Aes128;
+use cipher::generic_array::GenericArray;
+use cipher::{BlockDecrypt, KeyInit};
+
+/// Retail session-key wrapping key, published in the BSD-licensed Xenia
+/// `xex_module.cc` (`xe_xex2_retail_key`). Public constant, no secret.
+pub const RETAIL_KEY: [u8; 16] = [
+    0x20, 0xB1, 0x85, 0xA5, 0x9D, 0x28, 0xFD, 0xC3, 0x40, 0x58, 0x3F, 0xBB, 0x08, 0x96, 0xBF, 0x91,
+];
+
+/// AES-128-CBC with zero IV, matching the reference `aes_decrypt_buffer`
+/// (decrypt block, XOR previous ciphertext, chain continues across calls).
+pub struct Cbc {
+    cipher: Aes128,
+    ivec: [u8; 16],
+}
+
+impl Cbc {
+    pub fn new(key: &[u8; 16]) -> Self {
+        Self {
+            cipher: Aes128::new(GenericArray::from_slice(key)),
+            ivec: [0u8; 16],
+        }
+    }
+
+    pub fn decrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<()> {
+        if input.is_empty() || input.len() != output.len() || !input.len().is_multiple_of(16) {
+            return Err(EmuError::InvalidExecutable(
+                "cbc length must be a nonzero multiple of 16".into(),
+            ));
+        }
+        let (input_chunks, _) = input.as_chunks::<16>();
+        let (output_chunks, _) = output.as_chunks_mut::<16>();
+        for (ct, pt) in input_chunks.iter().zip(output_chunks.iter_mut()) {
+            let mut block = GenericArray::clone_from_slice(ct);
+            self.cipher.decrypt_block(&mut block);
+            for i in 0..16 {
+                pt[i] = block[i] ^ self.ivec[i];
+                self.ivec[i] = ct[i];
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Unwrap a session key with the retail key (single-block CBC = ECB here).
+pub fn unwrap_session_key(wrapped: &[u8; 16]) -> [u8; 16] {
+    let mut cbc = Cbc::new(&RETAIL_KEY);
+    let mut out = [0u8; 16];
+    cbc.decrypt_into(wrapped, &mut out)
+        .expect("16-byte unwrap cannot fail length checks");
+    out
+}
+
 pub const PAGE_THRESHOLD: u32 = 0x9000_0000;
 pub const PAGE_SMALL: u32 = 64 * 1024;
 pub const PAGE_TINY: u32 = 4 * 1024;
@@ -71,12 +125,16 @@ pub fn parse_basic_blocks(
 }
 
 /// Decompress the basic stream. Output is exactly `expected` bytes;
-/// overruns, shortfalls, and unconsumed input are all explicit errors.
+/// overruns are errors, trailing zero padding is allowed, trailing
+/// nonzeros are errors, and shortfalls stay zero (logged). When `crypt`
+/// is `Some`, each block's literal bytes are CBC-decrypted in stream
+/// order (chain state carries across blocks, per reference).
 pub fn decompress_basic(
     image: &[u8],
     header_size: usize,
     blocks: &[BasicBlock],
     expected: usize,
+    mut crypt: Option<&mut Cbc>,
 ) -> Result<Vec<u8>> {
     if header_size > image.len() {
         return Err(EmuError::InvalidExecutable("header_size OOB".into()));
@@ -108,7 +166,20 @@ pub fn decompress_basic(
                 n
             )));
         }
-        out[di..di + ds].copy_from_slice(&stream[si..si + ds]);
+        if ds > 0 {
+            if let Some(c) = crypt.as_mut() {
+                // Encrypted literals arrive 16-aligned; decrypt in place.
+                if !ds.is_multiple_of(16) {
+                    return Err(EmuError::InvalidExecutable(format!(
+                        "block {} encrypted size {} not a full AES block run",
+                        n, ds
+                    )));
+                }
+                c.decrypt_into(&stream[si..si + ds], &mut out[di..di + ds])?;
+            } else {
+                out[di..di + ds].copy_from_slice(&stream[si..si + ds]);
+            }
+        }
         si += ds;
         di += ds + zs; // zero region already zeroed
     }
@@ -142,7 +213,10 @@ pub fn decompress_basic(
 }
 
 /// Produce the loadable (decrypted, decompressed) image for a parsed file.
-/// Only `enc=None` bodies are handled; AES/LZX are explicit `Unsupported`.
+/// `None`+Basic and `Normal`+Basic bodies are handled (AES-128-CBC with
+/// the public retail key unwrapping the security session key, per
+/// reference `ReadImage`/`ReadImageBasicCompressed`); LZX compression
+/// stays explicit `Unsupported`.
 pub fn loadable_image(file: &[u8], hdr: &XexHeader, info: &XexInfo) -> Result<Vec<u8>> {
     let fmt = info
         .format_info
@@ -155,8 +229,36 @@ pub fn loadable_image(file: &[u8], hdr: &XexHeader, info: &XexInfo) -> Result<Ve
                 .image_size
                 .ok_or_else(|| EmuError::InvalidExecutable("no image size for output".into()))?
                 as usize;
-            let out = decompress_basic(file, hdr.header_size as usize, &blocks, expected)?;
+            let out = decompress_basic(file, hdr.header_size as usize, &blocks, expected, None)?;
             // Page-descriptor total must agree with the decompressed size.
+            let total = page_total(&info.page_descriptors, info.base_address)?;
+            if total != expected {
+                return Err(EmuError::InvalidExecutable(format!(
+                    "page total {} != image size {}",
+                    total, expected
+                )));
+            }
+            Ok(out)
+        }
+        (XexEncryption::Normal, XexCompression::Basic) => {
+            let wrapped = info.aes_key.ok_or_else(|| {
+                EmuError::InvalidExecutable("encrypted body without session key".into())
+            })?;
+            let session = unwrap_session_key(&wrapped);
+            let mut crypt = Cbc::new(&session);
+            let (off, size) = format_payload(info)?;
+            let blocks = parse_basic_blocks(file, off as usize, size)?;
+            let expected = info
+                .image_size
+                .ok_or_else(|| EmuError::InvalidExecutable("no image size for output".into()))?
+                as usize;
+            let out = decompress_basic(
+                file,
+                hdr.header_size as usize,
+                &blocks,
+                expected,
+                Some(&mut crypt),
+            )?;
             let total = page_total(&info.page_descriptors, info.base_address)?;
             if total != expected {
                 return Err(EmuError::InvalidExecutable(format!(
@@ -174,7 +276,7 @@ pub fn loadable_image(file: &[u8], hdr: &XexHeader, info: &XexInfo) -> Result<Ve
             Ok(file[hs..].to_vec())
         }
         (enc, comp) => Err(EmuError::Unsupported(format!(
-            "image body enc={:?} comp={:?} (AES/LZX pending)",
+            "image body enc={:?} comp={:?} (LZX pending)",
             enc, comp
         ))),
     }
@@ -382,7 +484,7 @@ mod tests {
                 zero_size: 0,
             },
         ];
-        let out = decompress_basic(&img, 16, &blocks, 9).unwrap();
+        let out = decompress_basic(&img, 16, &blocks, 9, None).unwrap();
         assert_eq!(&out, b"AB\0\0\0CDEF");
     }
 
@@ -395,7 +497,7 @@ mod tests {
             data_size: 2,
             zero_size: 0,
         }];
-        let out = decompress_basic(&img, 0, &blocks, 6).unwrap();
+        let out = decompress_basic(&img, 0, &blocks, 6, None).unwrap();
         assert_eq!(&out, b"AB\0\0\0\0");
     }
 
@@ -406,7 +508,7 @@ mod tests {
             data_size: 2,
             zero_size: 99,
         }];
-        assert!(decompress_basic(&img, 0, &blocks, 50).is_err());
+        assert!(decompress_basic(&img, 0, &blocks, 50, None).is_err());
     }
 
     #[test]
@@ -418,7 +520,7 @@ mod tests {
             data_size: 4,
             zero_size: 0,
         }];
-        let out = decompress_basic(&padded, 0, &blocks, 4).unwrap();
+        let out = decompress_basic(&padded, 0, &blocks, 4, None).unwrap();
         assert_eq!(&out, b"ABCD");
     }
 
@@ -432,7 +534,100 @@ mod tests {
             data_size: 4,
             zero_size: 0,
         }];
-        assert!(decompress_basic(&padded, 0, &blocks, 4).is_err());
+        assert!(decompress_basic(&padded, 0, &blocks, 4, None).is_err());
+    }
+
+    #[test]
+    fn cbc_openssl_vector() {
+        // Ciphertext produced by OpenSSL (independent implementation):
+        // AES-128-CBC, key 0x42 * 16, IV 0, "0123456789ABCDEF" x2.
+        // (OpenSSL appends a 16-byte PKCS#7 block; only the first 32
+        // bytes belong to the message.)
+        let ct = hex_bytes("98bd051d60432ae78b902407011bb67a38eccce4d915c4b1f886770eb1a38528a8b9dd18a7b4ed7d42b63fad0502ec43");
+        assert_eq!(ct.len(), 48);
+        let mut cbc = Cbc::new(&[0x42u8; 16]);
+        let mut out = vec![0u8; 32];
+        cbc.decrypt_into(&ct[..32], &mut out).unwrap();
+        assert_eq!(&out, b"0123456789ABCDEF0123456789ABCDEF");
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn cbc_roundtrip_and_unwrap() {
+        use aes::Aes128;
+        use cipher::generic_array::GenericArray;
+        use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+        // ECB sanity first (no chaining): both blocks must roundtrip.
+        let ecb = Aes128::new(GenericArray::from_slice(&[0x42u8; 16]));
+        let mut b0 = GenericArray::clone_from_slice(b"0123456789ABCDEF");
+        let mut b1 = GenericArray::clone_from_slice(b"GHIJKLMNOPQRSTUV");
+        ecb.encrypt_block(&mut b0);
+        ecb.encrypt_block(&mut b1);
+        ecb.decrypt_block(&mut b0);
+        ecb.decrypt_block(&mut b1);
+        assert_eq!(b0.as_slice(), b"0123456789ABCDEF");
+        assert_eq!(b1.as_slice(), b"GHIJKLMNOPQRSTUV");
+        // Encrypt 32 bytes with the session key, decrypt via Cbc.
+        // Correct CBC encrypt: xor plaintext with IV, then encrypt.
+        let session = [0x42u8; 16];
+        let plain = b"0123456789ABCDEF0123456789ABCDEF";
+        let cipher = Aes128::new(GenericArray::from_slice(&session));
+        let mut ivec = [0u8; 16];
+        let mut ct = vec![0u8; 32];
+        for i in 0..2usize {
+            let chunk = &plain[i * 16..(i + 1) * 16];
+            let mut block = GenericArray::clone_from_slice(chunk);
+            for j in 0..16 {
+                block[j] ^= ivec[j];
+            }
+            cipher.encrypt_block(&mut block);
+            for j in 0..16 {
+                ct[i * 16 + j] = block[j];
+                ivec[j] = ct[i * 16 + j];
+            }
+        }
+        let mut cbc = Cbc::new(&session);
+        let mut out = vec![0u8; 32];
+        cbc.decrypt_into(&ct, &mut out).unwrap();
+        assert_eq!(&out, &plain[..]);
+        // Bad lengths are explicit errors.
+        assert!(cbc.decrypt_into(&ct[..15], &mut out[..15]).is_err());
+    }
+
+    #[test]
+    fn encrypted_basic_blocks_decrypt() {
+        use aes::Aes128;
+        use cipher::generic_array::GenericArray;
+        use cipher::{BlockEncrypt, KeyInit};
+        // "HI" encrypted under a session key, one block, zero tail.
+        // Correct CBC encrypt: xor with IV first (IV is zero here).
+        let session = [0x11u8; 16];
+        let cipher = Aes128::new(GenericArray::from_slice(&session));
+        let ivec = [0u8; 16];
+        let mut ct = vec![0u8; 16];
+        let mut block = GenericArray::clone_from_slice(b"HI\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        for j in 0..16 {
+            block[j] ^= ivec[j];
+        }
+        cipher.encrypt_block(&mut block);
+        for j in 0..16 {
+            ct[j] = block[j];
+        }
+        let mut img = vec![0u8; 0];
+        img.extend_from_slice(&ct);
+        let blocks = vec![BasicBlock {
+            data_size: 16,
+            zero_size: 2,
+        }];
+        let mut crypt = Cbc::new(&session);
+        let out = decompress_basic(&img, 0, &blocks, 18, Some(&mut crypt)).unwrap();
+        assert_eq!(&out, b"HI\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
     }
 
     #[test]

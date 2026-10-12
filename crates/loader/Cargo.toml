@@ -9,3 +9,5 @@ x360-common = { path = "../common" }
 x360-cpu = { path = "../cpu" }
 x360-memory = { path = "../memory" }
 log = "0.4"
+aes = "0.8"
+cipher = "0.4"

@@ -150,4 +150,51 @@ mod integration {
         assert_eq!(stats.packets, 2048);
         assert_eq!(stats.pending_type3, 0);
     }
+
+    /// Full games-track pipeline on a retail package: STFS list →
+    /// extract XEX → header parse → decompress → PE sections covering
+    /// the entry point. Gated on `$X360_STFS_FILE`. Package bytes stay
+    /// out of git.
+    #[test]
+    fn retail_game_pipeline() {
+        use x360_filesystem::stfs::StfsImage;
+        let path = match std::env::var("X360_STFS_FILE") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let bytes = std::fs::read(&path).expect("read package");
+        let stfs = StfsImage::open(&bytes).expect("open package");
+        let files = stfs.list_files().expect("list package");
+        let xex = files
+            .iter()
+            .find(|f| !f.is_dir && f.name.to_lowercase().ends_with(".xex"))
+            .expect("no .xex in package");
+        println!("game xex: {} ({} bytes)", xex.name, xex.length);
+        let data = stfs.read_file(xex).expect("extract xex");
+        let (hdr, info) = x360_loader::parse_xex(&data).expect("game header parses");
+        let image =
+            x360_loader::image::loadable_image(&data, &hdr, &info).expect("game decompresses");
+        let sections = x360_loader::image::parse_pe_sections(&image).expect("game PE parses");
+        println!(
+            "entry={:08x} base={:08x} title={:?} sections={} imports={}",
+            info.entry_point.unwrap_or(0),
+            info.base_address,
+            info.title_id.map(|t| format!("{:08x}", t)),
+            sections.len(),
+            info.import_libs
+                .iter()
+                .map(|l| l.import_count as usize)
+                .sum::<usize>(),
+        );
+        assert!(!sections.is_empty());
+        if let Some(entry) = info.entry_point {
+            let rel = entry.wrapping_sub(info.base_address);
+            assert!(
+                sections.iter().any(|s| (s.virt_addr as usize) < image.len()
+                    && rel >= s.virt_addr
+                    && rel < s.virt_addr + s.virt_size.max(1)),
+                "game entry not covered"
+            );
+        }
+    }
 }

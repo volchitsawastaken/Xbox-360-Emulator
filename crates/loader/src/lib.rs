@@ -81,6 +81,7 @@ const SEC_LOAD_ADDRESS_OFF: usize = 0x110;
 const SEC_EXPORT_TABLE_OFF: usize = 0x160;
 const SEC_PAGE_COUNT_OFF: usize = 0x180;
 const SEC_FIXED_SIZE: usize = 0x184;
+const SEC_AES_KEY_OFF: usize = 0x150;
 const PAGE_DESCRIPTOR_SIZE: usize = 0x18;
 const TLS_INFO_SIZE: usize = 0x10;
 const STATIC_LIB_ENTRY_SIZE: usize = 0x10;
@@ -196,6 +197,10 @@ pub struct XexInfo {
     /// File-format info when key `0x000003FF` is present: encryption and
     /// compression of the image body. Absent = unknown, never assumed.
     pub format_info: Option<FormatInfo>,
+    /// Wrapped image AES key from security (+0x150), unwrapped with the
+    /// public retail key for `enc=Normal` bodies. Absent when the
+    /// security header is missing or truncated.
+    pub aes_key: Option<[u8; 16]>,
 }
 
 /// File-format info (`xex2_opt_file_format_info` layout facts:
@@ -225,41 +230,33 @@ struct SecurityParsed {
     export_table: Option<u32>,
     page_count: Option<u32>,
     pages: Vec<PageDescriptor>,
+    aes_key: Option<[u8; 16]>,
+}
+
+fn empty_security() -> SecurityParsed {
+    SecurityParsed {
+        image_size: None,
+        image_flags: None,
+        load_address: None,
+        export_table: None,
+        page_count: None,
+        pages: Vec::new(),
+        aes_key: None,
+    }
 }
 
 fn parse_security(image: &[u8], security_offset: u32) -> Result<SecurityParsed> {
     if security_offset == 0 {
-        return Ok(SecurityParsed {
-            image_size: None,
-            image_flags: None,
-            load_address: None,
-            export_table: None,
-            page_count: None,
-            pages: Vec::new(),
-        });
+        return Ok(empty_security());
     }
     let base = security_offset as usize;
     if base >= image.len() {
         log::warn!("xex: security_offset OOB (tracked)");
-        return Ok(SecurityParsed {
-            image_size: None,
-            image_flags: None,
-            load_address: None,
-            export_table: None,
-            page_count: None,
-            pages: Vec::new(),
-        });
+        return Ok(empty_security());
     }
     if base + SEC_FIXED_SIZE > image.len() {
         log::debug!("xex: security header truncated (tracked)");
-        return Ok(SecurityParsed {
-            image_size: None,
-            image_flags: None,
-            load_address: None,
-            export_table: None,
-            page_count: None,
-            pages: Vec::new(),
-        });
+        return Ok(empty_security());
     }
     let image_size = Some(read_u32(image, base + SEC_IMAGE_SIZE_OFF)?);
     let image_flags = Some(read_u32(image, base + SEC_IMAGE_FLAGS_OFF)?);
@@ -305,6 +302,14 @@ fn parse_security(image: &[u8], security_offset: u32) -> Result<SecurityParsed> 
         export_table,
         page_count: Some(page_count),
         pages: descs,
+        // Wrapped image key at +0x150 (16 bytes); absent when truncated.
+        aes_key: if base + SEC_AES_KEY_OFF + 16 <= image.len() {
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&image[base + SEC_AES_KEY_OFF..base + SEC_AES_KEY_OFF + 16]);
+            Some(key)
+        } else {
+            None
+        },
     })
 }
 
@@ -725,6 +730,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
             static_libs,
             format_info,
             import_libs,
+            aes_key: sec.aes_key,
         },
     ))
 }

@@ -75,6 +75,46 @@ out, and the license note. Workspace license: BSD-3-Clause.
   module is original under the workspace BSD-3-Clause. Attribution
   is kept in the module docs.
 
+## 4. STFS container layout and block map
+
+- Source: `src/xenia/vfs/devices/stfs_xbox.h` (volume descriptor,
+  hash-entry, directory-entry structs) + `stfs_container_device.{h,cc}`
+  (block-to-offset map, hash-block-number walk, chain following).
+- Taken (facts only): magic `CON `/`PIRS`/`LIVE` at 0x00, header size
+  u32be at 0x340, descriptor at 0x379 (0x24 bytes, read-only flag bit 0,
+  table count u16be, table block u24le, total blocks u32be), volume
+  type u32be at 0x3A9 (0 = STFS), 0x1000-byte blocks with 170-entry
+  hash tables (sha1 + info u32be, low 24 = next, `0xFFFFFF` = end),
+  level spans {170, 28900, 4913000}, 64-entry directory blocks of
+  0x40 bytes. Dual-backing + SVOD deliberately left out.
+- Lives here: `crates/filesystem/src/stfs.rs` — `StfsImage::open`,
+  `list_files`, `read_file` (SHA1-verified per block); `identify()`
+  in `lib.rs` now sniffs the three magics. Provenance note in the
+  module docs.
+- NOT taken: write path, journaling, device mounting, SVOD layout.
+- License: reference is BSD (Ben Vanik / Xenia project); our reader
+  is original under the workspace BSD-3-Clause. Attribution is kept
+  in the module docs.
+
+## 5. XEX AES session-key unwrap + CBC stream decrypt
+
+- Source: `src/xenia/cpu/xex_module.cc` (public `xe_xex2_retail_key`,
+  `aes_decrypt_buffer` zero-IV CBC with cross-call chaining,
+  `ReadImageBasicCompressed` decrypt-then-decompress order, wrapped
+  image key at security +0x150).
+- Taken (facts only): the 16-byte retail key constant, the CBC chaining
+  rule (decrypt block, XOR previous ciphertext, IV starts zero, state
+  carries across blocks), and the Normal+Basic pipeline order.
+- Lives here: `crates/loader/src/image.rs` — `RETAIL_KEY`,
+  `Cbc::decrypt_into`, `unwrap_session_key`, `loadable_image`
+  Normal+Basic arm; security key plumbed via `XexInfo::aes_key` in
+  `crates/loader/src/lib.rs`. Verified against an OpenSSL-produced
+  vector plus retail Braid bytes. Attribution note in the module docs.
+- NOT taken: LZX decompression, delta patching, devkit keys.
+- License: reference is BSD (Ben Vanik / Xenia project); our crypto
+  glue is original under the workspace BSD-3-Clause (AES primitive
+  itself is the `aes` crate). Attribution is kept in the module docs.
+
 ## Next candidates
 
 Concrete, data-only port targets. Each names the reference path and

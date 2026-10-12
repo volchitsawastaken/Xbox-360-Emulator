@@ -10,3 +10,4 @@ x360-cpu = { path = "../cpu" }
 x360-loader = { path = "../loader" }
 x360-gpu = { path = "../gpu" }
 x360-kernel = { path = "../kernel" }
+x360-filesystem = { path = "../filesystem" }
