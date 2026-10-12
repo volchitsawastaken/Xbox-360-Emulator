@@ -47,6 +47,31 @@ pub fn boot_banner_words() -> Vec<u32> {
     w
 }
 
+/// Harness address where guests leave a 2-word Type-0 command buffer
+/// (header + RGBA8 color) for the boot renderer. Bring-up convention,
+/// not hardware.
+pub const RENDER_BUFFER_ADDR: u32 = 0x8200_2000;
+/// Harness clear-color register programmed by the buffer (see gpu bridge).
+pub const RENDER_COLOR_REG: u32 = 0x2000;
+
+/// Render guest: stores a Type-0 packet (header for one register +
+/// opaque red) at [`RENDER_BUFFER_ADDR`], then exits 0. Only uses
+/// implemented integer ops so it runs on the real interpreter.
+pub fn render_guest_words() -> Vec<u32> {
+    vec![
+        0x3CA0_8200, // addis r5,0,0x8200
+        0x60A5_2000, // ori   r5,r5,0x2000   (r5 = buffer addr)
+        0x3860_0800, // addi  r3,0,0x0800    (type0 header: count 1, reg 0x800)
+        0x9065_0000, // stw   r3,0(r5)
+        0x3C60_FF00, // addis r3,0,0xFF00
+        0x6063_00FF, // ori   r3,r3,0x00FF   (r3 = 0xFF0000FF red)
+        0x9065_0004, // stw   r3,4(r5)
+        0x3860_0000, // addi  r3,0,0         (exit code)
+        0x3800_0001, // addi  r0,0,1         (exit)
+        0x4400_0002, // sc
+    ]
+}
+
 /// Run thread 0 until exit. Returns explicit errors for everything else.
 pub fn run_until_exit(
     mem: &mut Memory,
@@ -184,5 +209,23 @@ mod tests {
         assert_eq!(exit.code, 0);
         assert_eq!(exit.output, b"X360-RS BOOT");
         assert_eq!(exit.steps, words.len() as u64);
+    }
+
+    #[test]
+    fn render_guest_writes_command_buffer() {
+        let mut mem = Memory::new();
+        let entry = 0x8200_8000;
+        let words = render_guest_words();
+        for (i, w) in words.iter().enumerate() {
+            mem.write_u32(entry + i as u32 * 4, *w).unwrap();
+        }
+        let mut xenon = Xenon::new(entry);
+        let mut kernel = Kernel::new();
+        let exit = run_until_exit(&mut mem, &mut xenon, &mut kernel, 64).unwrap();
+        assert_eq!(exit.code, 0);
+        assert_eq!(exit.steps, words.len() as u64);
+        // Guest left a Type-0 packet: header then opaque red.
+        assert_eq!(mem.read_u32(RENDER_BUFFER_ADDR).unwrap(), 0x0000_0800);
+        assert_eq!(mem.read_u32(RENDER_BUFFER_ADDR + 4).unwrap(), 0xFF00_00FF);
     }
 }

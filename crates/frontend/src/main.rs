@@ -22,6 +22,7 @@ pub enum BootStage {
     Map,
     GpuInit,
     Run,
+    Render,
     Done,
     Failed,
 }
@@ -32,6 +33,8 @@ pub struct BootSession {
     pub progress: f32,
     pub detail: String,
     pub exit_code: Option<u32>,
+    /// Host-verified clear color from the guest command buffer.
+    pub render_color: Option<[u8; 4]>,
 }
 
 impl Default for BootSession {
@@ -47,6 +50,7 @@ impl BootSession {
             progress: 0.0,
             detail: "starting".into(),
             exit_code: None,
+            render_color: None,
         }
     }
 
@@ -56,6 +60,7 @@ impl BootSession {
             progress: 0.0,
             detail: String::new(),
             exit_code: None,
+            render_color: None,
         }
     }
 
@@ -188,29 +193,41 @@ impl EmuApp {
 
     /// Place the demo guest at entry and run it to exit. Real execution.
     pub fn boot_demo(&mut self) -> Result<()> {
-        use x360_kernel::boot::{boot_banner_words, run_until_exit};
+        use x360_kernel::boot::{render_guest_words, run_until_exit};
         let entry = 0x8200_1000;
-        for (i, w) in boot_banner_words().iter().enumerate() {
+        for (i, w) in render_guest_words().iter().enumerate() {
             self.mem.write_u32(entry + i as u32 * 4, *w)?;
         }
         self.xenon = x360_cpu::Xenon::new(entry);
         self.kernel.console.clear();
-        match run_until_exit(&mut self.mem, &mut self.xenon, &mut self.kernel, 1024) {
-            Ok(exit) => {
-                self.status_line = format!(
-                    "booted: exit={} steps={} out={:?}",
-                    exit.code,
-                    exit.steps,
-                    String::from_utf8_lossy(&exit.output)
-                );
-                self.log_lines.push(self.status_line.clone());
-                Ok(())
-            }
-            Err(e) => {
-                self.status_line = format!("boot failed: {}", e);
-                self.log_lines.push(self.status_line.clone());
-                Err(e)
-            }
+        let exit = run_until_exit(&mut self.mem, &mut self.xenon, &mut self.kernel, 1024)?;
+        let color = self.render_buffer()?;
+        self.status_line = format!(
+            "booted: exit={} steps={} rendered={:?}",
+            exit.code, exit.steps, color
+        );
+        self.log_lines.push(self.status_line.clone());
+        Ok(())
+    }
+
+    /// Execute the guest command buffer and verify host pixels.
+    /// Returns the verified RGBA8 color. Skips (explicit `None`) only
+    /// when no host adapter exists; anywhere else fails loudly.
+    pub fn render_buffer(&mut self) -> Result<Option<[u8; 4]>> {
+        use x360_gpu::bridge::{execute_buffer, harness_clear_color};
+        use x360_kernel::boot::RENDER_BUFFER_ADDR;
+        let stats = execute_buffer(&mut self.gpu, &self.mem, RENDER_BUFFER_ADDR, 2)?;
+        if stats.packets != 1 {
+            return Err(EmuError::Other(format!(
+                "expected 1 packet, got {}",
+                stats.packets
+            )));
+        }
+        let color = harness_clear_color(&self.gpu)
+            .ok_or_else(|| EmuError::Other("guest buffer set no clear color".into()))?;
+        match x360_gpu::validation::render_clear(color)? {
+            true => Ok(Some(color)),
+            false => Ok(None), // headless skip, explicit
         }
     }
 
@@ -223,23 +240,23 @@ impl EmuApp {
 
     /// Advance the staged boot by one stage. Returns true when terminal.
     pub fn poll_boot(&mut self) -> bool {
-        use x360_kernel::boot::{boot_banner_words, run_until_exit};
+        use x360_kernel::boot::{render_guest_words, run_until_exit};
         const ENTRY: u32 = 0x8200_1000;
         match self.boot.stage {
             BootStage::Idle | BootStage::Done | BootStage::Failed => true,
             BootStage::Parse => {
-                let words = boot_banner_words();
+                let words = render_guest_words();
                 if words.is_empty() || !ENTRY.is_multiple_of(4) {
-                    self.boot.fail("demo guest empty or entry misaligned");
+                    self.boot.fail("render guest empty or entry misaligned");
                 } else {
                     self.boot.detail = format!("{} words, entry={:08x}", words.len(), ENTRY);
-                    self.boot.advance(BootStage::Map, 0.25);
+                    self.boot.advance(BootStage::Map, 0.2);
                 }
                 false
             }
             BootStage::Map => {
                 let mut ok = true;
-                for (i, w) in boot_banner_words().iter().enumerate() {
+                for (i, w) in render_guest_words().iter().enumerate() {
                     if let Err(e) = self.mem.write_u32(ENTRY + i as u32 * 4, *w) {
                         self.boot.fail(&e.to_string());
                         ok = false;
@@ -249,7 +266,7 @@ impl EmuApp {
                 if ok {
                     self.xenon = x360_cpu::Xenon::new(ENTRY);
                     self.boot.detail = "guest mapped".into();
-                    self.boot.advance(BootStage::GpuInit, 0.5);
+                    self.boot.advance(BootStage::GpuInit, 0.4);
                 }
                 false
             }
@@ -257,11 +274,11 @@ impl EmuApp {
                 match x360_gpu::Xenos::validate_triangle() {
                     Ok(true) => {
                         self.boot.detail = "host GPU ok".into();
-                        self.boot.advance(BootStage::Run, 0.75);
+                        self.boot.advance(BootStage::Run, 0.6);
                     }
                     Ok(false) => {
                         self.boot.detail = "no adapter, continuing headless".into();
-                        self.boot.advance(BootStage::Run, 0.75);
+                        self.boot.advance(BootStage::Run, 0.6);
                     }
                     Err(e) => self.boot.fail(&e.to_string()),
                 }
@@ -277,12 +294,32 @@ impl EmuApp {
                             exit.steps,
                             String::from_utf8_lossy(&exit.output)
                         );
-                        self.boot.advance(BootStage::Done, 1.0);
-                        self.status_line = format!("booted: {}", self.boot.detail);
+                        self.boot.advance(BootStage::Render, 0.8);
+                        self.status_line = format!("ran: {}", self.boot.detail);
                         self.log_lines.push(self.status_line.clone());
                     }
                     Err(e) => self.boot.fail(&e.to_string()),
                 }
+                false
+            }
+            BootStage::Render => {
+                match self.render_buffer() {
+                    Ok(Some(color)) => {
+                        self.boot.render_color = Some(color);
+                        self.boot.detail = format!(
+                            "RENDERED #{:02X}{:02X}{:02X} (host pixels verified)",
+                            color[0], color[1], color[2]
+                        );
+                        self.boot.advance(BootStage::Done, 1.0);
+                    }
+                    Ok(None) => {
+                        self.boot.detail = "no adapter: render skipped headless".into();
+                        self.boot.advance(BootStage::Done, 1.0);
+                    }
+                    Err(e) => self.boot.fail(&e.to_string()),
+                }
+                self.status_line = format!("booted: {}", self.boot.detail);
+                self.log_lines.push(self.status_line.clone());
                 true
             }
         }
@@ -446,11 +483,25 @@ impl eframe::App for EmuApp {
             ui.label(format!("audio frames: {}", self.audio.frames_pushed));
         });
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Boot screen: guest output once the boot run completes.
+            // Boot screen: verified guest-driven pixels on completion.
             if self.boot.stage == BootStage::Done {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
-                    ui.heading(String::from_utf8_lossy(&self.kernel.console).to_string());
+                    match self.boot.render_color {
+                        Some(c) => {
+                            ui.heading("RENDERED");
+                            let color =
+                                egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(240.0, 120.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 4.0, color);
+                        }
+                        None => {
+                            ui.heading("BOOTED (headless, no pixels)");
+                        }
+                    }
                     ui.monospace(&self.boot.detail);
                     if ui.button("Back to debugger").clicked() {
                         self.boot = BootSession::idle();
@@ -466,19 +517,14 @@ impl eframe::App for EmuApp {
                         .show_percentage()
                         .animate(true),
                 );
-                for (name, done) in [
-                    ("parse", BootStage::Parse),
-                    ("map", BootStage::Map),
-                    ("gpu", BootStage::GpuInit),
-                    ("run", BootStage::Run),
+                for (name, done, at) in [
+                    ("parse", BootStage::Parse, 0.2),
+                    ("map", BootStage::Map, 0.4),
+                    ("gpu", BootStage::GpuInit, 0.6),
+                    ("run", BootStage::Run, 0.8),
+                    ("render", BootStage::Render, 1.0),
                 ] {
-                    let mark = if self.boot.progress
-                        >= match done {
-                            BootStage::Parse => 0.25,
-                            BootStage::Map => 0.5,
-                            BootStage::GpuInit => 0.75,
-                            _ => 1.0,
-                        } {
+                    let mark = if self.boot.progress >= at {
                         "✓"
                     } else if self.boot.stage == done {
                         "…"
@@ -563,8 +609,8 @@ mod tests {
         assert_eq!(app.boot.stage, BootStage::Map);
         assert!(!app.poll_boot()); // Map -> GpuInit (writes memory)
         assert_eq!(app.boot.stage, BootStage::GpuInit);
-        // First demo word landed at entry.
-        assert_eq!(app.mem.fetch_u32(0x8200_1000).unwrap(), 0x3800_0002);
+        // First render-guest word landed at entry.
+        assert_eq!(app.mem.fetch_u32(0x8200_1000).unwrap(), 0x3CA0_8200);
     }
 
     #[test]
@@ -582,5 +628,9 @@ mod tests {
         assert_eq!(app.boot.stage, BootStage::Done);
         assert_eq!(app.boot.exit_code, Some(0));
         assert_eq!(app.boot.progress, 1.0);
+        // Rendered red when an adapter exists; explicit skip headless.
+        if let Some(c) = app.boot.render_color {
+            assert_eq!(c, [0xFF, 0x00, 0x00, 0xFF]);
+        }
     }
 }
