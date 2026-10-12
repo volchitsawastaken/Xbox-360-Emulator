@@ -1,0 +1,12 @@
+[package]
+name = "x360-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+x360-common = { path = "../common" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "macros", "time", "io-util"] }

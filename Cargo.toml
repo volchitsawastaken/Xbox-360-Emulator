@@ -1,0 +1,21 @@
+[workspace]
+members = [
+  "crates/common",
+  "crates/memory",
+  "crates/cpu",
+  "crates/loader",
+  "crates/gpu",
+  "crates/audio",
+  "crates/filesystem",
+  "crates/kernel",
+  "crates/network",
+  "crates/debugger",
+  "crates/frontend",
+  "crates/emutests",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"

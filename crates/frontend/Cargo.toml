@@ -1,0 +1,27 @@
+[package]
+name = "x360-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "x360"
+path = "src/main.rs"
+
+[dependencies]
+x360-common = { path = "../common" }
+x360-memory = { path = "../memory" }
+x360-cpu = { path = "../cpu" }
+x360-loader = { path = "../loader" }
+x360-gpu = { path = "../gpu" }
+x360-audio = { path = "../audio" }
+x360-filesystem = { path = "../filesystem" }
+x360-kernel = { path = "../kernel" }
+x360-network = { path = "../network" }
+x360-debugger = { path = "../debugger" }
+log = "0.4"
+env_logger = "0.11"
+eframe = "0.28"
+egui = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
