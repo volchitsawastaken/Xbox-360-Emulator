@@ -143,6 +143,18 @@ pub struct StaticLib {
     pub name: String,
 }
 
+/// One import library from `IMPORT_LIBRARIES` (`xex2_import_library`
+/// layout facts: size-prefixed entries after a padded string table;
+/// per-record thunk patching happens at load time, not here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportLibrary {
+    pub name: String,
+    pub id: u32,
+    pub version: u32,
+    pub min_version: u32,
+    pub import_count: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct XexInfo {
     /// None for data-only modules (no executable entry). Booting one is
@@ -178,6 +190,9 @@ pub struct XexInfo {
     /// Recorded static library names when key `0x000200FF` is present.
     /// Added field, defaults to empty. No import resolution performed.
     pub static_libs: Vec<StaticLib>,
+    /// Import libraries when key `0x000103FF` is present. Names, ids,
+    /// versions, and import counts only; record patching is load-time.
+    pub import_libs: Vec<ImportLibrary>,
     /// File-format info when key `0x000003FF` is present: encryption and
     /// compression of the image body. Absent = unknown, never assumed.
     pub format_info: Option<FormatInfo>,
@@ -379,6 +394,112 @@ fn parse_static_libs(image: &[u8], data_off: usize) -> Result<(u32, Vec<StaticLi
     Ok((size, libs))
 }
 
+/// Parse the import-libraries table (`xex2_opt_import_libraries` layout
+/// facts: outer size, string table (size, count, NUL strings padded to
+/// 4), then size-prefixed library entries with name index, id,
+/// versions, and import count). Record patching is load-time work and
+/// explicitly out of scope here.
+fn parse_import_libraries(image: &[u8], data_off: usize) -> Result<(u32, Vec<ImportLibrary>)> {
+    if data_off + 12 > image.len() {
+        return Err(EmuError::InvalidExecutable(
+            "import libraries truncated".into(),
+        ));
+    }
+    let size = read_u32(image, data_off)?;
+    if size < 12 {
+        return Err(EmuError::InvalidExecutable(format!(
+            "import libraries size {} too small",
+            size
+        )));
+    }
+    if (data_off as u64) + (size as u64) > image.len() as u64 {
+        return Err(EmuError::InvalidExecutable(format!(
+            "import libraries data OOB (off {} size {})",
+            data_off, size
+        )));
+    }
+    let str_size = read_u32(image, data_off + 4)? as usize;
+    let str_count = read_u32(image, data_off + 8)? as usize;
+    if str_count > 64 {
+        return Err(EmuError::InvalidExecutable(format!(
+            "import string count {} unreasonable",
+            str_count
+        )));
+    }
+    if 12 + str_size > size as usize {
+        return Err(EmuError::InvalidExecutable(
+            "import string table overruns payload".into(),
+        ));
+    }
+    // Collect NUL-terminated, 4-padded strings.
+    let mut names = Vec::new();
+    let mut pos = data_off + 12;
+    let str_end = data_off + 12 + str_size;
+    while names.len() < str_count {
+        if pos >= str_end {
+            return Err(EmuError::InvalidExecutable(
+                "import string table truncated".into(),
+            ));
+        }
+        let rel = &image[pos..str_end];
+        let len = rel
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| EmuError::InvalidExecutable("import string unterminated".into()))?;
+        names.push(String::from_utf8_lossy(&rel[..len]).into_owned());
+        pos += len + 1;
+        pos += (4 - (pos % 4)) % 4;
+    }
+    // Library entries follow the 12-byte table header + strings.
+    let mut libs = Vec::new();
+    let mut off = data_off + 12 + str_size;
+    let end = data_off + size as usize;
+    while off < end {
+        if off + 4 > end {
+            return Err(EmuError::InvalidExecutable(
+                "import library entry truncated".into(),
+            ));
+        }
+        let lib_size = read_u32(image, off)? as usize;
+        if lib_size == 0 {
+            break;
+        }
+        if lib_size < 0x28 || off + lib_size > end {
+            return Err(EmuError::InvalidExecutable(format!(
+                "import library size {} OOB",
+                lib_size
+            )));
+        }
+        let id = read_u32(image, off + 0x18)?;
+        let version = read_u32(image, off + 0x1C)?;
+        let min_version = read_u32(image, off + 0x20)?;
+        let name_index = u16::from_be_bytes([image[off + 0x24], image[off + 0x25]]) as usize;
+        let count = u16::from_be_bytes([image[off + 0x26], image[off + 0x27]]);
+        if (name_index & 0xFF) >= names.len() {
+            return Err(EmuError::InvalidExecutable(format!(
+                "import name index {} OOB ({} strings)",
+                name_index,
+                names.len()
+            )));
+        }
+        if count > 20000 {
+            return Err(EmuError::InvalidExecutable(format!(
+                "import count {} unreasonable",
+                count
+            )));
+        }
+        libs.push(ImportLibrary {
+            name: names[name_index & 0xFF].clone(),
+            id,
+            version,
+            min_version,
+            import_count: count,
+        });
+        off += lib_size;
+    }
+    Ok((size, libs))
+}
+
 /// Parse XEX1/XEX2 header directory. Returns entry point for the kernel.
 pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
     if image.len() < 24 {
@@ -419,6 +540,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
     let mut tls_info: Option<TlsInfo> = None;
     let mut format_info: Option<FormatInfo> = None;
     let mut static_libs: Vec<StaticLib> = Vec::new();
+    let mut import_libs: Vec<ImportLibrary> = Vec::new();
     let mut dirs = Vec::new();
 
     for i in 0..header_count {
@@ -495,6 +617,16 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
                         },
                     });
                     static_libs.append(&mut libs);
+                } else if key == KEY_IMPORT_LIBRARIES {
+                    let (size, mut libs) = parse_import_libraries(image, data_off)?;
+                    dirs.push(XexDir {
+                        key,
+                        data: XexDirData::AtOffset {
+                            offset: value,
+                            size,
+                        },
+                    });
+                    import_libs.append(&mut libs);
                 } else if key == KEY_FILE_FORMAT_INFO {
                     let (size, info) = parse_format_info(image, data_off)?;
                     if (data_off as u64) + (size as u64) > image.len() as u64 {
@@ -592,6 +724,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
             tls_info,
             static_libs,
             format_info,
+            import_libs,
         },
     ))
 }
@@ -730,6 +863,105 @@ mod tests {
         let mut img = minimal_xex(0x8200_1000);
         img[0] = b'Y';
         assert!(parse_xex(&img).is_err());
+    }
+
+    fn put_u16(v: &mut [u8], off: usize, x: u16) {
+        v[off..off + 2].copy_from_slice(&x.to_be_bytes());
+    }
+
+    /// Synthetic import table: 2 strings, 2 libraries (3 + 1 imports).
+    fn import_payload() -> Vec<u8> {
+        let mut strings = b"xboxkrnl.exe\0".to_vec();
+        while !strings.len().is_multiple_of(4) {
+            strings.push(0);
+        }
+        strings.extend_from_slice(b"xam.xex\0");
+        let mut p = vec![0u8; 12 + strings.len() + 44 + 44];
+        let total_len = p.len() as u32;
+        put_u32(&mut p, 0, total_len);
+        put_u32(&mut p, 4, strings.len() as u32);
+        put_u32(&mut p, 8, 2);
+        p[12..12 + strings.len()].copy_from_slice(&strings);
+        let mut off = 12 + strings.len();
+        for (idx, count) in [(0u16, 3u16), (1u16, 1u16)] {
+            put_u32(&mut p, off, 44);
+            put_u32(&mut p, off + 0x18, 1); // id
+            put_u32(&mut p, off + 0x1C, 2); // version
+            put_u32(&mut p, off + 0x20, 1); // min version
+            put_u16(&mut p, off + 0x24, idx);
+            put_u16(&mut p, off + 0x26, count);
+            put_u32(&mut p, off + 0x28, 0xDEAD_0000 + idx as u32);
+            off += 44;
+        }
+        p
+    }
+
+    #[test]
+    fn import_libraries_parsed() {
+        let img = dir_image_with_payload(KEY_IMPORT_LIBRARIES, &import_payload());
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.import_libs.len(), 2);
+        assert_eq!(info.import_libs[0].name, "xboxkrnl.exe");
+        assert_eq!(info.import_libs[0].import_count, 3);
+        assert_eq!(info.import_libs[0].id, 1);
+        assert_eq!(info.import_libs[1].name, "xam.xex");
+        assert_eq!(info.import_libs[1].import_count, 1);
+    }
+
+    #[test]
+    fn import_bad_name_index_rejected() {
+        let mut payload = import_payload();
+        put_u16(&mut payload, 12 + 16 + 8 + 0x24, 9); // first lib, bad index
+        let img = dir_image_with_payload(KEY_IMPORT_LIBRARIES, &payload);
+        assert!(parse_xex(&img).is_err());
+    }
+
+    #[test]
+    fn import_truncated_rejected() {
+        let img = dir_image_with_payload(KEY_IMPORT_LIBRARIES, &[0u8; 6]);
+        assert!(parse_xex(&img).is_err());
+    }
+
+    /// Retail rank: import surface of every `.xex` in `$X360_FW_DIR`,
+    /// smallest first. Skipped when unset. Firmware never enters git.
+    #[test]
+    fn retail_import_rank() {
+        let dir = match std::env::var("X360_FW_DIR") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("X360_FW_DIR unreadable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "xex").unwrap_or(false))
+            .collect();
+        names.sort();
+        assert!(!names.is_empty(), "no .xex in $X360_FW_DIR");
+        let mut rows: Vec<(String, usize, usize)> = Vec::new();
+        for path in &names {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let file = std::fs::read(path).expect("read xex");
+            let (_, info) = parse_xex(&file).expect("retail header parses");
+            let total: usize = info
+                .import_libs
+                .iter()
+                .map(|l| l.import_count as usize)
+                .sum();
+            let detail: Vec<String> = info
+                .import_libs
+                .iter()
+                .map(|l| format!("{}:{}", l.name, l.import_count))
+                .collect();
+            println!("{}: {} imports [{}]", name, total, detail.join(" "));
+            rows.push((name, total, info.import_libs.len()));
+        }
+        rows.sort_by_key(|r| r.1);
+        println!("--- smallest import surface first ---");
+        for (name, total, libs) in &rows {
+            println!("{}: {} imports in {} libs", name, total, libs);
+        }
+        assert!(!rows.is_empty());
     }
 
     #[test]
