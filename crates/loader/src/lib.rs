@@ -30,6 +30,8 @@
 use x360_common::{EmuError, Result};
 use x360_memory::Memory;
 
+pub mod image;
+
 pub const XEX2_MAGIC: u32 = 0x5845_5832; // "XEX2"
 pub const XEX1_MAGIC: u32 = 0x5845_5831; // "XEX1"
 
@@ -189,7 +191,7 @@ pub struct FormatInfo {
     pub compression: XexCompression,
 }
 
-fn read_u32(image: &[u8], off: usize) -> Result<u32> {
+pub(crate) fn read_u32(image: &[u8], off: usize) -> Result<u32> {
     if off + 4 > image.len() {
         return Err(EmuError::InvalidExecutable("field OOB".into()));
     }
