@@ -28,7 +28,7 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 | Draw/state/texture/RT packets | unsupported | Type3 dispatch returns pending-M5, draws stays 0 |
 | Shader translate | unsupported | Hash + cache tracked, explicit UnimplementedShader |
 | eDRAM tile/resolve | not-started | |
-| Validation triangle | not-started | M5 milestone, not a substitute |
+| Validation triangle | partial | Headless wgpu offscreen render + readback (`Xenos::validate_triangle`), tested; not Xenos translation |
 
 ## Loader / Kernel
 

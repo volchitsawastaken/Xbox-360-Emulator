@@ -8,3 +8,4 @@ license.workspace = true
 x360-common = { path = "../common" }
 log = "0.4"
 wgpu = "22"
+pollster = "0.3"

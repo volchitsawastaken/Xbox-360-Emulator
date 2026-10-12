@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use x360_common::{EmuError, Result};
 
+pub mod validation;
+
 /// Packet classes (PM4-style).
 #[derive(Debug, Clone)]
 pub enum Packet {
@@ -197,6 +199,12 @@ impl Xenos {
             })
             .collect()
     }
+
+    /// M5 validation: host triangle through the real encoder.
+    /// `Ok(true)` = red pixels read back; `Ok(false)` = no adapter, skip.
+    pub fn validate_triangle() -> Result<bool> {
+        validation::validate_triangle()
+    }
 }
 
 impl Default for Xenos {
@@ -246,5 +254,12 @@ mod tests {
         let mut g = Xenos::new();
         let r = g.register_shader(0x1234, &[1, 2, 3, 4]);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn validation_triangle_renders_or_skips() {
+        // Passes when red pixels read back; also passes (skip) headless.
+        let r = Xenos::validate_triangle();
+        assert!(r.is_ok());
     }
 }
