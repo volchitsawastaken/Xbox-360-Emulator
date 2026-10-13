@@ -137,6 +137,39 @@ out, and the license note. Workspace license: BSD-3-Clause.
   and logic are original under the workspace BSD-3-Clause.
   Attribution is kept in the module docs.
 
+## 7. Kernel threading/sync/XConfig facts
+
+- Source: `src/xenia/kernel/xboxkrnl/xboxkrnl_threading.cc`
+  (`ExCreateThread` stack default/round/min, `ReturnKThreadPtr`
+  0x80, `NtCreateSemaphore/Event/Mutant/Timer` signatures,
+  `KeSetAffinityThread` prev-via-pointer + affinity!=0 check,
+  `XThread::SetPriority` clamp-at-0, `NtYieldExecution` returns 0),
+  `xthread.h` (`X_KTHREAD` field offsets, `X_KSEMAPHORE` 0x14,
+  `X_KMUTANT` 0x20, `X_KTIMER`, `KTHREAD_STATE_*`),
+  `xobject.h` (`X_OBJECT_TYPES` bytes, `X_DISPATCH_HEADER` 0x10),
+  `xevent.cc` (manual=notification/0, auto=synchronization/1),
+  `xbox.h` (NTSTATUS values), `xboxkrnl_ob.cc`
+  (`ObReferenceObjectByHandle` zeroes out_ptr first),
+  `xam/am_locale.cc` (`XGetGameRegion` country table, US index 1 =
+  0x03FF), `xconfig.h` + `xconfig.cc` (`SetDefaults`: language 1,
+  country 103, audio 0x00010001, retail 0x40, video 0,
+  av_region 0x00400100; field sizes), `xboxkrnl_xconfig.cc`
+  (entry semantics incl. BUFFER_TOO_SMALL + INVALID_PARAMETER_3),
+  `xam_net.cc` (`X_WSADATA` 0x190 layout).
+- Taken (facts only): struct sizes/offsets, enum/flag/NTSTATUS
+  numerics, function signatures and status behavior, default values.
+- Lives here: `crates/kernel/src/lib.rs` (NT object tracking +
+  guest backing structs) and `crates/kernel/src/dispatch.rs`
+  (shim handlers + unit tests); retail Braid boots 8M steps
+  through thread/sync/locale init into file I/O.
+- NOT taken: thread scheduling (created threads unscheduled),
+  blocking waits, named-object matching, `X_OBJECT_TYPE` structs
+  (type check in ObReference skipped, documented), APCs, timers
+  firing, real sockets.
+- License: reference is BSD (Ben Vanik / Xenia project); our
+  tracking and logic are original under the workspace
+  BSD-3-Clause. Attribution is kept in the module docs.
+
 ## Next candidates
 
 Concrete, data-only port targets. Each names the reference path and

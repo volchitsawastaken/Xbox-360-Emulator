@@ -359,6 +359,21 @@ pub enum Decoded {
         frb: u32,
         rc: bool,
     },
+    Fctid {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fctidz {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fcfid {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
     Fsqrt {
         frt: u32,
         frb: u32,
@@ -542,6 +557,46 @@ pub enum Decoded {
         oe: bool,
     },
     Divwu {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    // Doubleword multiply/divide (XO-form, full 64-bit GPR width).
+    // Same explicit edges as the word forms: divide-by-zero yields 0,
+    // `INT64_MIN / -1` yields `0x8000000000000000`, OE reports either.
+    // XOs: mulld=233, mulhd=73, mulhdu=9, divd=489, divdu=457
+    // (+512 for OE).
+    Mulld {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Mulhd {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Mulhdu {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Divd {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Divdu {
         rt: u32,
         ra: u32,
         rb: u32,
@@ -791,6 +846,13 @@ pub enum Decoded {
         rs: u32,
         spr: u32,
     },
+    // Move from time base (XO 371): RT gets TBL (268) or TBU (269)
+    // of a real monotonic 50MHz-equivalent tick count (assumed rate,
+    // documented; consistent with the millisecond syscall clock).
+    Mftb {
+        rt: u32,
+        tbr: u32,
+    },
     // Barriers / traps
     Sync {
         l: u32,
@@ -833,13 +895,24 @@ pub enum Decoded {
     },
     // Trap-word instructions. tw XO=4 (opcode 31), twi primary opcode 3;
     // TO in the RT field, per reference ppc_opcode_disasm_gen.cc
-    // (0x7c000008 "tw", 0x0c000000 "twi").
+    // (0x7c000008 "tw", 0x0c000000 "twi"). 64-bit twins: td XO=68
+    // (opcode 31), tdi primary opcode 2.
     Tw {
         to: u32,
         ra: u32,
         rb: u32,
     },
     Twi {
+        to: u32,
+        ra: u32,
+        simm: i16,
+    },
+    Td {
+        to: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Tdi {
         to: u32,
         ra: u32,
         simm: i16,
@@ -935,6 +1008,11 @@ pub fn decode(word: u32) -> Result<Decoded> {
     let rb = (word >> 11) & 0x1F;
     let d = (word & 0xFFFF) as u16;
     match opc {
+        2 => Ok(Decoded::Tdi {
+            to: rt,
+            ra,
+            simm: d as i16,
+        }),
         3 => Ok(Decoded::Twi {
             to: rt,
             ra,
@@ -1085,6 +1163,7 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     rb,
                 }),
                 4 => Ok(Decoded::Tw { to: rt, ra, rb }),
+                68 => Ok(Decoded::Td { to: rt, ra, rb }),
                 20 => Ok(Decoded::Lwarx { rt, ra, rb }),
                 23 => Ok(Decoded::Lwzx { rt, ra, rb }),
                 28 => Ok(Decoded::And { rs: rt, ra, rb, rc }),
@@ -1134,6 +1213,11 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 11 | 523 => Ok(Decoded::Mulhwu { rt, ra, rb, rc, oe }),
                 491 | 1003 => Ok(Decoded::Divw { rt, ra, rb, rc, oe }),
                 459 | 971 => Ok(Decoded::Divwu { rt, ra, rb, rc, oe }),
+                233 | 745 => Ok(Decoded::Mulld { rt, ra, rb, rc, oe }),
+                73 | 585 => Ok(Decoded::Mulhd { rt, ra, rb, rc, oe }),
+                9 | 521 => Ok(Decoded::Mulhdu { rt, ra, rb, rc, oe }),
+                489 | 1001 => Ok(Decoded::Divd { rt, ra, rb, rc, oe }),
+                457 | 969 => Ok(Decoded::Divdu { rt, ra, rb, rc, oe }),
                 10 | 522 => Ok(Decoded::Addc { rt, ra, rb, rc, oe }),
                 138 | 650 => Ok(Decoded::Adde { rt, ra, rb, rc, oe }),
                 234 | 746 => Ok(Decoded::Addme { rt, ra, rc, oe }),
@@ -1147,6 +1231,10 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 339 => Ok(Decoded::Mfspr {
                     rt,
                     spr: ((rb << 5) | ra),
+                }),
+                371 => Ok(Decoded::Mftb {
+                    rt,
+                    tbr: ((rb << 5) | ra),
                 }),
                 444 => Ok(Decoded::Or { rs: rt, ra, rb, rc }),
                 412 => Ok(Decoded::Orc { rs: rt, ra, rb, rc }),
@@ -1508,6 +1596,21 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     rc,
                 }),
                 264 => Ok(Decoded::Fabs {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                814 => Ok(Decoded::Fctid {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                815 => Ok(Decoded::Fctidz {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                846 => Ok(Decoded::Fcfid {
                     frt: rt,
                     frb: rb,
                     rc,

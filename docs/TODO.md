@@ -29,21 +29,34 @@ Terminal states only: impossible, done, or something rendering.
 - [x] Retail Braid runs 2M guest steps fault-free (10 kernel imports
       served: TLS/crits/2x NtAllocate/privilege/AV pack/header-field);
       progress-floor gate in `retail_braid_steps`
+- [x] CPU: `mftb`, `fcfid`/`fctid`, 64-bit mul/div (`mulhd`/`divd`
+      families), `td`/`tdi` traps, `rldic` mask fix (MASK(mb,~sh))
+- [x] Heap base moved to 0x01000000 (reference/Xenon low-placement):
+      walk-cycle terminates naturally, zero clamps; boot reaches 8M+
+      steps into thread/net/sync init
+- [x] `KeQueryPerformanceFrequency` returns frequency in r3 (reference
+      returns it; game wrapper stores r3 over the slot)
+- [x] NT sync objects with real guest backing structs: NtCreateEvent/
+      Semaphore/Mutant/Timer, release/set/clear/pulse/wait-single/
+      wait-multiple with reference NTSTATUS + guest mirroring
+- [x] NT threads: ExCreateThread (real stacks + X_KTHREAD), resume/
+      suspend/terminate/yield, Ke* ptr APIs (affinity/priority/boost),
+      ObReference/ObLookupThreadByThreadId, XGetGameRegion (0x03FF),
+      ExGetXConfigSetting (reference defaults table)
+- [x] Retail Braid boots 8M steps fault-free into file I/O
+      (`NtCreateFile` next): WSAStartup, semaphore, thread create +
+      ObReference + affinity, game region, XConfig language served
 
 ## Active
 
-- [ ] Heap-walk cycle at 8236C1B4 (2-cycle 840301D8<->840308D8): insert
-      verified correct; pre-keys (0x0Fxx) derive correctly from r5
-      range-checks at 8236A3DC-41C; D0 (a stride-8 node, not a 0x20
-      array element) was key-phased once with pointer input, poisoning
-      the search key to 0x8353. Next: find why the key-phase visited
-      D0 (r3 provenance at step 55966) — suspect r29=0xB0 invocation
-      context — then rerun for the next fault
+- [ ] Filesystem frontier: `NtCreateFile` (0xD2) hit at 8M steps
+      (game opens its first file). Next: file I/O shims mapped onto
+      the STFS package / content subsystem
 
 ## Next (retail-driven, in expected order)
 
-- [ ] 64-bit mul/div (`mulhd`, `divd`), `mftb`, VMX128
-- [ ] Kernel shims on demand (file I/O, video mode, content, threads)
+- [ ] `fctid`/`fcfid` edge cases, VMX128
+- [ ] Kernel shims on demand (file I/O first, then video mode, content)
 - [ ] Commit + push; update PORTING.md / COMPATIBILITY.md
 
 ## Later roadmap

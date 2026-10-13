@@ -146,6 +146,24 @@ fn fp_to_i32(v: f64, to_zero: bool) -> i32 {
     }
 }
 
+/// fctid/fctidz core: double to int64, NaN and out-of-range yield
+/// 0x8000000000000000 (reference `InstrEmit_fctidxx_` NaN case).
+fn fp_to_i64(v: f64, to_zero: bool) -> i64 {
+    if v.is_nan() {
+        return i64::MIN;
+    }
+    let r = if to_zero {
+        v.trunc()
+    } else {
+        v.round_ties_even()
+    };
+    if r < i64::MIN as f64 || r > i64::MAX as f64 {
+        i64::MIN
+    } else {
+        r as i64
+    }
+}
+
 fn cmp_signed(t: &mut ThreadState, bf: u32, a: i32, b: i32) {
     update_cr_bf(t, bf, a < b, a > b, a == b);
 }
@@ -212,6 +230,26 @@ fn trap_fires(to: u32, a: u32, b: u32) -> bool {
         return true;
     }
     if to & 0x08 != 0 && (a as i32) > b as i32 {
+        return true;
+    }
+    if to & 0x04 != 0 && a == b {
+        return true;
+    }
+    if to & 0x02 != 0 && a < b {
+        return true;
+    }
+    if to & 0x01 != 0 && a > b {
+        return true;
+    }
+    false
+}
+
+/// 64-bit twin for td/tdi (same TO layout over full GPRs).
+fn trap_fires_64(to: u32, a: u64, b: u64) -> bool {
+    if to & 0x10 != 0 && (a as i64) < b as i64 {
+        return true;
+    }
+    if to & 0x08 != 0 && (a as i64) > b as i64 {
         return true;
     }
     if to & 0x04 != 0 && a == b {
@@ -968,6 +1006,32 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Fctid { frt, frb, rc } => {
+            let i = fp_to_i64(t.fpr[frb as usize], false);
+            t.fpr[frt as usize] = f64::from_bits(i as u64);
+            if rc {
+                fp_cr1_zero(t);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Fctidz { frt, frb, rc } => {
+            let i = fp_to_i64(t.fpr[frb as usize], true);
+            t.fpr[frt as usize] = f64::from_bits(i as u64);
+            if rc {
+                fp_cr1_zero(t);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Fcfid { frt, frb, rc } => {
+            t.fpr[frt as usize] = t.fpr[frb as usize].to_bits() as i64 as f64;
+            if rc {
+                fp_cr1_zero(t);
+            }
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Fsqrt {
             frt,
             frb,
@@ -1225,6 +1289,79 @@ pub fn execute(
             t.gpr[rt as usize] = (v) as u64;
             if rc {
                 update_cr0(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Mulld { rt, ra, rb, rc, oe } => {
+            let prod = (t.gpr[ra as usize] as i64 as i128) * (t.gpr[rb as usize] as i64 as i128);
+            let v = prod as u64;
+            if oe {
+                t.xer.set_ov_so(prod != v as i64 as i128);
+            }
+            t.gpr[rt as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Mulhd { rt, ra, rb, rc, oe } => {
+            let prod = (t.gpr[ra as usize] as i64 as i128) * (t.gpr[rb as usize] as i64 as i128);
+            let v = (prod >> 64) as u64;
+            if oe {
+                t.xer.set_ov_so(prod != v as i64 as i128);
+            }
+            t.gpr[rt as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Mulhdu { rt, ra, rb, rc, oe } => {
+            let prod = (t.gpr[ra as usize] as u128) * (t.gpr[rb as usize] as u128);
+            let v = (prod >> 64) as u64;
+            if oe {
+                t.xer.set_ov_so(v != 0);
+            }
+            t.gpr[rt as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Divd { rt, ra, rb, rc, oe } => {
+            let a = t.gpr[ra as usize] as i64;
+            let b = t.gpr[rb as usize] as i64;
+            let (v, ov) = if b == 0 {
+                (0u64, true)
+            } else if a == i64::MIN && b == -1 {
+                (0x8000_0000_0000_0000u64, true)
+            } else {
+                ((a / b) as u64, false)
+            };
+            if oe {
+                t.xer.set_ov_so(ov);
+            }
+            t.gpr[rt as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Divdu { rt, ra, rb, rc, oe } => {
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            let (v, ov) = a.checked_div(b).map_or((0u64, true), |q| (q, false));
+            if oe {
+                t.xer.set_ov_so(ov);
+            }
+            t.gpr[rt as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
@@ -1707,6 +1844,28 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Mftb { rt, tbr } => {
+            // 50MHz-equivalent monotonic ticks from the same wall
+            // clock as the millisecond syscall (consistent deltas).
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let tb = ms.wrapping_mul(50_000);
+            let v = match tbr {
+                268 => tb as u32,
+                269 => (tb >> 32) as u32,
+                _ => {
+                    return Err(EmuError::Unsupported(format!(
+                        "mftb tbr={} word={:08x}",
+                        tbr, word
+                    )))
+                }
+            };
+            t.gpr[rt as usize] = v as u64;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Sync { .. } | Decoded::Isync | Decoded::Eieio => {
             // Scheduler fence for now; accurate barriers at M9.
             t.pc = next;
@@ -1763,6 +1922,30 @@ pub fn execute(
             if trap_fires(to, a, b) {
                 return Err(EmuError::Unsupported(format!(
                     "twi trap fired to={:05b} ra={} simm={} word={:08x} pc={:08x}",
+                    to, ra, simm, word, t.pc
+                )));
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Td { to, ra, rb } => {
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            if trap_fires_64(to, a, b) {
+                return Err(EmuError::Unsupported(format!(
+                    "td trap fired to={:05b} ra={} rb={} word={:08x} pc={:08x}",
+                    to, ra, rb, word, t.pc
+                )));
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Tdi { to, ra, simm } => {
+            let a = t.gpr[ra as usize];
+            let b = simm as i64 as u64;
+            if trap_fires_64(to, a, b) {
+                return Err(EmuError::Unsupported(format!(
+                    "tdi trap fired to={:05b} ra={} simm={} word={:08x} pc={:08x}",
                     to, ra, simm, word, t.pc
                 )));
             }
@@ -2018,6 +2201,15 @@ mod tests {
         t.fpr[7] = 3.5;
         run_word(fctiw, &mut t, &mut m);
         assert_eq!(t.fpr[8].to_bits() as u32, 4);
+        // Retail word: fcfid f13,f0 -> 0xFDA0069C.
+        t.fpr[0] = f64::from_bits(0xFFFF_FFFF_FFFF_FFF0);
+        run_word(0xFDA0_069C, &mut t, &mut m);
+        assert_eq!(t.fpr[13], -16.0);
+        // fctidz truncates toward zero into int64 bits.
+        t.fpr[9] = -3.75;
+        let fctidz = (63u32 << 26) | (10 << 21) | (9 << 11) | (815 << 1);
+        run_word(fctidz, &mut t, &mut m);
+        assert_eq!(t.fpr[10].to_bits(), (-3i64) as u64);
     }
 
     #[test]
@@ -2085,6 +2277,58 @@ mod tests {
         t.gpr[3] = 0xFFFF_FFFF_0000_0000;
         run_word(0x3863_0001, &mut t, &mut m); // addi r3,r3,1
         assert_eq!(t.gpr[3], 1);
+    }
+
+    #[test]
+    fn mul_div_doubleword_family() {
+        let (mut t, mut m) = setup();
+        // Retail word: divd r7,r31,r11 -> 0x7CFF5BD2.
+        t.gpr[31] = 100;
+        t.gpr[11] = 7;
+        run_word(0x7CFF_5BD2, &mut t, &mut m);
+        assert_eq!(t.gpr[7], 14);
+        // mulld low 64.
+        t.gpr[4] = 0xFFFF_FFFF_FFFF_FFFD;
+        t.gpr[5] = 5;
+        let mulld = (31u32 << 26) | (6 << 21) | (4 << 16) | (5 << 11) | (233 << 1);
+        run_word(mulld, &mut t, &mut m);
+        assert_eq!(t.gpr[6], 0xFFFF_FFFF_FFFF_FFF1);
+        // mulhdu high of max*max.
+        t.gpr[4] = u64::MAX;
+        t.gpr[5] = u64::MAX;
+        let mulhdu = (31u32 << 26) | (6 << 21) | (4 << 16) | (5 << 11) | (9 << 1);
+        run_word(mulhdu, &mut t, &mut m);
+        assert_eq!(t.gpr[6], 0xFFFF_FFFF_FFFF_FFFE);
+        // divdu by zero yields 0.
+        t.gpr[5] = 0;
+        let divdu = (31u32 << 26) | (6 << 21) | (4 << 16) | (5 << 11) | (457 << 1);
+        run_word(divdu, &mut t, &mut m);
+        assert_eq!(t.gpr[6], 0);
+        // INT64_MIN / -1 yields INT64_MIN, OE set.
+        t.gpr[4] = 0x8000_0000_0000_0000;
+        t.gpr[5] = 0xFFFF_FFFF_FFFF_FFFF;
+        let divdo = (31u32 << 26) | (6 << 21) | (4 << 16) | (5 << 11) | (489 << 1) | (1 << 10);
+        run_word(divdo, &mut t, &mut m);
+        assert_eq!(t.gpr[6], 0x8000_0000_0000_0000);
+        assert!(t.xer.so());
+    }
+
+    #[test]
+    fn mftb_retail_word() {
+        // Retail word: mftb r11,tbl -> 0x7D6C42E6 (tbr 268).
+        let (mut t, mut m) = setup();
+        run_word(0x7D6C_42E6, &mut t, &mut m);
+        let lo = t.gpr[11] as u32;
+        // TBU half arrives via tbr 269 (same tick base, high word).
+        let tbu = (31u32 << 26) | (11 << 21) | (269 & 31) << 16 | ((269 >> 5) << 11) | (371 << 1);
+        run_word(tbu, &mut t, &mut m);
+        let hi = t.gpr[11] as u32;
+        // Recombined ticks advance with wall time (nonzero on any real clock).
+        assert!((hi as u64) << 32 | lo as u64 > 0);
+        // Unknown time-base register stays explicit.
+        let bad = (31u32 << 26) | (11 << 21) | (270 & 31) << 16 | ((270 >> 5) << 11) | (371 << 1);
+        let d = decode(bad).unwrap();
+        assert!(execute(d, bad, &mut t, &mut m).is_err());
     }
 
     #[test]
@@ -2873,6 +3117,30 @@ mod tests {
         // TO=0 never traps.
         run_word(dform(3, 0, 3, 5), &mut t, &mut m);
         assert_eq!(t.pc, 0x1008);
+    }
+
+    #[test]
+    fn tdi_td_64bit() {
+        let (mut t, mut m) = setup();
+        // Retail word: tdi 6,r11,0 -> 0x08CB0000 (null-check idiom).
+        t.gpr[11] = 5;
+        run_word(0x08CB_0000, &mut t, &mut m);
+        assert_eq!(t.pc, 0x1004);
+        // 64-bit values above u32 range pass (32-bit twi would wrap).
+        t.gpr[11] = 0x1_0000_0005;
+        run_word(0x08CB_0000, &mut t, &mut m);
+        // Null fires loudly, never silently.
+        t.gpr[11] = 0;
+        let msg = expect_unsupported(0x08CB_0000, &mut t, &mut m);
+        assert!(msg.contains("tdi trap fired"));
+        // td register form compares full width (TO=0x10 signed lt).
+        t.gpr[3] = 0xFFFF_FFFF_FFFF_FFFF;
+        t.gpr[4] = 1;
+        let msg = expect_unsupported(xform(0x10, 3, 4, 68, 0), &mut t, &mut m);
+        assert!(msg.contains("td trap fired"));
+        // Equal values pass the same trap.
+        t.gpr[4] = 0xFFFF_FFFF_FFFF_FFFF;
+        run_word(xform(0x10, 3, 4, 68, 0), &mut t, &mut m);
     }
 
     // --- Condition register ---

@@ -15,7 +15,7 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 | lwarx/stwcx. reservations | partial | Single-thread correct + CR EQ; SMP invalidation pending |
 | sync/lwsync/isync/eieio | partial | Barriers as scheduler fences for now |
 | VMX128 vector ops | unsupported | Tracked per-opcode, required for retail |
-| FP unit | partial | FPR file + D-form lfs/lfd/stfs/stfd (plain+update); double+single ALU (add/sub/mul/div/madd/msub/nmadd/nmsub, fused mul_add), fmr/fneg/fabs/fnabs/frsp/fctiw(fctiwz)/fsqrt/fres/frsqrte/fsel, fcmpu/fcmpo to CR, stfiwx/lfiwax; FPSCR exceptions unmodeled (CR1=0), RN assumed nearest-even; tested |
+| FP unit | partial | FPR file + D-form lfs/lfd/stfs/stfd (plain+update); double+single ALU (add/sub/mul/div/madd/msub/nmadd/nmsub, fused mul_add), fmr/fneg/fabs/fnabs/frsp/fctiw(fctiwz)/fctid/fcfid/fsqrt/fres/frsqrte/fsel, fcmpu/fcmpo to CR, stfiwx/lfiwax; `mftb` (50MHz wall clock), `td`/`tdi` traps, word+doubleword mul/div (`mullw`/`mulhw`/`divw`, `mulld`/`mulhd`/`divd`); FPSCR exceptions unmodeled (CR1=0), RN assumed nearest-even; tested |
 | Exceptions (DSI/ISI/program/sc) | partial | Fault codes surfaced; sc traps with r0=syscall id convention |
 | 6-thread scheduling | partial | Xenon round-robin wired in frontend; priorities pending M6 |
 
@@ -40,9 +40,10 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 | Image body (Basic decompression + AES) | partial | None+Basic and Normal+Basic verified: Braid default.xex (6,041,600 bytes) decrypts (AES-128-CBC, public retail key unwraps session key) + decompresses to PE with 8 sections, entry 0x8236EF38 covered, 517 imports; LZX stays explicit Unsupported; tests |
 | Relocations/imports/TLS | partial | Import library names/ids/versions/counts parsed (Braid: 517 across libs); record patching + TLS resolution pending — first retail boot blocker |
 | ISO/GDFX/STFS/extracted dir | partial | STFS read-only single-backing: CON/PIRS/LIVE magic, volume descriptor, hash-table block map, SHA1-verify per block, dir list + file extract; Braid GOD lists 15 entries, default.xex extracts byte-exact (XEX2 verified); dual-backing + SVOD explicit Unsupported |
-| Threads/events/mutexes/sems | partial | create_thread/event/set/wait with queued waiters; blocking wait pending M6 |
+| Threads/events/mutexes/sems | partial | NT sync objects with real guest backing structs (event/semaphore/mutant/timer create + release/set/clear/pulse/wait-single/wait-multiple, reference NTSTATUS, guest mirroring); ExCreateThread (real stacks + X_KTHREAD) + resume/suspend/terminate/yield + Ke* ptr APIs (affinity/priority/boost) + ObReference/ObLookupThreadByThreadId; created threads unscheduled (single-threaded runner); blocking wait pending M6 |
 | Syscalls | partial | 0=time, 2=putc console tested; others explicit UnimplementedSyscall; 1=exit handled by boot runner |
-| Boot | partial | Demo guest (putc "HI" + exit 0) verified end-to-end via `run_until_exit`; retail Braid runs 2M steps fault-free from entry (10 imports served) with progress-floor gate; currently inside heap-walk init at 8236C1B4 |
+| XConfig/locale | partial | ExGetXConfigSetting (reference defaults: language/country/region/flags), XGetGameRegion 0x03FF, XGetAVPack 8; tested |
+| Boot | partial | Demo guest (putc "HI" + exit 0) verified end-to-end via `run_until_exit`; retail Braid runs 8M steps fault-free from entry into file I/O (heap base 0x01000000; QPF-in-r3; WSAStartup/semaphore/thread+ObReference+affinity/region/XConfig served); next fault `NtCreateFile`; progress-floor gate in `retail_braid_steps` |
 | ISO/GDFX/STFS/extracted dir | partial | identify + default.xex resolve; STFS payload parsing partial (see Loader rows above); ISO/GDFX pending |
 
 ## Audio
