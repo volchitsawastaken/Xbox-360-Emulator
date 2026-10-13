@@ -33,11 +33,13 @@ Terminal states only: impossible, done, or something rendering.
 ## Active
 
 - [ ] Heap-walk cycle at 8236C1B4 (2-cycle 840301D8<->840308D8): insert
-      verified correct circular-list behavior; key slot [840301D0] held
-      pointer bits (0x8403) instead of a key when derived at step 55966
-      (new key 0xB0 == r29 correct; r7 = 0x8403-0xB0 garbage). Next:
-      find who left the pointer in the key slot (init-order branch?)
-      and re-run for the next fault
+      verified correct circular-list behavior; node history complete
+      (self-links at steps 420-436, insert at 40868-72, key-phase at
+      55963-70). Key slot [840301D0] still held its init self-pointer
+      (high 0x8403) when key-derived, poisoning search key to 0x8353.
+      Next: determine why D0 missed pre-keying (array got 0x0Fxx keys
+      pre-link; D0 did not) — suspect init-order branch or r29
+      provenance — then rerun for the next fault
 
 ## Next (retail-driven, in expected order)
 

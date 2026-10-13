@@ -2241,8 +2241,7 @@ mod tests {
         assert_eq!(t.gpr[7], 0x27FF_FFFF_FFFF_FFF1);
         // rldic r5,r6,8,32 clears under MASK(32,~8=56).
         t.gpr[6] = 0xFFFF_FFFF_FFFF_FFFF;
-        let rldic =
-            (30u32 << 26) | (6 << 21) | (5 << 16) | (8 << 11) | (1 << 5) | (2 << 2);
+        let rldic = (30u32 << 26) | (6 << 21) | (5 << 16) | (8 << 11) | (1 << 5) | (2 << 2);
         run_word(rldic, &mut t, &mut m);
         assert_eq!(t.gpr[5], 0x0000_0000_FFFF_FF80);
         // 6-bit shift: rldicl r4,r3,40,0 (SH5 set).
