@@ -7,15 +7,15 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 
 | Area | Status | Notes |
 |---|---|---|
-| Integer ALU (addi, addis, ori, oris, xori, andi, extsh/extsb, shifts) | partial | Covered by unit vectors; OE/OV/SO honored for add/subf |
+| Integer ALU (addi, addis, ori, oris, xori, andi, extsh/extsb, shifts) | partial | Covered by unit vectors; OE/OV/SO honored for add/subf; X-form + D-form logicals use RS-in-RT/dest-in-RA layout (reference RS()=RT()); `neg` word with OE on 0x80000000 |
 | Branches (b, bc, bclr + LK) | partial | CR/BI/BO honored, LK writes LR; bcctr does not decrement CTR |
 | bcctr | partial | Target from CTR, no decrement; tested |
-| Loads/stores (lwz/stw/lbz/stb/lhz/sth/lmw/stmw/multiple) | partial | Alignment + bounds checked; EXEC required for fetch |
+| Loads/stores (lwz/stw/lbz/stb/lhz/sth/lmw/stmw/multiple) | partial | Alignment + bounds checked (u32/u16/u8); u64 permissive on 4-aligned (retail `std` to 4-aligned tolerated like reference memory); EXEC required for fetch |
 | CR/XER/LR/CTR moves (mfcr/mtcr, mflr/mtlr, mfctr/mtctr, mfxer) | partial | LR/CTR only; other SPRs explicit Unsupported |
 | lwarx/stwcx. reservations | partial | Single-thread correct + CR EQ; SMP invalidation pending |
 | sync/lwsync/isync/eieio | partial | Barriers as scheduler fences for now |
 | VMX128 vector ops | unsupported | Tracked per-opcode, required for retail |
-| FP unit | unsupported | Tracked |
+| FP unit | partial | FPR file + D-form lfs/lfd/stfs/stfd (plain+update); double+single ALU (add/sub/mul/div/madd/msub/nmadd/nmsub, fused mul_add), fmr/fneg/fabs/fnabs/frsp/fctiw(fctiwz)/fsqrt/fres/frsqrte/fsel, fcmpu/fcmpo to CR, stfiwx/lfiwax; FPSCR exceptions unmodeled (CR1=0), RN assumed nearest-even; tested |
 | Exceptions (DSI/ISI/program/sc) | partial | Fault codes surfaced; sc traps with r0=syscall id convention |
 | 6-thread scheduling | partial | Xenon round-robin wired in frontend; priorities pending M6 |
 
@@ -42,7 +42,7 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 | ISO/GDFX/STFS/extracted dir | partial | STFS read-only single-backing: CON/PIRS/LIVE magic, volume descriptor, hash-table block map, SHA1-verify per block, dir list + file extract; Braid GOD lists 15 entries, default.xex extracts byte-exact (XEX2 verified); dual-backing + SVOD explicit Unsupported |
 | Threads/events/mutexes/sems | partial | create_thread/event/set/wait with queued waiters; blocking wait pending M6 |
 | Syscalls | partial | 0=time, 2=putc console tested; others explicit UnimplementedSyscall; 1=exit handled by boot runner |
-| Boot | partial | Demo guest (putc "HI" + exit 0) verified end-to-end via `run_until_exit`; retail boot blocked on import-record resolution (Braid: 517 imports need kernel export shims) |
+| Boot | partial | Demo guest (putc "HI" + exit 0) verified end-to-end via `run_until_exit`; retail Braid runs 2M steps fault-free from entry (10 imports served) with progress-floor gate; currently inside heap-walk init at 8236C1B4 |
 | ISO/GDFX/STFS/extracted dir | partial | identify + default.xex resolve; STFS payload parsing partial (see Loader rows above); ISO/GDFX pending |
 
 ## Audio

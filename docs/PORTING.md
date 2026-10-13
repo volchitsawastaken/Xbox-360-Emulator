@@ -115,6 +115,28 @@ out, and the license note. Workspace license: BSD-3-Clause.
   glue is original under the workspace BSD-3-Clause (AES primitive
   itself is the `aes` crate). Attribution is kept in the module docs.
 
+## 6. PPC RS-in-RT/dest-in-RA layouts + FP conversion facts
+
+- Source: `src/xenia/cpu/ppc/ppc_decode_data.h` (`RS() const {
+  return RT(); }` across FormatX/FormatD) +
+  `ppc_opcode_disasm_gen.cc` (`andi.`/`ori`/`oris`/`or`/`extsw` print
+  `[RA],[RS]`), `ppc_emit_fpu.cc` (`InstrEmit_fctiwxx_` NaN-to-
+  `0x80000000` + sign-extend-then-Cast bit storage,
+  `InstrEmit_negx` CA-untouched negate).
+- Taken (facts only): RS lives in the RT field and the destination
+  in RA for X-form logicals/shifts/extends AND D-form logicals
+  (ori/oris/xori/andi./andis.); `neg` XO 104; fctiw NaN/out-of-range
+  yields `0x80000000`; single-precision primaries round via f32.
+- Lives here: `crates/cpu/src/decode.rs` (corrected arms, primaries
+  59/63 FP XOs, stfiwx 659 / lfiwax 769) and `crates/cpu/src/exec.rs`
+  (FP ALU with fused `mul_add`, ties-even dynamic rounding, CR1=0
+  documented); retail Braid memmove + FP init execute.
+- NOT taken: FPSCR exception modeling, rounding-mode switching,
+  VMX128.
+- License: reference is BSD (Ben Vanik / Xenia project); our decode
+  and logic are original under the workspace BSD-3-Clause.
+  Attribution is kept in the module docs.
+
 ## Next candidates
 
 Concrete, data-only port targets. Each names the reference path and

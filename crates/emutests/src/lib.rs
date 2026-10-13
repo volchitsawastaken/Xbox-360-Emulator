@@ -25,8 +25,8 @@ mod integration {
         for _ in 0..prog.len() {
             assert!(cpu.step(&mut mem).unwrap().is_none());
         }
-        assert_eq!(cpu.t.gpr[6], 42);
-        assert_eq!(cpu.t.gpr[7], 42);
+        assert_eq!((cpu.t.gpr[6] as u32), 42);
+        assert_eq!((cpu.t.gpr[7] as u32), 42);
     }
 
     #[test]
@@ -58,7 +58,7 @@ mod integration {
         mem.write_u32(entry, 0x3860_0007).unwrap();
         let mut cpu = Interpreter::new(0, entry);
         assert!(cpu.step(&mut mem).unwrap().is_none());
-        assert_eq!(cpu.t.gpr[3], 7);
+        assert_eq!((cpu.t.gpr[3] as u32), 7);
     }
 
     #[test]
@@ -122,7 +122,7 @@ mod integration {
         let secs = start.elapsed().as_secs_f64().max(1e-9);
         let mips = target as f64 / secs / 1e6;
         println!("interpreter: {:.2} MIPS ({} steps)", mips, target);
-        assert_eq!(cpu.t.gpr[3], (target / 2) as u32);
+        assert_eq!((cpu.t.gpr[3] as u32), (target / 2) as u32);
     }
 
     /// Bridge throughput over a 4K-word guest command buffer.
@@ -247,7 +247,7 @@ mod integration {
         }
         for lib in &info.import_libs {
             println!("lib {} records={}", lib.name, lib.records.len());
-            for (i, r) in lib.records.iter().take(8).enumerate() {
+            for (i, r) in lib.records.iter().enumerate() {
                 let off = r.wrapping_sub(info.base_address);
                 let slot = if (off as usize) + 4 <= image.len() {
                     u32::from_be_bytes([
@@ -259,19 +259,33 @@ mod integration {
                 } else {
                     0xEEEE_EEEE
                 };
+                let kind = slot >> 24;
+                let ord = (slot & 0xFFFF) as u16;
+                let name = x360_kernel::ordinals::kernel_export_name(&lib.name, ord).unwrap_or("?");
                 println!(
-                    "  [{}] addr={:08x} off={:08x} slot={:08x} type={:02x} ord={:04x}",
+                    "  [{}] addr={:08x} {} ord={:04x} {}",
                     i,
                     r,
-                    off,
-                    slot,
-                    slot >> 24,
-                    slot & 0xFFFF
+                    if kind == 0 { "var " } else { "thunk" },
+                    ord,
+                    name
                 );
             }
         }
         let _ = hdr;
+        println!("--- dir keys ---");
+        for d in &info.dirs {
+            match d.data {
+                x360_loader::XexDirData::Inline(v) => {
+                    println!("key={:08x} inline={:08x}", d.key, v)
+                }
+                x360_loader::XexDirData::AtOffset { offset, size } => {
+                    println!("key={:08x} off={:08x} size={}", d.key, offset, size)
+                }
+            }
+        }
     }
+
     #[test]
     fn retail_braid_steps() {
         use x360_filesystem::stfs::StfsImage;
@@ -309,6 +323,17 @@ mod integration {
             image.len() as u32,
             info.title_id.unwrap_or(0),
         );
+        // System flags for privilege queries (inline dir value, default 0).
+        let sysflags = info
+            .dirs
+            .iter()
+            .find_map(|d| match d.data {
+                x360_loader::XexDirData::Inline(v) if d.key == 0x0003_0000 => Some(v),
+                _ => None,
+            })
+            .unwrap_or(0);
+        kernel.set_system_flags(sysflags);
+        println!("sysflags={:08x}", sysflags);
         let hs = (hdr.header_size as usize).min(data.len());
         kernel.set_xex_header(
             data[..hs].to_vec(),
@@ -341,32 +366,59 @@ mod integration {
             println!("entry+{:02x}: {:08x} {}", i * 4, w, x360_cpu::disasm(w));
         }
         let mut xenon = x360_cpu::Xenon::new(entry);
-        xenon.threads[0].t.gpr[1] = stack_base + stack_size - 16;
-        let mut trace = x360_debugger::TraceBuffer::new(256);
+        xenon.threads[0].t.gpr[1] = (stack_base + stack_size - 16) as u64;
+        // Deep trace: retail faults need the full dataflow window.
+        let mut trace = x360_debugger::TraceBuffer::new(16384);
         match x360_kernel::boot::run_until_exit_traced_imports(
             &mut mem,
             &mut xenon,
             &mut kernel,
             Some(&mut table),
-            200_000,
+            2_000_000,
             Some(&mut trace),
         ) {
             Ok(exit) => {
                 println!("retail exit code={} steps={}", exit.code, exit.steps);
+            }
+            Err(e) if e.to_string().contains("step limit") => {
+                // Progress-floor regression gate: boot must run the full
+                // budget fault-free (no Unsupported / memory-fault /
+                // alignment errors). A reintroduced fault fails here
+                // instead; deeper hangs are chased with TEMP traces.
+                let done = table.implemented_calls.len();
+                println!(
+                    "retail boot ran 2M steps fault-free ({} imports served, pc={:08x})",
+                    done, xenon.threads[0].t.pc
+                );
+                assert!(done >= 10, "boot regressed: only {} imports served", done);
             }
             Err(e) => {
                 let t = &xenon.threads[0].t;
                 println!("retail stopped after error: {}", e);
                 println!(
                     "pc={:08x} lr={:08x} ctr={:08x} r1={:08x}",
-                    t.pc, t.lr, t.ctr, t.gpr[1]
+                    t.pc,
+                    t.lr,
+                    t.ctr,
+                    (t.gpr[1] as u32)
                 );
                 for r in [3u32, 4, 5, 6, 7, 8, 9, 10] {
-                    println!("r{}={:08x}", r, t.gpr[r as usize]);
+                    println!("r{}={:08x}", r, (t.gpr[r as usize] as u32));
                 }
-                println!("--- last trace (oldest first) ---");
-                for ev in trace.iter() {
+                println!("--- last trace (oldest first, last 400) ---");
+                let events: Vec<_> = trace.iter().collect();
+                for ev in events.iter().skip(events.len().saturating_sub(400)) {
                     println!("{:08x}: {}", ev.pc, ev.disasm);
+                }
+                // Full trace to TEMP for dataflow forensics.
+                {
+                    let mut s = String::new();
+                    for ev in events.iter() {
+                        s.push_str(&format!("{:08x}: {}\n", ev.pc, ev.disasm));
+                    }
+                    let p = std::env::temp_dir().join("braid_trace.log");
+                    let _ = std::fs::write(&p, s);
+                    println!("full trace ({} events) -> {}", events.len(), p.display());
                 }
                 let mut done: Vec<_> = table.implemented_calls.iter().collect();
                 done.sort();

@@ -125,8 +125,8 @@ mod tests {
         for _ in 0..4 {
             assert!(cpu.step(&mut mem).unwrap().is_none());
         }
-        assert_eq!(cpu.t.gpr[3], 16);
-        assert_eq!(cpu.t.gpr[4], 16);
+        assert_eq!((cpu.t.gpr[3] as u32), 16);
+        assert_eq!((cpu.t.gpr[4] as u32), 16);
     }
 
     #[test]
@@ -141,6 +141,6 @@ mod tests {
         cpu.step(&mut mem).unwrap();
         assert_eq!(cpu.t.pc, 0x10008);
         cpu.step(&mut mem).unwrap();
-        assert_eq!(cpu.t.gpr[3], 7);
+        assert_eq!((cpu.t.gpr[3] as u32), 7);
     }
 }

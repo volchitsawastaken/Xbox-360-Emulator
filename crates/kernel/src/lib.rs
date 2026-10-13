@@ -14,6 +14,7 @@ pub mod boot;
 pub mod dispatch;
 pub mod imports;
 pub mod ordinals;
+pub mod variables;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle(pub u32);
@@ -59,8 +60,10 @@ pub struct Kernel {
     xex_header: Vec<u8>,
     entry_point_val: u32,
     module_name: String,
+    xex_header_addr: u32,
     stack_base: u32,
     stack_size: u32,
+    system_flags: u32,
 }
 
 /// Single-threaded critical-section state.
@@ -97,8 +100,10 @@ impl Kernel {
             xex_header: Vec::new(),
             entry_point_val: 0,
             module_name: String::new(),
+            xex_header_addr: 0,
             stack_base: 0,
             stack_size: 0,
+            system_flags: 0,
         }
     }
 
@@ -124,15 +129,15 @@ impl Kernel {
     /// Serve an XEX optional-header field from the stored header image.
     /// Returns `None` when the header is absent or the key is unknown.
     /// Layout facts: 8-byte entries at +24, inline when `key & 0xFF`
-    /// is 0x00/0x01, else a file offset to the payload.
+    /// is 0x00/0x01, else a file offset to the payload. Accepts both
+    /// the linked image base and the placed header-copy address,
+    /// since games pass the in-memory header pointer.
     pub fn xex_header_field(&self, header_ptr: u32, field: u32) -> Option<u32> {
         if self.xex_header.is_empty() {
             return None;
         }
-        // `header_ptr` must point at our loaded header copy.
-        if header_ptr != self.image_base {
-            // Games sometimes pass the linked header base; only the
-            // stored image is authoritative here.
+        // `header_ptr` must be the linked base or our placed copy.
+        if header_ptr != self.image_base && header_ptr != self.xex_header_addr {
             return None;
         }
         if self.xex_header.len() < 24 {
@@ -203,6 +208,26 @@ impl Kernel {
 
     pub fn stack_size(&self) -> u32 {
         self.stack_size
+    }
+
+    /// Place the stored XEX header image in guest memory and return its
+    /// address (for module-structure chains). Errors when no header was
+    /// recorded.
+    pub fn place_xex_header(&mut self, mem: &mut x360_memory::Memory) -> Result<u32> {
+        if self.xex_header.is_empty() {
+            return Err(EmuError::Other("no XEX header recorded".into()));
+        }
+        let len = self.xex_header.len() as u32;
+        let addr = self.alloc_mem(len, 4)?;
+        let bytes = self.xex_header.clone();
+        mem.write_bytes(addr, &bytes)?;
+        self.xex_header_addr = addr;
+        Ok(addr)
+    }
+
+    /// Record the XEX system-flags word for privilege queries.
+    pub fn set_system_flags(&mut self, flags: u32) {
+        self.system_flags = flags;
     }
 
     /// Allocate at a fixed guest address (for fixed-base virtual-memory

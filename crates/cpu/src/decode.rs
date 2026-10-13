@@ -1,4 +1,9 @@
 //! PowerPC decode. Unknown encodings are explicit Unsupported.
+//!
+//! Layout facts (RS-in-RT/dest-in-RA for logicals, MDS MD field
+//! build, FP XO maps) follow the BSD-licensed Xenia
+//! `ppc_decode_data.h` / `ppc_opcode_disasm_gen.cc` (facts only, all
+//! code original).
 
 use x360_common::Result;
 
@@ -15,28 +20,31 @@ pub enum Decoded {
         ra: u32,
         simm: i16,
     },
+    // D-form logicals (primaries 24/25/26/28/29): like X-form
+    // logicals, the SOURCE lives in the RT field and the DESTINATION
+    // in RA (`ori [RA],[RS],...` per reference disassembler).
     Ori {
-        rt: u32,
+        rs: u32,
         ra: u32,
         uimm: u16,
     },
     Oris {
-        rt: u32,
+        rs: u32,
         ra: u32,
         uimm: u16,
     },
     Xoris {
-        rt: u32,
+        rs: u32,
         ra: u32,
         uimm: u16,
     },
     Andi {
-        rt: u32,
+        rs: u32,
         ra: u32,
         uimm: u16,
     },
     Andis {
-        rt: u32,
+        rs: u32,
         ra: u32,
         uimm: u16,
     },
@@ -46,6 +54,18 @@ pub enum Decoded {
         simm: i16,
     },
     Subfic {
+        rt: u32,
+        ra: u32,
+        simm: i16,
+    },
+    // addic/addic.: D-form carrying add; the `.` form also writes CR0.
+    // Primaries 12/13.
+    Addic {
+        rt: u32,
+        ra: u32,
+        simm: i16,
+    },
+    Addic_ {
         rt: u32,
         ra: u32,
         simm: i16,
@@ -170,6 +190,262 @@ pub enum Decoded {
         ra: u32,
         d: i16,
     },
+    // Floating-point D-form loads/stores (primaries 48-55). FRT/FRS
+    // live in the RT field, base in RA. Singles convert f32<->f64;
+    // doubles move f64 bits. Update forms write the EA back to RA.
+    Lfs {
+        frt: u32,
+        ra: u32,
+        d: i16,
+    },
+    Lfsu {
+        frt: u32,
+        ra: u32,
+        d: i16,
+    },
+    Lfd {
+        frt: u32,
+        ra: u32,
+        d: i16,
+    },
+    Lfdu {
+        frt: u32,
+        ra: u32,
+        d: i16,
+    },
+    Stfs {
+        frs: u32,
+        ra: u32,
+        d: i16,
+    },
+    Stfsu {
+        frs: u32,
+        ra: u32,
+        d: i16,
+    },
+    Stfd {
+        frs: u32,
+        ra: u32,
+        d: i16,
+    },
+    Stfdu {
+        frs: u32,
+        ra: u32,
+        d: i16,
+    },
+    // Doubleword loads/stores, DS-form (primaries 58/62, XO bit 0
+    // selects update). `ds` is the sign-extended byte offset
+    // (14-bit field << 2). Needed for 64-bit prologues/epilogues.
+    Ld {
+        rt: u32,
+        ra: u32,
+        ds: i32,
+    },
+    Ldu {
+        rt: u32,
+        ra: u32,
+        ds: i32,
+    },
+    Std {
+        rs: u32,
+        ra: u32,
+        ds: i32,
+    },
+    Stdu {
+        rs: u32,
+        ra: u32,
+        ds: i32,
+    },
+    // Floating-point arithmetic. FRT/FRA/FRB live in the RT/RA/RB
+    // fields; `single` selects primary 59 (round the result to f32,
+    // reference `ppc_emit_fpu.cc` ROUND_TO_SINGLE). A-form ops carry
+    // FRC from bits 6-10. Rc on arithmetic copies the (unmodeled)
+    // exception summary, so CR1 reads 0; compares write the asked
+    // CR field with FU for unordered. Rounding-mode dynamic ops
+    // assume round-to-nearest-even (FPSCR RN is never changed by the
+    // title path yet; assumed, not hidden).
+    Fadd {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fsub {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fmul {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fdiv {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fmadd {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        frc: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fmsub {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        frc: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fnmadd {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        frc: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fnmsub {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        frc: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fmr {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fneg {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fabs {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fnabs {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Frsp {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fctiw {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fctiwz {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fsqrt {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+        single: bool,
+    },
+    Fres {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Frsqrte {
+        frt: u32,
+        frb: u32,
+        rc: bool,
+    },
+    Fsel {
+        frt: u32,
+        fra: u32,
+        frb: u32,
+        frc: u32,
+        rc: bool,
+    },
+    Fcmpu {
+        bf: u32,
+        fra: u32,
+        frb: u32,
+    },
+    Fcmpo {
+        bf: u32,
+        fra: u32,
+        frb: u32,
+    },
+    // Integer-indexed float/int moves (primary 31): `stfiwx` stores
+    // the low word of FRS (the fctiwz companion); `lfiwax` loads a
+    // word, sign-extends, and converts to double.
+    Stfiwx {
+        frs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lfiwax {
+        frt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    // 64-bit rotates (MDS-form, primary 30). `mb` is the raw 6-bit
+    // mask-begin/end field; rotates feed shifts, extracts, and
+    // bitfield inserts. XO: rldicl=0, rldicr=1, rldic=2, rldimi=3.
+    Rldicl {
+        rs: u32,
+        ra: u32,
+        sh: u32,
+        mb: u32,
+    },
+    Rldicr {
+        rs: u32,
+        ra: u32,
+        sh: u32,
+        me: u32,
+    },
+    Rldic {
+        rs: u32,
+        ra: u32,
+        sh: u32,
+        mb: u32,
+        rc: bool,
+    },
+    Rldimi {
+        rs: u32,
+        ra: u32,
+        sh: u32,
+        mb: u32,
+        rc: bool,
+    },
+    // Sign-extend low word (XO 986) and count leading zeros
+    // doubleword (XO 58).
+    Extsw {
+        rs: u32,
+        ra: u32,
+        rc: bool,
+    },
+    Cntlzd {
+        rs: u32,
+        ra: u32,
+        rc: bool,
+    },
     Stmw {
         rs: u32,
         ra: u32,
@@ -223,6 +499,110 @@ pub enum Decoded {
         rc: bool,
         oe: bool,
     },
+    // Negate word (XO 104): RT = 0 - RA (32-bit, zero-extended).
+    // OE overflows only on 0x80000000; CA untouched per reference
+    // `InstrEmit_negx` (facts only, code original).
+    Neg {
+        rt: u32,
+        ra: u32,
+        rc: bool,
+        oe: bool,
+    },
+    // Word multiply/divide (XO-form). Edge behavior is ISA-undefined;
+    // choices here are explicit and tested: divide-by-zero yields 0,
+    // `INT_MIN / -1` yields `0x80000000`, OE reports either as
+    // overflow. XOs: mullw=235, mulhw=75, mulhwu=11, divw=491,
+    // divwu=459 (+512 for OE).
+    Mullw {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Mulhw {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Mulhwu {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Divw {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Divwu {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    // Carrying/extended arithmetic (XO-form). `Addc`/`Subfc` set CA like
+    // `Add`/`Subf`; the `e`/`me`/`ze` forms fold CA into the sum, so
+    // multi-word add/sub chains compare correctly.
+    Addc {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Subfc {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Adde {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Subfe {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Addme {
+        rt: u32,
+        ra: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Subfme {
+        rt: u32,
+        ra: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Addze {
+        rt: u32,
+        ra: u32,
+        rc: bool,
+        oe: bool,
+    },
+    Subfze {
+        rt: u32,
+        ra: u32,
+        rc: bool,
+        oe: bool,
+    },
     And {
         rs: u32,
         ra: u32,
@@ -242,6 +622,32 @@ pub enum Decoded {
         rc: bool,
     },
     Nor {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+    },
+    // Remaining integer logicals (XOs: andc=60, orc=412, nand=238,
+    // eqv=289). Same shape as And/Or/Xor/Nor.
+    Andc {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+    },
+    Orc {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+    },
+    Nand {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+    },
+    Eqv {
         rs: u32,
         ra: u32,
         rb: u32,
@@ -393,6 +799,38 @@ pub enum Decoded {
     Eieio,
     Sc,
     Trap,
+    // Cache management, X-form (RA/RB). Touch/flush/invalidate are
+    // semantic no-ops on a cacheless memory; `dcbz` genuinely zeroes
+    // its 128-byte line. XOs per Power ISA: dcbst=54, dcbf=86,
+    // dcbtst=246, dcbt=278, dcbi=306, icbi=982, dcbz=1014.
+    Dcbt {
+        ra: u32,
+        rb: u32,
+    },
+    Dcbtst {
+        ra: u32,
+        rb: u32,
+    },
+    Dcbz {
+        ra: u32,
+        rb: u32,
+    },
+    Dcbf {
+        ra: u32,
+        rb: u32,
+    },
+    Dcbst {
+        ra: u32,
+        rb: u32,
+    },
+    Dcbi {
+        ra: u32,
+        rb: u32,
+    },
+    Icbi {
+        ra: u32,
+        rb: u32,
+    },
     // Trap-word instructions. tw XO=4 (opcode 31), twi primary opcode 3;
     // TO in the RT field, per reference ppc_opcode_disasm_gen.cc
     // (0x7c000008 "tw", 0x0c000000 "twi").
@@ -406,8 +844,7 @@ pub enum Decoded {
         ra: u32,
         simm: i16,
     },
-    // Condition-register moves and logical ops (opcode 19 XL form).
-    // mcrf XO=0 (0x4c000000); CR logical XOs per reference base
+    // Condition-register moves and logical ops (opcode 19 XL form).    // mcrf XO=0 (0x4c000000); CR logical XOs per reference base
     // encodings: crnor=33, crandc=129, crxor=193, crnand=225,
     // crand=257, creqv=289, crorc=417, cror=449.
     Mcrf {
@@ -480,6 +917,14 @@ fn ex_bd(word: u32) -> i16 {
     (word & 0x0000_FFFC) as i16
 }
 
+/// DS field: 14-bit signed value at bits 2..15, scaled by 4.
+fn ex_ds(word: u32) -> i32 {
+    let raw = ((word >> 2) & 0x3FFF) as u16;
+    // Sign-extend 14 bits to 16, then scale.
+    let extended = ((raw as i16) << 2) >> 2;
+    (extended as i32) << 2
+}
+
 pub fn decode(word: u32) -> Result<Decoded> {
     if word == 0x6000_0000 {
         return Ok(Decoded::Nop);
@@ -502,6 +947,16 @@ pub fn decode(word: u32) -> Result<Decoded> {
             simm: d as i16,
         }),
         8 => Ok(Decoded::Subfic {
+            rt,
+            ra,
+            simm: d as i16,
+        }),
+        12 => Ok(Decoded::Addic {
+            rt,
+            ra,
+            simm: d as i16,
+        }),
+        13 => Ok(Decoded::Addic_ {
             rt,
             ra,
             simm: d as i16,
@@ -593,11 +1048,31 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 }),
             }
         }
-        24 => Ok(Decoded::Ori { rt, ra, uimm: d }),
-        25 => Ok(Decoded::Oris { rt, ra, uimm: d }),
-        26 => Ok(Decoded::Xoris { rt, ra, uimm: d }),
-        28 => Ok(Decoded::Andi { rt, ra, uimm: d }),
-        29 => Ok(Decoded::Andis { rt, ra, uimm: d }),
+        24 => Ok(Decoded::Ori {
+            rs: rt,
+            ra,
+            uimm: d,
+        }),
+        25 => Ok(Decoded::Oris {
+            rs: rt,
+            ra,
+            uimm: d,
+        }),
+        26 => Ok(Decoded::Xoris {
+            rs: rt,
+            ra,
+            uimm: d,
+        }),
+        28 => Ok(Decoded::Andi {
+            rs: rt,
+            ra,
+            uimm: d,
+        }),
+        29 => Ok(Decoded::Andis {
+            rs: rt,
+            ra,
+            uimm: d,
+        }),
         31 => {
             let xo = (word >> 1) & 0x3FF;
             let rc = word & 1 != 0;
@@ -613,6 +1088,7 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 20 => Ok(Decoded::Lwarx { rt, ra, rb }),
                 23 => Ok(Decoded::Lwzx { rt, ra, rb }),
                 28 => Ok(Decoded::And { rs: rt, ra, rb, rc }),
+                60 => Ok(Decoded::Andc { rs: rt, ra, rb, rc }),
                 32 => Ok(Decoded::Cmpl {
                     bf: rt >> 2,
                     l: rt & 0x2 != 0,
@@ -621,6 +1097,7 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 }),
                 // Add/Subf: top XO bit is OE, so accept both OE=0/1 forms.
                 40 | 552 => Ok(Decoded::Subf { rt, ra, rb, rc, oe }),
+                104 | 616 => Ok(Decoded::Neg { rt, ra, rc, oe }),
                 87 => Ok(Decoded::Lbzx { rt, ra, rb }),
                 119 => Ok(Decoded::Lbzux { rt, ra, rb }),
                 183 => Ok(Decoded::Stwux { rs: rt, ra, rb }),
@@ -648,25 +1125,52 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 19 => Ok(Decoded::Mfcr { rt }),
                 24 => Ok(Decoded::Slw { rs: rt, ra, rb, rc }),
                 26 => Ok(Decoded::Cntlzw { rs: rt, ra, rc }),
+                58 => Ok(Decoded::Cntlzd { rs: rt, ra, rc }),
                 124 => Ok(Decoded::Nor { rs: rt, ra, rb, rc }),
+                238 => Ok(Decoded::Nand { rs: rt, ra, rb, rc }),
                 266 | 778 => Ok(Decoded::Add { rt, ra, rb, rc, oe }),
+                235 | 747 => Ok(Decoded::Mullw { rt, ra, rb, rc, oe }),
+                75 | 587 => Ok(Decoded::Mulhw { rt, ra, rb, rc, oe }),
+                11 | 523 => Ok(Decoded::Mulhwu { rt, ra, rb, rc, oe }),
+                491 | 1003 => Ok(Decoded::Divw { rt, ra, rb, rc, oe }),
+                459 | 971 => Ok(Decoded::Divwu { rt, ra, rb, rc, oe }),
+                10 | 522 => Ok(Decoded::Addc { rt, ra, rb, rc, oe }),
+                138 | 650 => Ok(Decoded::Adde { rt, ra, rb, rc, oe }),
+                234 | 746 => Ok(Decoded::Addme { rt, ra, rc, oe }),
+                202 | 714 => Ok(Decoded::Addze { rt, ra, rc, oe }),
+                8 | 520 => Ok(Decoded::Subfc { rt, ra, rb, rc, oe }),
+                136 | 648 => Ok(Decoded::Subfe { rt, ra, rb, rc, oe }),
+                232 | 744 => Ok(Decoded::Subfme { rt, ra, rc, oe }),
+                200 | 712 => Ok(Decoded::Subfze { rt, ra, rc, oe }),
+                289 => Ok(Decoded::Eqv { rs: rt, ra, rb, rc }),
                 316 => Ok(Decoded::Xor { rs: rt, ra, rb, rc }),
                 339 => Ok(Decoded::Mfspr {
                     rt,
                     spr: ((rb << 5) | ra),
                 }),
                 444 => Ok(Decoded::Or { rs: rt, ra, rb, rc }),
+                412 => Ok(Decoded::Orc { rs: rt, ra, rb, rc }),
                 467 => Ok(Decoded::Mtspr {
                     rs: rt,
                     spr: ((rb << 5) | ra),
                 }),
                 536 => Ok(Decoded::Srw { rs: rt, ra, rb, rc }),
+                54 => Ok(Decoded::Dcbst { ra, rb }),
+                86 => Ok(Decoded::Dcbf { ra, rb }),
+                246 => Ok(Decoded::Dcbtst { ra, rb }),
+                278 => Ok(Decoded::Dcbt { ra, rb }),
+                306 => Ok(Decoded::Dcbi { ra, rb }),
+                982 => Ok(Decoded::Icbi { ra, rb }),
+                1014 => Ok(Decoded::Dcbz { ra, rb }),
                 598 => Ok(Decoded::Sync {
                     l: (word >> 21) & 3,
                 }),
                 854 => Ok(Decoded::Eieio),
                 922 => Ok(Decoded::Extsh { rs: rt, ra, rc }),
                 954 => Ok(Decoded::Extsb { rs: rt, ra, rc }),
+                986 => Ok(Decoded::Extsw { rs: rt, ra, rc }),
+                659 => Ok(Decoded::Stfiwx { frs: rt, ra, rb }),
+                769 => Ok(Decoded::Lfiwax { frt: rt, ra, rb }),
                 _ => Ok(Decoded::Unsupported {
                     opc,
                     word,
@@ -754,6 +1258,324 @@ pub fn decode(word: u32) -> Result<Decoded> {
             ra,
             d: d as i16,
         }),
+        48 => Ok(Decoded::Lfs {
+            frt: rt,
+            ra,
+            d: d as i16,
+        }),
+        49 => Ok(Decoded::Lfsu {
+            frt: rt,
+            ra,
+            d: d as i16,
+        }),
+        50 => Ok(Decoded::Lfd {
+            frt: rt,
+            ra,
+            d: d as i16,
+        }),
+        51 => Ok(Decoded::Lfdu {
+            frt: rt,
+            ra,
+            d: d as i16,
+        }),
+        52 => Ok(Decoded::Stfs {
+            frs: rt,
+            ra,
+            d: d as i16,
+        }),
+        53 => Ok(Decoded::Stfsu {
+            frs: rt,
+            ra,
+            d: d as i16,
+        }),
+        54 => Ok(Decoded::Stfd {
+            frs: rt,
+            ra,
+            d: d as i16,
+        }),
+        55 => Ok(Decoded::Stfdu {
+            frs: rt,
+            ra,
+            d: d as i16,
+        }),
+        // Single-precision arithmetic (primary 59): same XO layout
+        // as the double side, result rounded to f32.
+        59 => {
+            let xo = (word >> 1) & 0x3FF;
+            let rc = word & 1 != 0;
+            let frc = (word >> 6) & 0x1F;
+            match xo {
+                18 => Ok(Decoded::Fdiv {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
+                    single: true,
+                }),
+                20 => Ok(Decoded::Fsub {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
+                    single: true,
+                }),
+                21 => Ok(Decoded::Fadd {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
+                    single: true,
+                }),
+                22 => Ok(Decoded::Fsqrt {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                    single: true,
+                }),
+                24 => Ok(Decoded::Fres {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                25 => Ok(Decoded::Fmul {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
+                    single: true,
+                }),
+                28 => Ok(Decoded::Fmsub {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: true,
+                }),
+                29 => Ok(Decoded::Fmadd {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: true,
+                }),
+                30 => Ok(Decoded::Fnmsub {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: true,
+                }),
+                31 => Ok(Decoded::Fnmadd {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: true,
+                }),
+                _ => Ok(Decoded::Unsupported {
+                    opc,
+                    word,
+                    reason: "fp59-xo",
+                }),
+            }
+        }
+        // Double-precision arithmetic (primary 63).
+        63 => {
+            let xo = (word >> 1) & 0x3FF;
+            let rc = word & 1 != 0;
+            let frc = (word >> 6) & 0x1F;
+            match xo {
+                0 => Ok(Decoded::Fcmpu {
+                    bf: rt >> 2,
+                    fra: ra,
+                    frb: rb,
+                }),
+                12 => Ok(Decoded::Frsp {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                14 => Ok(Decoded::Fctiw {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                15 => Ok(Decoded::Fctiwz {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                18 => Ok(Decoded::Fdiv {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
+                    single: false,
+                }),
+                20 => Ok(Decoded::Fsub {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
+                    single: false,
+                }),
+                21 => Ok(Decoded::Fadd {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
+                    single: false,
+                }),
+                22 => Ok(Decoded::Fsqrt {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                    single: false,
+                }),
+                23 => Ok(Decoded::Fsel {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                }),
+                25 => Ok(Decoded::Fmul {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
+                    single: false,
+                }),
+                26 => Ok(Decoded::Frsqrte {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                28 => Ok(Decoded::Fmsub {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: false,
+                }),
+                29 => Ok(Decoded::Fmadd {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: false,
+                }),
+                30 => Ok(Decoded::Fnmsub {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: false,
+                }),
+                31 => Ok(Decoded::Fnmadd {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: false,
+                }),
+                32 => Ok(Decoded::Fcmpo {
+                    bf: rt >> 2,
+                    fra: ra,
+                    frb: rb,
+                }),
+                40 => Ok(Decoded::Fneg {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                72 => Ok(Decoded::Fmr {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                136 => Ok(Decoded::Fnabs {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                264 => Ok(Decoded::Fabs {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                _ => Ok(Decoded::Unsupported {
+                    opc,
+                    word,
+                    reason: "fp63-xo",
+                }),
+            }
+        }
+        // MDS-form (primary 30) is actually the MD layout for these
+        // four: 6-bit SH/MB built as (bit5 << 5) | low-5, XO select on
+        // bits 2-4 (reference `ppc_decode_data.h` FormatMD plus the
+        // `n <- sh[5] || sh[0:4]` / `b <- mb[5] || mb[0:4]` rules in
+        // `ppc_emit_alu.cc` `InstrEmit_rldiclx/rldicrx/rldimix`).
+        30 => {
+            let rs = rt;
+            let sh = (((word >> 1) & 1) << 5) | ((word >> 11) & 0x1F);
+            let mb = (((word >> 5) & 1) << 5) | ((word >> 6) & 0x1F);
+            match (word >> 2) & 0x7 {
+                0 => Ok(Decoded::Rldicl { rs, ra, sh, mb }),
+                1 => Ok(Decoded::Rldicr { rs, ra, sh, me: mb }),
+                2 => Ok(Decoded::Rldic {
+                    rs,
+                    ra,
+                    sh,
+                    mb,
+                    rc: word & 1 != 0,
+                }),
+                3 => Ok(Decoded::Rldimi {
+                    rs,
+                    ra,
+                    sh,
+                    mb,
+                    rc: word & 1 != 0,
+                }),
+                _ => Ok(Decoded::Unsupported {
+                    opc,
+                    word,
+                    reason: "mds-xo",
+                }),
+            }
+        }
+        58 => {
+            let ds = ex_ds(word);
+            match word & 3 {
+                0 => Ok(Decoded::Ld { rt, ra, ds }),
+                1 => Ok(Decoded::Ldu { rt, ra, ds }),
+                _ => Ok(Decoded::Unsupported {
+                    opc,
+                    word,
+                    reason: "ds-xo",
+                }),
+            }
+        }
+        62 => {
+            let ds = ex_ds(word);
+            match word & 3 {
+                0 => Ok(Decoded::Std { rs: rt, ra, ds }),
+                1 => Ok(Decoded::Stdu { rs: rt, ra, ds }),
+                _ => Ok(Decoded::Unsupported {
+                    opc,
+                    word,
+                    reason: "ds-xo",
+                }),
+            }
+        }
         17 => Ok(Decoded::Sc),
         _ => Ok(Decoded::Unsupported {
             opc,
@@ -797,6 +1619,121 @@ mod tests {
         // b 0x100 (relative) encoding check via roundtrip of AA=0 LK=0
         let d = decode(0x4800_0100).unwrap();
         assert!(matches!(d, Decoded::B { .. }));
+    }
+    #[test]
+    fn ds_form_load_store() {
+        // Retail fault word: std r28,-40(r1) -> 0xFB81FFD8.
+        assert!(matches!(
+            decode(0xFB81_FFD8).unwrap(),
+            Decoded::Std {
+                rs: 28,
+                ra: 1,
+                ds: -40
+            }
+        ));
+        // ld r3,8(r4): primary 58, XO 0.
+        assert!(matches!(
+            decode(0xE864_0008).unwrap(),
+            Decoded::Ld {
+                rt: 3,
+                ra: 4,
+                ds: 8
+            }
+        ));
+        // stdu r1,-64(r1): primary 62, XO 1.
+        assert!(matches!(
+            decode(0xF821_FFC1).unwrap(),
+            Decoded::Stdu {
+                rs: 1,
+                ra: 1,
+                ds: -64
+            }
+        ));
+        // Reserved XO 2 stays Unsupported, never executed.
+        assert!(matches!(
+            decode(0xE864_000A).unwrap(),
+            Decoded::Unsupported { .. }
+        ));
+    }
+    #[test]
+    fn cache_ops_decode() {
+        // Retail word: dcbt r0,r4 -> 0x7C00222C.
+        assert!(matches!(
+            decode(0x7C00_222C).unwrap(),
+            Decoded::Dcbt { ra: 0, rb: 4 }
+        ));
+        assert!(matches!(
+            decode((31u32 << 26) | (2 << 16) | (3 << 11) | (1014 << 1)).unwrap(),
+            Decoded::Dcbz { ra: 2, rb: 3 }
+        ));
+    }
+    #[test]
+    fn addic_form() {
+        // Retail word: addic. r8,r8,-1 -> 0x3508FFFF.
+        assert!(matches!(
+            decode(0x3508_FFFF).unwrap(),
+            Decoded::Addic_ {
+                rt: 8,
+                ra: 8,
+                simm: -1
+            }
+        ));
+        assert!(matches!(
+            decode(0x30A0_0010).unwrap(),
+            Decoded::Addic {
+                rt: 5,
+                ra: 0,
+                simm: 16
+            }
+        ));
+    }
+    #[test]
+    fn mds_form_decode() {
+        // Retail word: rldicl r9,r11,0,32 -> 0x79690020
+        // (6-bit fields: SH = 0<<5|0, MB = 1<<5|0; a low-half move).
+        assert!(matches!(
+            decode(0x7969_0020).unwrap(),
+            Decoded::Rldicl {
+                rs: 11,
+                ra: 9,
+                sh: 0,
+                mb: 32
+            }
+        ));
+        // Reserved MDS XO (bits 2-4 = 0b100) stays Unsupported.
+        assert!(matches!(
+            decode(0x7969_0030).unwrap(),
+            Decoded::Unsupported { .. }
+        ));
+        // rldimi r7,r8,60,60 -> 0x7907E72E.
+        assert!(matches!(
+            decode(0x7907_E72E).unwrap(),
+            Decoded::Rldimi {
+                rs: 8,
+                ra: 7,
+                sh: 60,
+                mb: 60,
+                rc: false
+            }
+        ));
+        // extsw r6,r5 -> 0x7CA607B4; cntlzd r8,r7 -> 0x7CE80074.
+        // (RS in RT field, dest in RA: rt=5/ra=6 and rt=7/ra=8.)
+        assert!(matches!(
+            decode(0x7CA6_07B4).unwrap(),
+            Decoded::Extsw {
+                rs: 5,
+                ra: 6,
+                rc: false
+            }
+        ));
+        assert!(matches!(
+            decode(0x7CE8_0074).unwrap(),
+            Decoded::Cntlzd {
+                rs: 7,
+                ra: 8,
+                rc: false
+            }
+        ));
     }
     #[test]
     fn unknown_is_unsupported_not_error() {

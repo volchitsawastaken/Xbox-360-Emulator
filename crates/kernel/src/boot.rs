@@ -144,8 +144,8 @@ pub fn run_until_exit_traced_imports(
             )?;
             continue;
         }
-        let id = xenon.threads[t.thread].t.gpr[0];
-        let r3 = xenon.threads[t.thread].t.gpr[3];
+        let id = xenon.threads[t.thread].t.gpr[0] as u32;
+        let r3 = xenon.threads[t.thread].t.gpr[3] as u32;
         match id {
             1 => {
                 return Ok(GuestExit {
@@ -160,7 +160,7 @@ pub fn run_until_exit_traced_imports(
             0 => {
                 let v = kernel.syscall(0, &[])?;
                 // Return time in r3 like a real ABI would.
-                xenon.threads[t.thread].t.gpr[3] = v;
+                xenon.threads[t.thread].t.gpr[3] = (v) as u64;
             }
             other => {
                 kernel.syscall(other, &[])?;

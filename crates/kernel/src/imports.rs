@@ -106,10 +106,11 @@ pub fn apply(
             let ordinal = (slot & 0xFFFF) as u16;
             match kind_byte {
                 0 => {
-                    // Variable: real backing store, slot points at it.
-                    let backing = kernel.alloc_mem(32, 4)?;
-                    mem.write_bytes(backing, &[0u8; 32])?;
-                    mem.write_u32(addr, backing)?;
+                    // Variable or descriptor slot: content comes from
+                    // the variables module (real models, else explicit
+                    // markers — never a silent zero page).
+                    let value = super::variables::init_variable(kernel, mem, lib, ordinal)?;
+                    mem.write_u32(addr, value)?;
                     table.imports.insert(
                         addr,
                         ResolvedImport {

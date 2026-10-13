@@ -22,6 +22,14 @@ impl CondReg {
         let v = (lt << 3) | (gt << 2) | (eq << 1) | (xer_so as u8);
         self.set_field(0, v);
     }
+    /// CR0 from a signed 64-bit result (doubleword Rc forms).
+    pub fn set_cr0_64(&mut self, result: i64, xer_so: bool) {
+        let lt = (result < 0) as u8;
+        let gt = (result > 0) as u8;
+        let eq = (result == 0) as u8;
+        let v = (lt << 3) | (gt << 2) | (eq << 1) | (xer_so as u8);
+        self.set_field(0, v);
+    }
 }
 
 /// Fixed-point exception register subset.
@@ -55,9 +63,16 @@ impl Xer {
 }
 
 /// One hardware thread.
+///
+/// GPRs are 64-bit (Xenon is PPC64). Word (32-bit) instructions operate
+/// on the low half and zero-extend, matching the observable behavior of
+/// recompiled code; genuine doubleword instructions use the full width.
+/// FPRs are f64 (singles convert on load/store per Power ISA).
 #[derive(Debug, Clone)]
 pub struct ThreadState {
-    pub gpr: [u32; 32],
+    pub gpr: [u64; 32],
+    pub fpr: [f64; 32],
+    pub fpscr: u32,
     pub pc: u32,
     pub lr: u32,
     pub ctr: u32,
@@ -76,6 +91,8 @@ impl ThreadState {
     pub fn new(id: usize, entry: u32) -> Self {
         Self {
             gpr: [0; 32],
+            fpr: [0.0; 32],
+            fpscr: 0,
             pc: entry,
             lr: 0,
             ctr: 0,

@@ -44,7 +44,7 @@ const CS_RECURSION: u32 = 0x14;
 const CS_OWNER: u32 = 0x18;
 
 fn arg(t: &ThreadState, i: usize) -> u32 {
-    t.gpr[3 + i]
+    t.gpr[3 + i] as u32
 }
 
 fn read_u16be(mem: &Memory, addr: u32) -> Result<u16> {
@@ -129,16 +129,34 @@ pub fn dispatch_import(
         (Lib::Xboxkrnl, 0x84) => ke_query_system_time(mem, arg(t, 0), t),
         (Lib::Xboxkrnl, 0x83) => ke_query_perf_freq(mem, arg(t, 0), t),
         (Lib::Xboxkrnl, 0x66) => {
-            t.gpr[3] = 1; // title process
+            t.gpr[3] = 1_u64; // title process
             Ok(())
         }
         (Lib::Xboxkrnl, 0x12B) => rtl_xex_header_field(kernel, arg(t, 0), arg(t, 1), t),
         (Lib::Xboxkrnl, 0x12A) => rtl_get_stack_limits(kernel, mem, arg(t, 0), arg(t, 1), t),
         (Lib::Xboxkrnl, 0x195) => xex_get_module_handle(kernel, mem, arg(t, 0), arg(t, 1), t),
+        (Lib::Xboxkrnl, 0x194) => xex_check_privilege(kernel, arg(t, 0), t),
         (Lib::Xboxkrnl, 0x03) => {
             let fmt = read_cstr(mem, arg(t, 0)).unwrap_or_default();
             log::info!("guest DbgPrint: {}", String::from_utf8_lossy(&fmt));
-            t.gpr[3] = 0;
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // ---- XAM ----
+        // AV pack for PAL checks (reference `am_info.cc`; 8 = HDMI,
+        // the reference default; 3/4/6/8 are the non-exploding set).
+        (Lib::Xam, 0x3CB) => {
+            t.gpr[3] = 8_u64;
+            Ok(())
+        }
+        // System version (reference returns 0: older is safer).
+        (Lib::Xam, 0x282) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // Current title id: the genuinely loaded title.
+        (Lib::Xam, 0x1CF) => {
+            t.gpr[3] = (kernel.title_id) as u64;
             Ok(())
         }
         _ => {
@@ -192,7 +210,7 @@ fn rtl_init_cs(
     write_i32be(mem, cs + CS_RECURSION, 0)?;
     mem.write_u32(cs + CS_OWNER, 0)?;
     kernel.crit_insert(cs, div);
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -225,7 +243,7 @@ fn rtl_enter_cs(
         )));
     }
     kernel.crit_owned(cs, thread_id);
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -257,7 +275,7 @@ fn rtl_leave_cs(
         write_i32be(mem, cs + CS_LOCK, lock - 1)?;
         write_i32be(mem, cs + CS_RECURSION, rec - 1)?;
     }
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -269,16 +287,16 @@ fn rtl_try_enter_cs(
     t: &mut ThreadState,
 ) -> Result<()> {
     if cs == 0 {
-        t.gpr[3] = 1;
+        t.gpr[3] = 1_u64;
         return Ok(());
     }
     let lock = read_i32be(mem, cs + CS_LOCK).unwrap_or(-1);
     let owner = mem.read_u32(cs + CS_OWNER).unwrap_or(0);
     if lock < 0 || owner == 0 || owner == thread_id {
         rtl_enter_cs(kernel, mem, thread_id, cs, t)?;
-        t.gpr[3] = 1;
+        t.gpr[3] = 1_u64;
     } else {
-        t.gpr[3] = 0;
+        t.gpr[3] = 0_u64;
     }
     Ok(())
 }
@@ -303,7 +321,7 @@ fn rtl_init_ansi(mem: &mut Memory, dst: u32, src: u32, t: &mut ThreadState) -> R
         write_u16be(mem, dst + 2, (s.len() + 1) as u16)?;
         mem.write_u32(dst + 4, src)?;
     }
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -334,7 +352,7 @@ fn rtl_init_unicode(mem: &mut Memory, dst: u32, src: u32, t: &mut ThreadState) -
         write_u16be(mem, dst + 2, bytes.wrapping_add(2))?;
         mem.write_u32(dst + 4, src)?;
     }
-    t.gpr[3] = dst;
+    t.gpr[3] = (dst) as u64;
     Ok(())
 }
 
@@ -344,7 +362,7 @@ fn rtl_free_string(mem: &mut Memory, s: u32, t: &mut ThreadState) -> Result<()> 
         write_u16be(mem, s + 2, 0)?;
         mem.write_u32(s + 4, 0)?;
     }
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -361,7 +379,7 @@ fn rtl_copy_string(
     }
     if src == 0 {
         write_u16be(mem, dst, 0)?;
-        t.gpr[3] = 0;
+        t.gpr[3] = 0_u64;
         return Ok(());
     }
     let src_len = read_u16be(mem, src)? as u32;
@@ -374,7 +392,7 @@ fn rtl_copy_string(
         mem.write_bytes(dst_buf, &bytes)?;
     }
     write_u16be(mem, dst, n as u16)?;
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -413,11 +431,11 @@ fn rtl_compare_memory_ulong(
     for off in (0..len).step_by(4) {
         let w = mem.read_bytes(ptr + off, 4)?;
         if w != pat {
-            t.gpr[3] = 1;
+            t.gpr[3] = 1_u64;
             return Ok(());
         }
     }
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -438,7 +456,7 @@ fn rtl_fill_ulong(
     for off in (0..len).step_by(4) {
         mem.write_bytes(ptr + off, &pat)?;
     }
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -455,7 +473,7 @@ fn ex_alloc_pool(
     }
     let addr = kernel.alloc_mem(size, 8)?;
     mem.write_bytes(addr, &vec![0u8; size as usize])?;
-    t.gpr[3] = addr;
+    t.gpr[3] = (addr) as u64;
     Ok(())
 }
 
@@ -463,12 +481,12 @@ fn ex_free_pool(kernel: &mut Kernel, addr: u32, t: &mut ThreadState) -> Result<(
     if addr != 0 {
         kernel.free_mem(addr)?;
     }
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
 fn ex_query_pool_size(kernel: &Kernel, addr: u32, t: &mut ThreadState) -> Result<()> {
-    t.gpr[3] = kernel.alloc_size(addr);
+    t.gpr[3] = (kernel.alloc_size(addr)) as u64;
     Ok(())
 }
 
@@ -490,15 +508,15 @@ fn nt_alloc_virt(
     t: &mut ThreadState,
 ) -> Result<()> {
     if base_ptr == 0 || size_ptr == 0 {
-        t.gpr[3] = STATUS_INVALID_PARAMETER;
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
     if alloc_type & MEM_RESET != 0 && alloc_type & !MEM_RESET != 0 {
-        t.gpr[3] = STATUS_INVALID_PARAMETER;
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
     if alloc_type & (MEM_COMMIT | MEM_RESERVE | MEM_RESET) == 0 {
-        t.gpr[3] = STATUS_INVALID_PARAMETER;
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
     let want_base = mem.read_u32(base_ptr)?;
@@ -509,7 +527,7 @@ fn nt_alloc_virt(
         want_size as u32
     };
     if want_size == 0 {
-        t.gpr[3] = STATUS_INVALID_PARAMETER;
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
     let page = page_size_for(alloc_type);
@@ -531,7 +549,7 @@ fn nt_alloc_virt(
     }
     mem.write_u32(base_ptr, addr)?;
     mem.write_u32(size_ptr, size)?;
-    t.gpr[3] = STATUS_SUCCESS;
+    t.gpr[3] = (STATUS_SUCCESS) as u64;
     Ok(())
 }
 
@@ -544,14 +562,14 @@ fn nt_free_virt(
     t: &mut ThreadState,
 ) -> Result<()> {
     if base_ptr == 0 || size_ptr == 0 {
-        t.gpr[3] = STATUS_INVALID_PARAMETER;
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
     let base = mem.read_u32(base_ptr)?;
-    match kernel.free_mem(base) {
-        Ok(_) => t.gpr[3] = STATUS_SUCCESS,
-        Err(_) => t.gpr[3] = STATUS_INVALID_PARAMETER,
-    }
+    t.gpr[3] = match kernel.free_mem(base) {
+        Ok(_) => STATUS_SUCCESS,
+        Err(_) => STATUS_INVALID_PARAMETER,
+    } as u64;
     Ok(())
 }
 
@@ -563,13 +581,13 @@ fn nt_query_virt(
     t: &mut ThreadState,
 ) -> Result<()> {
     if info_ptr == 0 {
-        t.gpr[3] = STATUS_INVALID_PARAMETER;
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
     // `X_MEMORY_BASIC_INFORMATION`: 7 x u32be.
     let size = kernel.alloc_size(base);
     if size == 0 {
-        t.gpr[3] = STATUS_INVALID_PARAMETER;
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
     mem.write_u32(info_ptr, base)?;
@@ -579,7 +597,7 @@ fn nt_query_virt(
     mem.write_u32(info_ptr + 16, MEM_COMMIT | MEM_RESERVE)?;
     mem.write_u32(info_ptr + 20, 0x04)?;
     mem.write_u32(info_ptr + 24, 0x0002_0000)?; // MEM_PRIVATE
-    t.gpr[3] = STATUS_SUCCESS;
+    t.gpr[3] = (STATUS_SUCCESS) as u64;
     Ok(())
 }
 
@@ -592,12 +610,12 @@ fn mm_alloc_phys(
 ) -> Result<()> {
     let _ = protect;
     if size == 0 {
-        t.gpr[3] = 0;
+        t.gpr[3] = 0_u64;
         return Ok(());
     }
     let addr = kernel.alloc_mem(size.div_ceil(4096) * 4096, 4096)?;
     mem.write_bytes(addr, &vec![0u8; (size.div_ceil(4096) * 4096) as usize])?;
-    t.gpr[3] = addr;
+    t.gpr[3] = (addr) as u64;
     Ok(())
 }
 
@@ -611,14 +629,14 @@ fn mm_alloc_phys_ex(kernel: &mut Kernel, mem: &mut Memory, t: &mut ThreadState) 
     let _max = arg(t, 4);
     let align = arg(t, 5).max(4096);
     if size == 0 {
-        t.gpr[3] = 0;
+        t.gpr[3] = 0_u64;
         return Ok(());
     }
     let rounded = size.div_ceil(4096) * 4096;
     let addr = kernel.alloc_mem(rounded, align.min(65536))?;
     mem.write_bytes(addr, &vec![0u8; rounded as usize])?;
     let _ = protect;
-    t.gpr[3] = addr;
+    t.gpr[3] = (addr) as u64;
     Ok(())
 }
 
@@ -626,41 +644,41 @@ fn mm_free_phys(kernel: &mut Kernel, addr: u32, t: &mut ThreadState) -> Result<(
     if addr != 0 {
         let _ = kernel.free_mem(addr);
     }
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
 fn mm_query_alloc_size(kernel: &Kernel, addr: u32, t: &mut ThreadState) -> Result<()> {
-    t.gpr[3] = kernel.alloc_size(addr);
+    t.gpr[3] = (kernel.alloc_size(addr)) as u64;
     Ok(())
 }
 
 // ---- TLS ----
 
 fn ke_tls_alloc(kernel: &mut Kernel, t: &mut ThreadState) -> Result<()> {
-    match kernel.tls_alloc() {
-        Some(slot) => t.gpr[3] = slot,
-        None => t.gpr[3] = 0xFFFF_FFFF, // X_TLS_OUT_OF_INDEXES
-    }
+    t.gpr[3] = match kernel.tls_alloc() {
+        Some(slot) => slot as u64,
+        None => 0xFFFF_FFFF, // X_TLS_OUT_OF_INDEXES
+    };
     Ok(())
 }
 
 fn ke_tls_free(kernel: &mut Kernel, index: u32, t: &mut ThreadState) -> Result<()> {
     if index == 0xFFFF_FFFF {
-        t.gpr[3] = 0;
+        t.gpr[3] = 0_u64;
     } else {
-        t.gpr[3] = u32::from(kernel.tls_free(index));
+        t.gpr[3] = (u32::from(kernel.tls_free(index))) as u64;
     }
     Ok(())
 }
 
 fn ke_tls_get(kernel: &Kernel, index: u32, t: &mut ThreadState) -> Result<()> {
-    t.gpr[3] = kernel.tls_get(index);
+    t.gpr[3] = (kernel.tls_get(index)) as u64;
     Ok(())
 }
 
 fn ke_tls_set(kernel: &mut Kernel, index: u32, value: u32, t: &mut ThreadState) -> Result<()> {
-    t.gpr[3] = u32::from(kernel.tls_set(index, value));
+    t.gpr[3] = (u32::from(kernel.tls_set(index, value))) as u64;
     Ok(())
 }
 
@@ -691,7 +709,7 @@ fn ke_query_perf_freq(mem: &mut Memory, out_ptr: u32, t: &mut ThreadState) -> Re
     if out_ptr != 0 {
         mem.write_u32(out_ptr, 50_000_000)?;
     }
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -713,7 +731,7 @@ fn rtl_get_stack_limits(
         high_ptr,
         kernel.stack_base().wrapping_add(kernel.stack_size()),
     )?;
-    t.gpr[3] = 0;
+    t.gpr[3] = 0_u64;
     Ok(())
 }
 
@@ -724,21 +742,34 @@ fn rtl_xex_header_field(
     t: &mut ThreadState,
 ) -> Result<()> {
     if header_ptr == 0 {
-        t.gpr[3] = 0;
+        t.gpr[3] = 0_u64;
         return Ok(());
     }
     // Serve from the stored header image when it covers the request,
     // else from module facts for the handful of inline keys games poll.
     if let Some(v) = kernel.xex_header_field(header_ptr, field) {
-        t.gpr[3] = v;
+        t.gpr[3] = (v) as u64;
         return Ok(());
     }
-    t.gpr[3] = match field {
+    t.gpr[3] = (match field {
         0x0001_0100 => kernel.entry_point(),
         0x0001_0201 => kernel.image_base,
         0x0004_0006 => kernel.title_id, // execution-info title id (caller reads +0xC)
         _ => 0,
-    };
+    }) as u64;
+    Ok(())
+}
+
+/// `XexCheckExecutablePrivilege(privilege)`: test one system-flag bit
+/// (reference `xboxkrnl_modules.cc`; privilege is a bit position into
+/// the `XEX_HEADER_SYSTEM_FLAGS` word). Returns 1/0, never traps.
+fn xex_check_privilege(kernel: &Kernel, privilege: u32, t: &mut ThreadState) -> Result<()> {
+    if privilege >= 32 {
+        t.gpr[3] = 0_u64;
+        return Ok(());
+    }
+    let mask = 1u32 << privilege;
+    t.gpr[3] = (u32::from(kernel.system_flags & mask != 0)) as u64;
     Ok(())
 }
 
@@ -750,13 +781,13 @@ fn xex_get_module_handle(
     t: &mut ThreadState,
 ) -> Result<()> {
     if out_ptr == 0 {
-        t.gpr[3] = STATUS_INVALID_PARAMETER;
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
     if name_ptr == 0 {
         // Current executable: the image base serves as the handle.
         mem.write_u32(out_ptr, kernel.image_base)?;
-        t.gpr[3] = ERROR_SUCCESS;
+        t.gpr[3] = (ERROR_SUCCESS) as u64;
         return Ok(());
     }
     let name = read_cstr(mem, name_ptr).unwrap_or_default();
@@ -768,13 +799,13 @@ fn xex_get_module_handle(
     const XRNL_HANDLE: u32 = 0x9000_0002;
     if want == "xam.xex" {
         mem.write_u32(out_ptr, XAM_HANDLE)?;
-        t.gpr[3] = ERROR_SUCCESS;
+        t.gpr[3] = (ERROR_SUCCESS) as u64;
     } else if want == "xboxkrnl.exe" {
         mem.write_u32(out_ptr, XRNL_HANDLE)?;
-        t.gpr[3] = ERROR_SUCCESS;
+        t.gpr[3] = (ERROR_SUCCESS) as u64;
     } else {
         mem.write_u32(out_ptr, 0)?;
-        t.gpr[3] = ERROR_NOT_FOUND;
+        t.gpr[3] = (ERROR_NOT_FOUND) as u64;
     }
     Ok(())
 }
@@ -806,7 +837,7 @@ mod tests {
         let mut t = thread();
         let cs = 0x8400_1000;
         m.write_bytes(cs, &[0u8; 28]).unwrap();
-        t.gpr[3] = cs;
+        t.gpr[3] = (cs) as u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -817,7 +848,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.read_u32(cs + CS_LOCK).unwrap(), 0xFFFF_FFFF);
-        t.gpr[3] = cs;
+        t.gpr[3] = (cs) as u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -828,7 +859,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.read_u32(cs + CS_OWNER).unwrap(), 1);
-        t.gpr[3] = cs;
+        t.gpr[3] = (cs) as u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -847,7 +878,7 @@ mod tests {
         let mut m = Memory::new();
         let mut tab = ImportTable::new();
         let mut t = thread();
-        t.gpr[3] = 64;
+        t.gpr[3] = 64_u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -857,10 +888,10 @@ mod tests {
             &imp("xboxkrnl.exe", 0x09),
         )
         .unwrap();
-        let a = t.gpr[3];
+        let a = t.gpr[3] as u32;
         assert_ne!(a, 0);
         assert_eq!(&m.read_bytes(a, 4).unwrap(), &[0, 0, 0, 0]);
-        t.gpr[3] = a;
+        t.gpr[3] = (a) as u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -887,10 +918,10 @@ mod tests {
             &imp("xboxkrnl.exe", 0x152),
         )
         .unwrap();
-        let slot = t.gpr[3];
+        let slot = t.gpr[3] as u32;
         assert!(slot < 64);
-        t.gpr[3] = slot;
-        t.gpr[4] = 0x1234_5678;
+        t.gpr[3] = (slot) as u64;
+        t.gpr[4] = 0x1234_5678_u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -900,8 +931,8 @@ mod tests {
             &imp("xboxkrnl.exe", 0x155),
         )
         .unwrap();
-        assert_eq!(t.gpr[3], 1);
-        t.gpr[3] = slot;
+        assert_eq!((t.gpr[3] as u32), 1);
+        t.gpr[3] = (slot) as u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -911,7 +942,110 @@ mod tests {
             &imp("xboxkrnl.exe", 0x154),
         )
         .unwrap();
-        assert_eq!(t.gpr[3], 0x1234_5678);
+        assert_eq!((t.gpr[3] as u32), 0x1234_5678);
+    }
+
+    #[test]
+    fn header_field_from_placed_copy() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Minimal header: one inline entry 0x00020401 = 0x00A00000.
+        let mut hdr = vec![0u8; 32];
+        hdr[0..4].copy_from_slice(b"XEX2");
+        hdr[20..24].copy_from_slice(&1u32.to_be_bytes());
+        hdr[24..28].copy_from_slice(&0x0002_0401u32.to_be_bytes());
+        hdr[28..32].copy_from_slice(&0x00A0_0000u32.to_be_bytes());
+        k.set_module_info(0x8200_0000, 0x100, 0x5841_08CE);
+        k.set_xex_header(hdr, 0x8200_1000, "default.xex".into());
+        let placed = k.place_xex_header(&mut m).unwrap();
+        assert_ne!(placed, 0x8200_0000);
+        // Query through the placed copy, as games do via the module struct.
+        t.gpr[3] = placed as u64;
+        t.gpr[4] = 0x0002_0401_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x12B),
+        )
+        .unwrap();
+        assert_eq!((t.gpr[3] as u32), 0x00A0_0000);
+        // Unknown header pointer stays 0, never fabricated.
+        t.gpr[3] = 0x1234_5678_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x12B),
+        )
+        .unwrap();
+        assert_eq!((t.gpr[3] as u32), 0);
+    }
+
+    #[test]
+    fn privilege_tests_flag_bit() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Bit 6 = INSECURE_SOCKETS.
+        k.set_system_flags(0x40);
+        t.gpr[3] = 6;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x194),
+        )
+        .unwrap();
+        assert_eq!((t.gpr[3] as u32), 1);
+        t.gpr[3] = 7;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x194),
+        )
+        .unwrap();
+        assert_eq!((t.gpr[3] as u32), 0);
+        // Out-of-range privilege is 0, never a shift panic.
+        t.gpr[3] = 33;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x194),
+        )
+        .unwrap();
+        assert_eq!((t.gpr[3] as u32), 0);
+    }
+
+    #[test]
+    fn xam_info_getters() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        k.set_module_info(0x8200_0000, 0x1000, 0x5841_08CE);
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x3CB)).unwrap();
+        assert_eq!((t.gpr[3] as u32), 8);
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x282)).unwrap();
+        assert_eq!((t.gpr[3] as u32), 0);
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1CF)).unwrap();
+        assert_eq!((t.gpr[3] as u32), 0x5841_08CE);
+        assert_eq!(ImportTable::name_of("xam.xex", 0x3CB), Some("XGetAVPack"));
     }
 
     #[test]
@@ -920,8 +1054,15 @@ mod tests {
         let mut m = Memory::new();
         let mut tab = ImportTable::new();
         let mut t = thread();
-        let e = dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x282))
-            .unwrap_err();
-        assert!(format!("{}", e).contains("XamGetSystemVersion"));
+        let e = dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1A6),
+        )
+        .unwrap_err();
+        assert!(format!("{}", e).contains("DbgLoadImageSymbols"));
     }
 }

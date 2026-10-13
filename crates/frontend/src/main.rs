@@ -337,7 +337,7 @@ impl EmuApp {
         }
         for trap in traps {
             // Convention: r0 = syscall id at sc time.
-            let id = self.xenon.threads[trap.thread].t.gpr[0];
+            let id = self.xenon.threads[trap.thread].t.gpr[0] as u32;
             match self.kernel.syscall(id, &[]) {
                 Ok(v) => {
                     let msg = format!("syscall {} -> {:08x} (thread {})", id, v, trap.thread);

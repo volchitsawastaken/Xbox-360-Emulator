@@ -140,6 +140,31 @@ impl Memory {
         Ok(())
     }
 
+    /// 64-bit big-endian access for `ld/std` (PPC64 GPRs). Deliberately
+    /// permissive on alignment: retail Braid stores dwords to 4-aligned
+    /// addresses (396-byte stride array, field at +24), which shipped
+    /// hardware tolerates and the reference's `uint32_t` memory never
+    /// faults on. Wild addresses still fault at translation (unmapped).
+    pub fn read_u64(&self, addr: u32) -> Result<u64> {
+        let off = self.translate(addr, 8, Perm::READ)?;
+        Ok(u64::from_be_bytes([
+            self.data[off],
+            self.data[off + 1],
+            self.data[off + 2],
+            self.data[off + 3],
+            self.data[off + 4],
+            self.data[off + 5],
+            self.data[off + 6],
+            self.data[off + 7],
+        ]))
+    }
+
+    pub fn write_u64(&mut self, addr: u32, v: u64) -> Result<()> {
+        let off = self.translate(addr, 8, Perm::WRITE)?;
+        self.data[off..off + 8].copy_from_slice(&v.to_be_bytes());
+        Ok(())
+    }
+
     pub fn read_bytes(&self, addr: u32, len: usize) -> Result<&[u8]> {
         let off = self.translate(addr, len, Perm::READ)?;
         Ok(&self.data[off..off + len])
@@ -204,6 +229,23 @@ mod tests {
     fn misaligned_is_error() {
         let m = Memory::new();
         assert!(m.read_u32(0x1001).is_err());
+    }
+
+    #[test]
+    fn u64_roundtrip_be() {
+        let mut m = Memory::new();
+        m.write_u64(0x2000, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(m.read_u64(0x2000).unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(m.read_u32(0x2000).unwrap(), 0x1122_3344);
+        assert_eq!(m.read_u32(0x2004).unwrap(), 0x5566_7788);
+    }
+
+    #[test]
+    fn u64_four_aligned_roundtrips() {
+        // Retail Braid `std` to 4-aligned addresses must work.
+        let mut m = Memory::new();
+        m.write_u64(0x2004, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(m.read_u64(0x2004).unwrap(), 0x1122_3344_5566_7788);
     }
 
     #[test]
