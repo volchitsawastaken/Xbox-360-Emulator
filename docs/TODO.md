@@ -32,9 +32,12 @@ Terminal states only: impossible, done, or something rendering.
 
 ## Active
 
-- [ ] Heap-walk cycle at 8236C1B4 (2-cycle 840301D8<->840308D8, key
-      r9=0x8353): find what built the cyclic links (steps ~40k) and
-      whether a CPU op or shim value diverged; then rerun for next fault
+- [ ] Heap-walk cycle at 8236C1B4 (2-cycle 840301D8<->840308D8): insert
+      verified correct circular-list behavior; key slot [840301D0] held
+      pointer bits (0x8403) instead of a key when derived at step 55966
+      (new key 0xB0 == r29 correct; r7 = 0x8403-0xB0 garbage). Next:
+      find who left the pointer in the key slot (init-order branch?)
+      and re-run for the next fault
 
 ## Next (retail-driven, in expected order)
 

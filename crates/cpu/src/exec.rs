@@ -585,8 +585,9 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Rldic { rs, ra, sh, mb, rc } => {
+            // Clear under MASK(mb, ~sh) (reference `InstrEmit_rldicx`).
             let rot = t.gpr[rs as usize].rotate_left(sh);
-            let v = rot & rld_mask(mb, 63);
+            let v = rot & rld_mask(mb, 64u32.wrapping_sub(sh) & 63);
             t.gpr[ra as usize] = v;
             if rc {
                 update_cr0_64(t, v);
@@ -2238,6 +2239,12 @@ mod tests {
         t.gpr[8] = 0x12;
         run_word(0x7907_E72E, &mut t, &mut m);
         assert_eq!(t.gpr[7], 0x27FF_FFFF_FFFF_FFF1);
+        // rldic r5,r6,8,32 clears under MASK(32,~8=56).
+        t.gpr[6] = 0xFFFF_FFFF_FFFF_FFFF;
+        let rldic =
+            (30u32 << 26) | (6 << 21) | (5 << 16) | (8 << 11) | (1 << 5) | (2 << 2);
+        run_word(rldic, &mut t, &mut m);
+        assert_eq!(t.gpr[5], 0x0000_0000_FFFF_FF80);
         // 6-bit shift: rldicl r4,r3,40,0 (SH5 set).
         t.gpr[3] = 1;
         run_word(0x7864_4002, &mut t, &mut m);
