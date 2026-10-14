@@ -314,6 +314,35 @@ out, and the license note. Workspace license: BSD-3-Clause.
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.
 
+## 11. Thread startup, KeWait/KeResetEvent, messagebox facts
+
+- Source: `src/xenia/kernel/xthread.cc` (`XThread::Execute`:
+  raw threads start at `start_address` with `start_context` as the
+  single arg, return value in r3 becomes the exit code),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_threading.cc`
+  (`NtWaitForSingleObjectEx`/`KeWaitForSingleObject_entry`:
+  `(handle_or_ptr, mode, alertable, timeout_ptr)`, NULL timeout =
+  infinite, kBlocking; `KeResetEvent_entry`: clear + return
+  previous state),
+  `src/xenia/kernel/kernel.h` (`MESSAGEBOX_RESULT`: `ButtonPressed`
+  u32be at +0, 8 bytes),
+  `src/xenia/kernel/xam/am_ui.cc` (`XamShowMessageBoxUi`: raw
+  UTF-16 title/text/buttons, empty list falls back to "OK",
+  headless auto-picks the focused button + SUCCESS).
+- Taken (facts only): startup arg convention, wait signatures +
+  NULL semantics, reset return, result layout, headless rule.
+- Lives here: `crates/kernel/src/boot.rs` (spawn drain + round
+  robin), `crates/kernel/src/lib.rs` (slot assignment, `Blocked`),
+  `crates/kernel/src/dispatch.rs` (`KeWaitForSingleObject`,
+  `KeResetEvent`, `XamShowMessageBoxUI(Ex)` + unit tests),
+  `crates/common/src/lib.rs` (`EmuError::Blocked`).
+- NOT taken: time-based finite waits (immediate TIMEOUT),
+  overlapped-async UI completion (sync completion), APC delivery,
+  interrupt-callback delivery.
+- License: reference is BSD (Ben Vanik / Xenia project); our
+  tracking and logic are original under the workspace
+  BSD-3-Clause. Attribution is kept in the module docs.
+
 Concrete, data-only port targets. Each names the reference path and
 the file it would land in.
 

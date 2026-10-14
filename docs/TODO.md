@@ -131,17 +131,33 @@ Terminal states only: impossible, done, or something rendering.
       (no draw backend yet); retail Braid kicks twice
       (`0x16`/`0x19`) and the stream executes clean (ME_INIT,
       register programming, nested IBs) — device field still NULL
-- [ ] Retail frontier refined: Braid creates 4 worker threads
-      RUNNABLE (`flags=0`: 2 job-queue `0x82349E20` + 2 `0x8219E7B8`)
-      that our single-thread runner never steps (only thread 0
-      executes; dispatch keeps kernel records only, no Xenon CPU
-      threads). Workers are the likely fillers of the virgin
-      completion slots (`+120` device, post-kick callbacks
-      `[r26+21532]`/`[r26+23308]`) and the missing heap-history
-      contributors. NEXT: cooperative round-robin scheduler —
-      spawn Xenon threads at `start_addr` (r3 = context), step the
-      ready set, honor suspend counts; then re-run and confirm the
-      graphics-failure path is no longer taken
+- [ ] Retail frontier (STFS-backed boot): scheduler is live — workers
+      run and contend (new fault `leave of unowned critical section
+      01030610` at `0x82558D18`, a worker executing leave without
+      ownership). Still open: whether the imbalance is a divergent
+      worker path (heap history now includes worker allocs) or a
+      genuine game race; needs an enter/leave trace with thread ids
+- [x] Critsec ownership vs thread 0 (found via worker contention):
+      main's token 0 collided with "free", letting workers steal
+      main-held sections; free is now (lock < 0) or pristine-zero
+      (unit-tested); genuine contention blocks cooperatively
+      (`EmuError::Blocked` rewind-and-retry in the boot loop) instead
+      of fatal errors
+- [x] Blocking waits: NULL (infinite) timeouts report `Blocked` for
+      rewind-retry instead of bogus TIMEOUT (reference ABI);
+      `KeWaitForSingleObject` (0xB0, pointer form) +
+      `KeResetEvent` (0x8F, returns previous state) implemented and
+      tested; `XamShowMessageBoxUI(Ex)` (0x2CA/0x2DC) mirrors
+      reference headless (auto-pick focused button, logs UTF-16
+      title/text — retail surfaces its fatal errors here)
+- [ ] Retail frontier (STFS-backed boot, with workers live): back at
+      the original `bctr` to `0x67735C65` (+16 stale) — worker
+      starvation eliminated as a cause (workers run, signal, contend;
+      KeWait succeeds via worker signaling). +120/+16 and the
+      post-kick callbacks stay virgin: device creation needs the
+      undelivered graphics-interrupt callback or adapter state the
+      NOP pump doesn't produce. NEXT: GPU interrupt-callback delivery
+      (safe guest reentry), then draw backend
 - [ ] Dash frontier (HostDirFs boot): 63 imports to an entry-table
       walk at `0x921B86BC` (`lwz r8,896(r11)`, r11=0x603400A2 from
       version-string bytes). Walk runs 65537 iterations by
@@ -155,9 +171,13 @@ Terminal states only: impossible, done, or something rendering.
 
 ## Next (retail-driven, in expected order)
 
-- [ ] Cooperative thread scheduler (spawn + round-robin + suspend
-      counts); goal: Braid workers run, device gets created, no
-      "Unable to initialize graphics" path
+- [x] Cooperative thread scheduler (reference `xthread.cc`,
+      `ExCreateThread`): Xenon slots 1..=5 assigned at creation
+      (`thread_id` = slot; exhaustion is an explicit SMP-cap error),
+      spawn queue drained by the boot runner (r1 = stack top,
+      r3 = context, LR 0), round-robin stepping honors suspend
+      counts, worker return (PC/LR 0) marks clean exits; retail Braid
+      workers now run and contend (see Active)
 - [ ] GPU interrupt-callback delivery (safe guest reentry) once the
       scheduler exists; then draw backend
 - [ ] VMX128 FP arithmetic (`vaddfp`, `vmulfp`, float permutes)

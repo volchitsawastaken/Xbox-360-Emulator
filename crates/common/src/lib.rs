@@ -33,6 +33,8 @@ pub enum EmuError {
     Config(String),
     #[error("network error: {0}")]
     Network(String),
+    #[error("blocked: {0}")]
+    Blocked(String),
     #[error("other: {0}")]
     Other(String),
 }

@@ -90,6 +90,24 @@ fn read_cstr(mem: &Memory, ptr: u32) -> Result<Vec<u8>> {
     Err(EmuError::Other("unterminated guest string".into()))
 }
 
+/// Read a guest UTF-16BE string (up to 2048 units, NUL-terminated),
+/// lossy-decoded. Reference `am_ui.cc` reads raw u16 pointers.
+fn read_utf16be(mem: &Memory, ptr: u32) -> Result<String> {
+    if ptr == 0 {
+        return Ok(String::new());
+    }
+    let mut units = Vec::new();
+    for i in 0..2048u32 {
+        let b = mem.read_bytes(ptr.wrapping_add(i * 2), 2)?;
+        let u = u16::from_be_bytes([b[0], b[1]]);
+        if u == 0 {
+            break;
+        }
+        units.push(u);
+    }
+    Ok(String::from_utf16_lossy(&units))
+}
+
 /// Dispatch one import call. On return the boot runner continues at
 /// the post-`sc` word (`blr`), so handlers only set registers/memory.
 pub fn dispatch_import(
@@ -247,7 +265,28 @@ pub fn dispatch_import(
         (Lib::Xboxkrnl, 0xF6) => nt_set_event(kernel, mem, arg(t, 0), arg(t, 1), t),
         (Lib::Xboxkrnl, 0xCE) => nt_clear_event(kernel, mem, arg(t, 0), t),
         (Lib::Xboxkrnl, 0xE2) => nt_pulse_event(kernel, mem, arg(t, 0), arg(t, 1), t),
-        (Lib::Xboxkrnl, 0xFD) => nt_wait_single(kernel, mem, arg(t, 0), thread_id, t),
+        (Lib::Xboxkrnl, 0xFD) => nt_wait_single(kernel, mem, arg(t, 0), thread_id, arg(t, 3), t),
+        // KeWaitForSingleObject(ptr, reason, mode, alertable,
+        // timeout_ptr) (reference `xboxkrnl_threading.cc`,
+        // `KeWaitForSingleObject_entry`, kBlocking): resolve the
+        // guest object pointer to its handle, then wait exactly like
+        // the handle form (NULL timeout blocks cooperatively).
+        (Lib::Xboxkrnl, 0xB0) => ke_wait_single(kernel, mem, arg(t, 0), thread_id, arg(t, 4), t),
+        // KeResetEvent(ptr) (reference `KeResetEvent_entry`): clear
+        // and return the previous signaled state (0/1).
+        (Lib::Xboxkrnl, 0x8F) => {
+            match kernel.nt_handle_of_guest(arg(t, 0)) {
+                Some((handle, _)) => match kernel.nt_clear_event(handle) {
+                    Ok(prev) => {
+                        mirror_event(kernel, mem, handle);
+                        t.gpr[3] = (prev as u32) as u64;
+                    }
+                    Err(_) => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+                },
+                None => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+            }
+            Ok(())
+        }
         (Lib::Xboxkrnl, 0xFE) => {
             nt_wait_multiple(kernel, mem, arg(t, 0), arg(t, 1), arg(t, 2), thread_id, t)
         }
@@ -754,6 +793,16 @@ pub fn dispatch_import(
             t.gpr[3] = (kernel.dash_context) as u64;
             Ok(())
         }
+        // XamShowMessageBoxUI(Ex) (reference `am_ui.cc`
+        // `XamShowMessageBoxUi`): with no UI backend, mirror the
+        // headless path exactly — auto-pick the focused button
+        // (`result->ButtonPressed = active_button`) and return
+        // SUCCESS, completing synchronously even with an overlapped
+        // pointer (no async UI to wait on). Title/text/buttons are
+        // raw UTF-16 pointers, logged: this is how retail surfaces
+        // fatal errors, so the text names the real frontier.
+        (Lib::Xam, 0x2CA) => xam_message_box(mem, t, false),
+        (Lib::Xam, 0x2DC) => xam_message_box(mem, t, true),
         // Title launch data (reference `am_info.cc`
         // `XamLoaderSetLaunchData`/`GetLaunchData(Size)`): empty until
         // set; empty reads report NOT_FOUND (2) exactly like the
@@ -823,6 +872,52 @@ pub fn dispatch_import(
     Ok(())
 }
 
+/// Shared `XamShowMessageBoxUI` (`ex = false`, ordinal 0x2CA) /
+/// `XamShowMessageBoxUIEx` (`ex = true`, 0x2DC) body. Register layout
+/// (reference `am_ui.cc`): user=r3, title=r4, text=r5, count=r6,
+/// ptrs=r7, active=r8, flags=r9, then result=r10 (+ overlapped on
+/// stack); Ex inserts an unused word at r10, shifting result and
+/// overlapped to the stack.
+fn xam_message_box(mem: &mut Memory, t: &mut ThreadState, ex: bool) -> Result<()> {
+    let r1 = t.gpr[1] as u32;
+    let (result_ptr, _overlapped) = if ex {
+        (
+            crate::fs::stack_arg(mem, r1, 0).unwrap_or(0),
+            crate::fs::stack_arg(mem, r1, 1).unwrap_or(0),
+        )
+    } else {
+        (arg(t, 7), crate::fs::stack_arg(mem, r1, 0).unwrap_or(0))
+    };
+    let title = read_utf16be(mem, arg(t, 1)).unwrap_or_default();
+    let text = read_utf16be(mem, arg(t, 2)).unwrap_or_default();
+    let count = arg(t, 3) as usize;
+    let ptrs = arg(t, 4);
+    let active = arg(t, 5);
+    let mut buttons = Vec::new();
+    if ptrs != 0 {
+        for i in 0..count.min(16) {
+            let p = mem.read_u32(ptrs.wrapping_add(i as u32 * 4)).unwrap_or(0);
+            buttons.push(read_utf16be(mem, p).unwrap_or_default());
+        }
+    }
+    if buttons.is_empty() {
+        buttons.push("OK".to_string());
+    }
+    log::warn!(
+        "xam messagebox user={} title={:?} text={:?} buttons={:?} active={}",
+        arg(t, 0),
+        title,
+        text,
+        buttons,
+        active,
+    );
+    if result_ptr != 0 {
+        mem.write_u32(result_ptr, active)?;
+    }
+    t.gpr[3] = 0_u64; // X_ERROR_SUCCESS
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lib {
     Xboxkrnl,
@@ -877,18 +972,25 @@ fn rtl_enter_cs(
     }
     // Tolerate never-initialized sections whose image bytes are zero:
     // treat all-zero as free (reference notes pre-initialized data).
+    // Free is (lock < 0) or pristine-zero; owner 0 alone is NOT free
+    // (thread 0 is the initial thread and may hold the section with
+    // recursion > 0) — stealing it corrupts ownership across threads.
     let lock = read_i32be(mem, cs + CS_LOCK).unwrap_or(-1);
     let owner = mem.read_u32(cs + CS_OWNER).unwrap_or(0);
-    if owner == thread_id && lock >= 0 {
-        write_i32be(mem, cs + CS_LOCK, lock + 1)?;
-        let rec = read_i32be(mem, cs + CS_RECURSION).unwrap_or(0);
-        write_i32be(mem, cs + CS_RECURSION, rec + 1)?;
-    } else if lock < 0 || owner == 0 {
+    let rec0 = read_i32be(mem, cs + CS_RECURSION).unwrap_or(0);
+    if lock < 0 || (owner == 0 && rec0 == 0) {
         write_i32be(mem, cs + CS_LOCK, 0)?;
         write_i32be(mem, cs + CS_RECURSION, 1)?;
         mem.write_u32(cs + CS_OWNER, thread_id)?;
+    } else if owner == thread_id && lock >= 0 {
+        write_i32be(mem, cs + CS_LOCK, lock + 1)?;
+        let rec = read_i32be(mem, cs + CS_RECURSION).unwrap_or(0);
+        write_i32be(mem, cs + CS_RECURSION, rec + 1)?;
     } else {
-        return Err(EmuError::Other(format!(
+        // Owned by another live thread: cooperative block (the boot
+        // runner rewinds to the import and retries; never a silent
+        // acquire, never a fatal error for honest contention).
+        return Err(EmuError::Blocked(format!(
             "critical section {:08x} owned by another thread",
             cs
         )));
@@ -943,7 +1045,9 @@ fn rtl_try_enter_cs(
     }
     let lock = read_i32be(mem, cs + CS_LOCK).unwrap_or(-1);
     let owner = mem.read_u32(cs + CS_OWNER).unwrap_or(0);
-    if lock < 0 || owner == 0 || owner == thread_id {
+    // Same free rule as enter (owner 0 alone is not free: thread 0).
+    let rec = read_i32be(mem, cs + CS_RECURSION).unwrap_or(0);
+    if lock < 0 || (owner == 0 && rec == 0) || owner == thread_id {
         rtl_enter_cs(kernel, mem, thread_id, cs, t)?;
         t.gpr[3] = 1_u64;
     } else {
@@ -1614,7 +1718,7 @@ fn nt_clear_event(
     t: &mut ThreadState,
 ) -> Result<()> {
     match kernel.nt_clear_event(handle) {
-        Ok(()) => {
+        Ok(_) => {
             mirror_event(kernel, mem, handle);
             t.gpr[3] = (STATUS_SUCCESS) as u64;
         }
@@ -1645,14 +1749,30 @@ fn nt_pulse_event(
 }
 
 /// `NtWaitForSingleObjectEx(handle, mode, alertable, timeout_ptr)`:
-/// single-threaded poll — acquire when ready, else TIMEOUT. Timeout
-/// pointer (guest i64 100ns, NULL = infinite) is honored only as
-/// "zero => no wait"; positive waits cannot block without threads.
+/// acquire when ready, else TIMEOUT for zero/non-null timeouts.
+/// NULL timeout is infinite (reference blocks): report Blocked so the
+/// boot runner rewinds and retries — never a bogus TIMEOUT down a
+/// path that must sleep. Finite nonzero timeouts stay immediate
+/// TIMEOUT (polling-loop compatible; time-based expiry is pending).
 fn nt_wait_single(
     kernel: &mut Kernel,
     mem: &mut Memory,
     handle: u32,
     thread_id: u32,
+    timeout_ptr: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    wait_on_handle(kernel, mem, handle, thread_id, timeout_ptr, t)
+}
+
+/// Shared handle-wait result writer (both `Nt*` handle and `Ke*`
+/// pointer forms land here after resolution).
+fn wait_on_handle(
+    kernel: &mut Kernel,
+    mem: &mut Memory,
+    handle: u32,
+    thread_id: u32,
+    timeout_ptr: u32,
     t: &mut ThreadState,
 ) -> Result<()> {
     match kernel.nt_wait_single(handle, thread_id) {
@@ -1660,10 +1780,41 @@ fn nt_wait_single(
             mirror_waited(kernel, mem, handle, thread_id);
             t.gpr[3] = (STATUS_SUCCESS) as u64;
         }
-        Ok(false) => t.gpr[3] = (STATUS_TIMEOUT) as u64,
+        Ok(false) => {
+            if timeout_ptr == 0 {
+                return Err(EmuError::Blocked(format!(
+                    "wait on {:08x} with infinite timeout",
+                    handle
+                )));
+            }
+            let timeout = mem.read_u64(timeout_ptr).unwrap_or(0);
+            if timeout != 0 {
+                // Finite waits cannot block yet: immediate TIMEOUT.
+                // (Reference would sleep until value/expiry.)
+            }
+            t.gpr[3] = (STATUS_TIMEOUT) as u64;
+        }
         Err(_) => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
     }
     Ok(())
+}
+
+/// `KeWaitForSingleObject(ptr, reason, mode, alertable, timeout_ptr)`.
+fn ke_wait_single(
+    kernel: &mut Kernel,
+    mem: &mut Memory,
+    ptr: u32,
+    thread_id: u32,
+    timeout_ptr: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    match kernel.nt_handle_of_guest(ptr) {
+        Some((handle, _)) => wait_on_handle(kernel, mem, handle, thread_id, timeout_ptr, t),
+        None => {
+            t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
+            Ok(())
+        }
+    }
 }
 
 /// Mirror whatever `nt_wait_single` just acquired (auto-reset consume,
@@ -4277,6 +4428,58 @@ mod tests {
         assert_eq!(t.gpr[3] as u32, 0);
     }
 
+    /// Write a UTF-16BE NUL-terminated string for messagebox tests.
+    fn put_u16(m: &mut Memory, addr: u32, s: &str) {
+        for (i, u) in s.encode_utf16().chain(std::iter::once(0)).enumerate() {
+            m.write_bytes(addr + i as u32 * 2, &u.to_be_bytes())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn messagebox_picks_active_button() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x2CA),
+            Some("XamShowMessageBoxUI")
+        );
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x2DC),
+            Some("XamShowMessageBoxUIEx")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        put_u16(&mut m, 0x4000, "Braid");
+        put_u16(&mut m, 0x4100, "Unable to initialize graphics");
+        put_u16(&mut m, 0x4200, "Retry");
+        put_u16(&mut m, 0x4240, "Quit");
+        m.write_u32(0x4300, 0x4200).unwrap();
+        m.write_u32(0x4304, 0x4240).unwrap();
+        m.write_u32(0x4400, 0xFFFF_FFFF).unwrap();
+        t.gpr[1] = 0x8000_u64;
+        m.write_u32(0x8008, 0).unwrap(); // overlapped = sync
+        t.gpr[3] = 0xFF_u64; // user
+        t.gpr[4] = 0x4000_u64;
+        t.gpr[5] = 0x4100_u64;
+        t.gpr[6] = 2_u64;
+        t.gpr[7] = 0x4300_u64;
+        t.gpr[8] = 1_u64; // active = Quit
+        t.gpr[9] = 0_u64;
+        t.gpr[10] = 0x4400_u64; // result
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x2CA)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u32(0x4400).unwrap(), 1);
+        // Ex variant: result + overlapped shift to the stack.
+        m.write_u32(0x4400, 0xFFFF_FFFF).unwrap();
+        m.write_u32(0x8008, 0x4400).unwrap(); // result
+        m.write_u32(0x800C, 0).unwrap(); // overlapped
+        t.gpr[8] = 0_u64; // active = Retry
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x2DC)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u32(0x4400).unwrap(), 0);
+    }
+
     #[test]
     fn xam_video_mode_matches_vd_query() {
         assert_eq!(
@@ -4695,6 +4898,10 @@ mod tests {
         let mut m = Memory::new();
         let mut tab = ImportTable::new();
         let mut t = thread();
+        // Zero-timeout qword: polls (immediate TIMEOUT when not
+        // ready); NULL would mean infinite (cooperative block).
+        let zt = 0x8400_4F00;
+        m.write_u64(zt, 0).unwrap();
         // NtCreateEvent(manual=0..., auto type=1, initial=0).
         let hp = 0x8400_4000;
         t.gpr[3] = hp as u64;
@@ -4717,7 +4924,7 @@ mod tests {
         t.gpr[3] = ev as u64;
         t.gpr[4] = 0;
         t.gpr[5] = 0;
-        t.gpr[6] = 0;
+        t.gpr[6] = zt as u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -4759,7 +4966,7 @@ mod tests {
         t.gpr[3] = ev as u64;
         t.gpr[4] = 0;
         t.gpr[5] = 0;
-        t.gpr[6] = 0;
+        t.gpr[6] = zt as u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -4804,7 +5011,7 @@ mod tests {
         t.gpr[3] = sem as u64;
         t.gpr[4] = 0;
         t.gpr[5] = 0;
-        t.gpr[6] = 0;
+        t.gpr[6] = zt as u64;
         dispatch_import(
             &mut k,
             &mut m,
@@ -4921,6 +5128,222 @@ mod tests {
     }
 
     #[test]
+    fn infinite_wait_blocks_instead_of_timing_out() {
+        use x360_common::EmuError;
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Unsignaled auto-reset event.
+        let hp = 0x8400_4100;
+        t.gpr[3] = hp as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xD1),
+        )
+        .unwrap();
+        let ev = m.read_u32(hp).unwrap();
+        // NULL timeout (infinite) on an unsignaled object: cooperative
+        // Block, never a bogus TIMEOUT.
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0;
+        let e = dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xFD),
+        )
+        .expect_err("infinite wait must block");
+        assert!(matches!(e, EmuError::Blocked(_)));
+        // Same wait once signaled: SUCCESS even with NULL timeout.
+        t.gpr[3] = ev as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xF6),
+        )
+        .unwrap();
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xFD),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn ke_wait_resolves_guest_pointer() {
+        use x360_common::EmuError;
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0xB0),
+            Some("KeWaitForSingleObject")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Manual-reset event, initially unsignaled; fetch its guest ptr.
+        let hp = 0x8400_4200;
+        t.gpr[3] = hp as u64;
+        t.gpr[4] = 1;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xD1),
+        )
+        .unwrap();
+        let h = m.read_u32(hp).unwrap();
+        let gp = k.nt_events.get(&h).copied().expect("tracked").guest_ptr;
+        assert_ne!(gp, 0);
+        // Pointer form, NULL timeout, unsignaled: Blocked.
+        t.gpr[3] = gp as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        let e = dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .expect_err("must block");
+        assert!(matches!(e, EmuError::Blocked(_)));
+        // Unknown pointer: INVALID_HANDLE, never success.
+        t.gpr[3] = 0x8400_4300_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
+        // Signal, then pointer wait succeeds.
+        t.gpr[3] = h as u64;
+        t.gpr[4] = 0; // no prev-count out word
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xF6),
+        )
+        .unwrap();
+        t.gpr[3] = gp as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn ke_reset_event_returns_previous_state() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x8F),
+            Some("KeResetEvent")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Signaled manual event.
+        let hp = 0x8400_4400;
+        t.gpr[3] = hp as u64;
+        t.gpr[4] = 1;
+        t.gpr[5] = 1;
+        t.gpr[6] = 1;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xD1),
+        )
+        .unwrap();
+        let h = m.read_u32(hp).unwrap();
+        let gp = k.nt_events.get(&h).copied().expect("tracked").guest_ptr;
+        // Reset reports previously-signaled (1) and clears.
+        t.gpr[3] = gp as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x8F),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 1);
+        t.gpr[3] = gp as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x8F),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        // Unknown pointer: INVALID_HANDLE.
+        t.gpr[3] = 0x8400_4500_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x8F),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
+    }
+
+    #[test]
     fn crit_init_enter_leave() {
         let mut k = Kernel::new();
         let mut m = Memory::new();
@@ -4960,6 +5383,78 @@ mod tests {
             &imp("xboxkrnl.exe", 0x130),
         )
         .unwrap();
+        assert_eq!(m.read_u32(cs + CS_OWNER).unwrap(), 0);
+    }
+
+    #[test]
+    fn crit_thread_zero_ownership_is_not_free() {
+        // Thread 0 (initial thread) holding a section must not look
+        // free to another thread: owner 0 alone is not free, only
+        // (lock < 0) or pristine-zero is.
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let cs = 0x8400_1100;
+        m.write_bytes(cs, &[0u8; 28]).unwrap();
+        // Pristine section is acquirable by thread 0.
+        t.gpr[3] = (cs) as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x125),
+        )
+        .unwrap();
+        assert_eq!(m.read_u32(cs + CS_OWNER).unwrap(), 0);
+        // Another thread must not steal it: try-enter fails, enter
+        // errors, foreign leave errors.
+        t.gpr[3] = (cs) as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            1,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x141),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        t.gpr[3] = (cs) as u64;
+        assert!(dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            1,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x125),
+        )
+        .is_err());
+        t.gpr[3] = (cs) as u64;
+        assert!(dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            1,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x130),
+        )
+        .is_err());
+        // Owner still thread 0; its leave releases.
+        assert_eq!(m.read_u32(cs + CS_OWNER).unwrap(), 0);
+        t.gpr[3] = (cs) as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x130),
+        )
+        .unwrap();
+        assert_eq!(read_i32be(&m, cs + CS_LOCK).unwrap(), -1);
         assert_eq!(m.read_u32(cs + CS_OWNER).unwrap(), 0);
     }
 

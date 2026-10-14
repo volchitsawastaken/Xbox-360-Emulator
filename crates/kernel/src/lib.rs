@@ -66,6 +66,10 @@ pub struct Kernel {
     pub nt_mutants: HashMap<u32, NtMutant>,
     pub nt_timers: HashMap<u32, NtTimer>,
     pub nt_threads: HashMap<u32, NtThread>,
+    /// NT-thread spawn queue for the boot runner (handles, in creation
+    /// order). Dispatch cannot reach Xenon CPU state, so the runner
+    /// drains this and installs each thread's registers.
+    pub pending_spawns: Vec<u32>,
     /// Open guest files/directories by handle (reference `XFile`
     /// objects; guest structs pending — handles resolve through this
     /// table, not `nt_guest_object`, until then).
@@ -201,8 +205,8 @@ pub struct TerminateNotification {
 }
 
 /// NT thread (reference `xthread.cc` / `X_KTHREAD` in `xthread.h`).
-/// Single-threaded runner tracks creation state only; created threads
-/// are not yet scheduled (documented M6 gap, never silent).
+/// `thread_id` is the Xenon CPU slot the boot runner steps
+/// (cooperative round-robin); slot 0 is the initial thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NtThread {
     pub stack_base: u32,
@@ -213,6 +217,9 @@ pub struct NtThread {
     pub exited: bool,
     pub exit_code: u32,
     pub thread_id: u32,
+    pub cpu_slot: u32,
+    /// Xenon CPU state installed by the boot runner (spawn drain).
+    pub spawned: bool,
     pub kthread_ptr: u32,
     pub affinity: u32,
     pub active_cpu: u8,
@@ -256,6 +263,7 @@ impl Kernel {
             nt_mutants: HashMap::new(),
             nt_timers: HashMap::new(),
             nt_threads: HashMap::new(),
+            pending_spawns: Vec::new(),
             files: fs::FileTable::default(),
             guest_fs: None,
             launch_data: Vec::new(),
@@ -704,13 +712,14 @@ impl Kernel {
         Ok(prev)
     }
 
-    pub fn nt_clear_event(&mut self, handle: u32) -> Result<()> {
+    pub fn nt_clear_event(&mut self, handle: u32) -> Result<i32> {
         let e = self
             .nt_events
             .get_mut(&handle)
             .ok_or_else(|| EmuError::Other(format!("bad NT event {:08x}", handle)))?;
+        let prev = i32::from(e.signaled);
         e.signaled = false;
-        Ok(())
+        Ok(prev)
     }
 
     /// Pulse: report previous state and reset to nonsignaled (reference
@@ -967,10 +976,11 @@ impl Kernel {
 
     /// Create an NT thread (reference `ExCreateThread` /
     /// `xthread.cc`). Allocates a real zeroed stack plus a 0x160-byte
-    /// `X_KTHREAD` block (field offsets from `xthread.h`), tracks the
-    /// start address/context, and returns (handle, thread_id,
-    /// kthread_ptr). Created threads are not yet scheduled — the boot
-    /// runner stays on the initial thread (explicit M6 gap).
+    /// `X_KTHREAD` block (field offsets from `xthread.h`), assigns a
+    /// Xenon CPU slot (1..=5; slot 0 is the initial thread), and queues
+    /// a spawn for the boot runner. Returns (handle, thread_id,
+    /// kthread_ptr); thread_id is the CPU slot. Slot exhaustion is an
+    /// explicit error (SMP cap), never a silent alias.
     pub fn ex_create_thread(
         &mut self,
         mem: &mut x360_memory::Memory,
@@ -993,7 +1003,20 @@ impl Kernel {
         let kthread = self.alloc_mem(0x160, 8)?;
         mem.write_bytes(kthread, &vec![0u8; 0x160])?;
         let handle = self.alloc_handle().0;
-        let thread_id = self.alloc_handle().0;
+        // Xenon CPU slot: first live-free slot 1..=5 (slot 0 is the
+        // initial thread). Exhaustion is an explicit SMP-cap error.
+        let mut slot: Option<u32> = None;
+        for s in 1..=5u32 {
+            let taken = self
+                .nt_threads
+                .values()
+                .any(|t| t.cpu_slot == s && !t.exited);
+            if !taken {
+                slot = Some(s);
+                break;
+            }
+        }
+        let slot = slot.ok_or_else(|| EmuError::Other("no free Xenon thread slot".into()))?;
         let suspended = flags & 0x0000_0001 != 0;
         // X_KTHREAD fields (reference `xthread.h` offsets).
         mem.write_u32(kthread + 0x5C, stack_base.wrapping_add(actual))?;
@@ -1015,7 +1038,9 @@ impl Kernel {
                 suspend_count: if suspended { 1 } else { 0 },
                 exited: false,
                 exit_code: 0,
-                thread_id,
+                thread_id: slot,
+                cpu_slot: slot,
+                spawned: false,
                 kthread_ptr: kthread,
                 affinity: 0x3F,
                 active_cpu: 0,
@@ -1023,17 +1048,18 @@ impl Kernel {
                 boost_disabled: 0,
             },
         );
+        self.pending_spawns.push(handle);
         log::info!(
             "kernel: thread created handle={:08x} id={} start={:08x} ctx={:08x} stack={:08x}+{:x} flags={:08x}",
             handle,
-            thread_id,
+            slot,
             start_addr,
             start_context,
             stack_base,
             actual,
             flags
         );
-        Ok((handle, thread_id, kthread))
+        Ok((handle, slot, kthread))
     }
 
     /// Resume an NT thread. Returns the previous suspend count
@@ -1092,6 +1118,46 @@ impl Kernel {
         }
         // No NT object for the caller: this is the initial thread.
         Ok(true)
+    }
+
+    /// Drain queued spawns for the boot runner (handles, creation order).
+    pub fn take_pending_spawns(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_spawns)
+    }
+
+    /// Look up an NT thread by handle.
+    pub fn nt_thread(&self, handle: u32) -> Option<&NtThread> {
+        self.nt_threads.get(&handle)
+    }
+
+    /// Mark a spawn installed by the boot runner.
+    pub fn mark_spawned(&mut self, handle: u32) {
+        if let Some(th) = self.nt_threads.get_mut(&handle) {
+            th.spawned = true;
+        }
+    }
+
+    /// Whether Xenon slot `slot` may execute: slot 0 (initial thread)
+    /// always; worker slots need a live, unsuspended record.
+    pub fn cpu_runnable(&self, slot: u32) -> bool {
+        if slot == 0 {
+            return true;
+        }
+        self.nt_threads
+            .values()
+            .any(|t| t.cpu_slot == slot && t.spawned && !t.exited && t.suspend_count == 0)
+    }
+
+    /// Mark the worker in Xenon `slot` exited (returned from its entry
+    /// with LR 0). Returns false when no live record owns the slot.
+    pub fn exit_cpu_thread(&mut self, slot: u32) -> bool {
+        for th in self.nt_threads.values_mut() {
+            if th.cpu_slot == slot && !th.exited {
+                th.exited = true;
+                return true;
+            }
+        }
+        false
     }
 
     // ---- Guest files (reference `xboxkrnl_io.cc`, `xfile.cc`) ----
@@ -1293,6 +1359,26 @@ mod tests {
     fn unknown_syscall_is_error() {
         let mut k = Kernel::new();
         assert!(k.syscall(0xFFFF, &[]).is_err());
+    }
+    #[test]
+    fn thread_slots_assign_and_exhaust() {
+        use x360_memory::Memory;
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut slots = Vec::new();
+        for _ in 0..5 {
+            let (_, tid, _) = k
+                .ex_create_thread(&mut m, 0, 0x8200_1000, 0, 0)
+                .expect("slot");
+            slots.push(tid);
+        }
+        slots.sort();
+        assert_eq!(slots, vec![1, 2, 3, 4, 5]);
+        // Sixth live thread: explicit SMP-cap error, never an alias.
+        assert!(k.ex_create_thread(&mut m, 0, 0x8200_1000, 0, 0).is_err());
+        // Spawns queue in creation order for the boot runner.
+        assert_eq!(k.take_pending_spawns().len(), 5);
+        assert!(k.take_pending_spawns().is_empty());
     }
     #[test]
     fn gpu_pump_retires_kicks() {
