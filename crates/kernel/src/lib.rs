@@ -14,6 +14,7 @@ use x360_cpu::regs::ThreadState;
 pub mod boot;
 pub mod dispatch;
 pub mod fs;
+pub mod gpu;
 pub mod imports;
 pub mod ordinals;
 pub mod variables;
@@ -101,6 +102,21 @@ pub struct Kernel {
     /// Read-pointer writeback base + block_log2 (reference
     /// `VdEnableRingBufferRPtrWriteBack`).
     pub vd_rptr_wb: Option<(u32, u32)>,
+    /// Last consumed ring write pointer + current read pointer
+    /// (reference `CommandProcessor::write_ptr_index_` /
+    /// `read_ptr_index_`). The single-threaded pump consumes ring
+    /// batches as NOPs the moment the guest kicks (no draw backend
+    /// yet); fences and writeback polling observe real progress.
+    pub vd_wptr_seen: u32,
+    pub vd_rptr: u32,
+    /// Guest-programmed GPU registers (reference `RegisterFile`;
+    /// type-0/1 writes + REG_RMW land here, REG_TO_MEM reads back).
+    /// Starts zeroed like the reference file.
+    pub vd_regs: HashMap<u32, u32>,
+    /// Command-stream interrupts seen but not yet delivered
+    /// (reference `DispatchInterruptCallback`; delivery needs a
+    /// safe guest-reentry point, still pending).
+    pub vd_irq_pending: u32,
     /// System command-buffer GPU identifier address (reference
     /// `VdSetSystemCommandBufferGpuIdentifierAddress`).
     pub vd_gpu_identifier: Option<u32>,
@@ -252,6 +268,10 @@ impl Kernel {
             vd_interrupt: None,
             vd_ring: None,
             vd_rptr_wb: None,
+            vd_wptr_seen: 0,
+            vd_rptr: 0,
+            vd_regs: HashMap::new(),
+            vd_irq_pending: 0,
             vd_gpu_identifier: None,
             vd_studio_rgb: None,
             image_base: 0,
@@ -493,6 +513,41 @@ impl Kernel {
         self.heap_next = end;
         self.allocs.insert(base, size);
         Ok(base)
+    }
+
+    /// Minimal GPU ring pump (reference `graphics_system.cc`
+    /// `WriteRegister` + `command_processor.cc` `WorkerThreadMain`).
+    /// The guest kicks the ring by storing the write index to
+    /// CP_RB_WPTR (register 0x01C5, MMIO offset 0x714). Kicked batches
+    /// execute through the PM4 executor (`gpu.rs`): memory/register
+    /// side effects are real, draw/state packets length-skip (no draw
+    /// backend yet), and the read index is published to the writeback
+    /// pointer exactly like the reference worker, so guest fences
+    /// observe genuine forward progress.
+    /// Called once per guest step by the boot runner; cheap (one
+    /// MMIO read when a ring exists, work only on new kicks).
+    pub fn pump_gpu(&mut self, mem: &mut x360_memory::Memory) -> Result<()> {
+        let (ring_ptr, ring_log2) = match self.vd_ring {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        const WPTR_MMIO: u32 = x360_memory::MMIO_BASE + 0x01C5 * 4;
+        let wptr = mem.read_u32(WPTR_MMIO)?;
+        if wptr == 0xBAAD_F00D || wptr == self.vd_wptr_seen {
+            return Ok(());
+        }
+        let ring_dw = 1u32
+            .checked_shl(ring_log2.saturating_add(1))
+            .ok_or_else(|| EmuError::Other(format!("ring size_log2 {} overflows", ring_log2)))?;
+        self.gpu_exec_ring(mem, ring_ptr, self.vd_rptr, wptr, ring_dw)?;
+        self.vd_wptr_seen = wptr;
+        self.vd_rptr = wptr;
+        if let Some((wb_ptr, _)) = self.vd_rptr_wb {
+            if wb_ptr != 0 {
+                mem.write_u32(wb_ptr, wptr)?;
+            }
+        }
+        Ok(())
     }
 
     /// Release a tracked range. Memory is left as-is (no reuse).
@@ -1238,5 +1293,35 @@ mod tests {
     fn unknown_syscall_is_error() {
         let mut k = Kernel::new();
         assert!(k.syscall(0xFFFF, &[]).is_err());
+    }
+    #[test]
+    fn gpu_pump_retires_kicks() {
+        use x360_memory::{Memory, MMIO_BASE};
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        // No ring: pump is a silent no-op (stray WPTR ignored).
+        m.write_u32(MMIO_BASE + 0x01C5 * 4, 0x16).unwrap();
+        k.pump_gpu(&mut m).unwrap();
+        assert_eq!((k.vd_wptr_seen, k.vd_rptr), (0, 0));
+        // Ring + writeback: kick retires instantly, rptr published.
+        k.vd_ring = Some((0x0110_0000, 20));
+        let wb = k.alloc_mem(4, 4).unwrap();
+        k.vd_rptr_wb = Some((wb, 6));
+        k.pump_gpu(&mut m).unwrap();
+        assert_eq!((k.vd_wptr_seen, k.vd_rptr), (0x16, 0x16));
+        assert_eq!(m.read_u32(wb).unwrap(), 0x16);
+        // Same value twice: no republish, no error.
+        m.write_u32(wb, 0xDEAD_BEEF).unwrap();
+        k.pump_gpu(&mut m).unwrap();
+        assert_eq!(m.read_u32(wb).unwrap(), 0xDEAD_BEEF);
+        // Second kick advances both.
+        m.write_u32(MMIO_BASE + 0x01C5 * 4, 0x19).unwrap();
+        k.pump_gpu(&mut m).unwrap();
+        assert_eq!((k.vd_wptr_seen, k.vd_rptr), (0x19, 0x19));
+        assert_eq!(m.read_u32(wb).unwrap(), 0x19);
+        // Empty sentinel never retires.
+        m.write_u32(MMIO_BASE + 0x01C5 * 4, 0xBAAD_F00D).unwrap();
+        k.pump_gpu(&mut m).unwrap();
+        assert_eq!((k.vd_wptr_seen, k.vd_rptr), (0x19, 0x19));
     }
 }

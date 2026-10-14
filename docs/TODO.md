@@ -119,33 +119,29 @@ Terminal states only: impossible, done, or something rendering.
 
 ## Active
 
-- [ ] Retail frontier (STFS-backed boot): ROOT CAUSE FOUND — the game
-      takes its graphics-failure path ("Unable to initialize graphics,
-      for an unknown reason. To fix this problem, you could try
-      downloading the newest version of DirectX...", formatted at
-      steps ~452K/474K via `0x82155B58` into buffers `0x01054C70` /
-      `0x010302D0`). The factory object at `0x010434B0` keeps +120
-      (device) virgin-NULL for the whole run (polling watch: zero
-      writes): guest device creation (347K-step vcall at `0x82149900`
-      returning `0x10000`) never produces a device without a real GPU.
-      Both wild faults are downstream of the failure path, not heap
-      corruption: (1) `bctr` at `0x821503A4` to `0x67735C65` reads
-      `+16` of the fresh 52-byte object `0x010338F0` — a
-      device-dependent slot the failed init never fills (ctor only
-      zeroes +0..+12; polling watch proves no writer); skip-hack to a
-      `blr` proves the slot is call-then-ignore. (2) With (1) skipped,
-      boot advances into the game's error formatter, whose 512-byte
-      message legitimately targets game-heap buffer `0x010302D0` but
-      that buffer was carved from the 1MB arena overlapping the live
-      intrusive node table at `0x01030000` (slots init to self at step
-      ~636, clobbered from step 476876) — so the later table walk at
-      `0x8236BC18` reads message text ("em, you...") as nodes.
-      NEXT: make device creation succeed — implement Vd ring-buffer
-      shims with real guest-struct init per reference
-      (`VdInitializeRingBuffer`, `VdEnableRingBufferRPtrWriteBack`,
-      `VdSetSystemCommandBufferGpuIdentifierAddress`: base/size/put
-      pointers the 347K-step init actually consumes), then a minimal
-      ring pump; re-run and confirm the failure path is no longer taken
+- [x] GPU ring bring-up (reference `command_processor.cc`,
+      `graphics_system.cc`, `xenos.h`, `register_table.inc`): runner
+      pumps CP_RB_WPTR kicks once per step; `VdInitializeRingBuffer`
+      zeroes `1 << (size_log2 + 3)` bytes like the reference; PM4
+      executor (`crates/kernel/src/gpu.rs`, unit-tested) runs ring +
+      indirect-buffer packets with real CPU-visible effects
+      (type-0/1 reg writes, REG_RMW/REG_TO_MEM, MEM_WRITE with
+      `GpuSwap`, EVENT_WRITE_SHD/EXT, WAIT/COND single-shot checks,
+      INTERRUPT recorded pending); draw/state packets length-skip
+      (no draw backend yet); retail Braid kicks twice
+      (`0x16`/`0x19`) and the stream executes clean (ME_INIT,
+      register programming, nested IBs) — device field still NULL
+- [ ] Retail frontier refined: Braid creates 4 worker threads
+      RUNNABLE (`flags=0`: 2 job-queue `0x82349E20` + 2 `0x8219E7B8`)
+      that our single-thread runner never steps (only thread 0
+      executes; dispatch keeps kernel records only, no Xenon CPU
+      threads). Workers are the likely fillers of the virgin
+      completion slots (`+120` device, post-kick callbacks
+      `[r26+21532]`/`[r26+23308]`) and the missing heap-history
+      contributors. NEXT: cooperative round-robin scheduler —
+      spawn Xenon threads at `start_addr` (r3 = context), step the
+      ready set, honor suspend counts; then re-run and confirm the
+      graphics-failure path is no longer taken
 - [ ] Dash frontier (HostDirFs boot): 63 imports to an entry-table
       walk at `0x921B86BC` (`lwz r8,896(r11)`, r11=0x603400A2 from
       version-string bytes). Walk runs 65537 iterations by
@@ -159,9 +155,11 @@ Terminal states only: impossible, done, or something rendering.
 
 ## Next (retail-driven, in expected order)
 
-- [ ] Vd ring-buffer shims with real guest-struct init (reference
-      `xboxkrnl_video.cc` facts) + minimal ring pump; goal: Braid
-      no longer formats "Unable to initialize graphics"
+- [ ] Cooperative thread scheduler (spawn + round-robin + suspend
+      counts); goal: Braid workers run, device gets created, no
+      "Unable to initialize graphics" path
+- [ ] GPU interrupt-callback delivery (safe guest reentry) once the
+      scheduler exists; then draw backend
 - [ ] VMX128 FP arithmetic (`vaddfp`, `vmulfp`, float permutes)
 - [ ] Kernel shims on demand (file data, content)
 - [ ] Commit + push; update PORTING.md / COMPATIBILITY.md

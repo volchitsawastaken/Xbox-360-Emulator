@@ -400,8 +400,31 @@ pub fn dispatch_import(
             Ok(())
         }
         (Lib::Xboxkrnl, 0x1C3) => {
-            // VdInitializeRingBuffer(ptr, size_log2): void.
-            kernel.vd_ring = Some((arg(t, 0), arg(t, 1)));
+            // VdInitializeRingBuffer(ptr, size_log2): void. `ptr` is
+            // the MmGetPhysicalAddress of a WRITE_COMBINE Mm block.
+            // Reference (`command_processor.cc`
+            // `CommandProcessor::InitializeRingBuffer`) zeroes
+            // `1 << (size_log2 + 3)` bytes at the buffer and records
+            // it as the primary ring; the read pointer starts at 0.
+            // Physical DRAM maps 1:1 here (`to_physical` is the
+            // identity below 512MB), so zero the range in place.
+            let (ptr, log2) = (arg(t, 0), arg(t, 1));
+            let size = 1u64
+                .checked_shl(log2.saturating_add(3))
+                .ok_or_else(|| EmuError::Other(format!("ring size_log2 {} overflows", log2)))?;
+            let end = (ptr as u64)
+                .checked_add(size)
+                .ok_or_else(|| EmuError::Other("ring range overflows".into()))?;
+            if end > x360_memory::MEM_SIZE as u64 {
+                return Err(EmuError::Other(format!(
+                    "ring buffer {:08x}+{} outside DRAM",
+                    ptr, size
+                )));
+            }
+            if size != 0 {
+                mem.write_bytes(ptr, &vec![0u8; size as usize])?;
+            }
+            kernel.vd_ring = Some((ptr, log2));
             Ok(())
         }
         (Lib::Xboxkrnl, 0x1B6) => {
@@ -3047,6 +3070,10 @@ mod tests {
         assert_eq!(k.vd_interrupt, Some((0x8218_1718, 0x0104_3800)));
         t.gpr[3] = 0x0110_0000;
         t.gpr[4] = 20;
+        // Dirty the range first so the test proves the zeroing.
+        m.write_u32(0x0110_0000, 0xDEAD_BEEF).unwrap();
+        m.write_u32(0x0110_0000 + (1 << 23) - 4, 0xDEAD_BEEF)
+            .unwrap();
         dispatch_import(
             &mut k,
             &mut m,
@@ -3057,6 +3084,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(k.vd_ring, Some((0x0110_0000, 20)));
+        // Ring buffer is zeroed: 1 << (20 + 3) bytes at the pointer.
+        assert_eq!(m.read_u32(0x0110_0000).unwrap(), 0);
+        assert_eq!(m.read_u32(0x0110_0000 + (1 << 23) - 4).unwrap(), 0);
+        // Out-of-DRAM ring is an explicit error, never silent.
+        t.gpr[3] = 0x796F_7518;
+        t.gpr[4] = 20;
+        assert!(dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1C3),
+        )
+        .is_err());
         // System command buffer magics.
         let p0 = 0x8400_C000;
         let p1 = 0x8400_C100;

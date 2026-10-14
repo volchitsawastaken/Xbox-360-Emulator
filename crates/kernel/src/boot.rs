@@ -125,6 +125,9 @@ pub fn run_until_exit_traced_imports(
         }
         let trap = xenon.threads[0].step(mem)?;
         steps += 1;
+        // Retire kicked GPU ring batches (PM4 executor); guest fences
+        // observe real progress.
+        kernel.pump_gpu(mem)?;
         let Some(t) = trap else { continue };
         // Thunk trap? The rewriter leaves `sc` at the thunk address,
         // so the post-`sc` pc minus 4 names the import.

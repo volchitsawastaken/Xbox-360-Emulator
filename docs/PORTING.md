@@ -283,6 +283,37 @@ out, and the license note. Workspace license: BSD-3-Clause.
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.
 
+## 10. GPU ring pump + PM4 memory/register packet facts
+
+- Source: `src/xenia/gpu/command_processor.cc`
+  (`InitializeRingBuffer` zero of `1 << (size_log2 + 3)`,
+  `EnableReadPointerWriteBack`, worker consume-`[read, write)` +
+  writeback publish, `0xBAADF00D` empty sentinel),
+  `src/xenia/gpu/graphics_system.cc` (`WriteRegister`: `r =
+  (addr & 0xFFFF) / 4`, `CP_RB_WPTR 0x01C5` kick),
+  `src/xenia/gpu/xenos.h` (type-3 `opcode/count` framing,
+  `GpuSwap`/`Endian` table, opcode numbers),
+  `src/xenia/gpu/pm4_command_processor_implement.h`
+  (`ExecutePacket` skips, type-0 `base/count + 1` + bit-15
+  write-one, type-1 pairs, IB `[ptr, len & 0xFFFFF]` in dwords,
+  MEM_WRITE/EVENT_WRITE_SHD/EXT/REG_RMW/REG_TO_MEM/WAIT/COND/
+  INTERRUPT payload layouts, `MatchValueAndRef`),
+  `src/xenia/gpu/register_table.inc` (`WRITEBACK_START 0x0A04`,
+  `WRITEBACK_SIZE 0x0A05`, `VGT_EVENT_INITIATOR 0x21F9`,
+  `RB_SAMPLE_COUNT_ADDR 0x2325`).
+- Taken (facts only): register index + framing/field maps, zero
+  size, swap table, match function, writeback remap rule.
+- Lives here: `crates/kernel/src/gpu.rs` (executor + unit tests),
+  `crates/kernel/src/lib.rs` (`pump_gpu`, `vd_regs`,
+  `vd_irq_pending`), `crates/kernel/src/boot.rs` (per-step pump),
+  `crates/kernel/src/dispatch.rs` (ring-zero shim + test).
+- NOT taken: draw/state packet semantics (length-skipped), shader
+  upload, EDRAM/resolve, interrupt delivery, worker-thread
+  scheduling of the GPU completion path.
+- License: reference is BSD (Ben Vanik / Xenia project); our
+  tracking and logic are original under the workspace
+  BSD-3-Clause. Attribution is kept in the module docs.
+
 Concrete, data-only port targets. Each names the reference path and
 the file it would land in.
 
