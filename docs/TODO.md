@@ -94,8 +94,19 @@ Terminal states only: impossible, done, or something rendering.
       bodies (value-independent); identical under a shifted heap base
       (address-independent); file bytes genuine (single sync 37KB
       read); every import called in the window returns sane values;
-      two spawned worker threads are independent. Still open:
-      divergence point (which hardware-executed +16 writer we skip)
+      two spawned worker threads are independent; waits honest
+      (TIMEOUT, threads never fake-done); free-then-realloc cycle is
+      legitimate (freelist link/unlink observed); no silent
+      mis-dispatch in 500k steps (every other indirect branch lands
+      in-image); no GPU polling at all (2 MMIO writes, 0 reads);
+      caller chain mapped, single callers throughout
+      (`0x82150248` <- `0x820E839C` <- `0x820E8308` <- `0x820F9584`);
+      the 347k-step virtual method is GPU driver bring-up, fully
+      served. Still open: which hardware-executed +16 writer (or
+      branch avoiding the read) we skip — needs trace-diff harness
+      or fresh eyes; empty-catalog boot runs 65M+ steps into its main
+      loop (no fault there, needs GPU draw path for anything
+      observable)
 
 ## Next (retail-driven, in expected order)
 
