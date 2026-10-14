@@ -72,6 +72,13 @@ pub struct Kernel {
     /// Game file bytes backing NtCreateFile etc. Set by the launcher
     /// (STFS package, host dir); None = no game mounted.
     pub guest_fs: Option<Arc<dyn fs::GuestFs>>,
+    /// Title-to-title launch data (reference `XamModule::loader_data`:
+    /// `XamLoaderSetLaunchData` stores, `...GetLaunchData(Size)`
+    /// serve; empty until set).
+    pub launch_data: Vec<u8>,
+    /// DOS-device symlinks (reference `ObCreateSymbolicLink`):
+    /// canonical path -> target, e.g. `d:` -> device path.
+    pub symlinks: HashMap<String, String>,
     /// XAM notification listeners by handle (reference
     /// `XNotifyListener`) plus the UI position word.
     pub notify_listeners: HashMap<u32, NotifyListener>,
@@ -97,10 +104,16 @@ pub struct Kernel {
     /// System command-buffer GPU identifier address (reference
     /// `VdSetSystemCommandBufferGpuIdentifierAddress`).
     pub vd_gpu_identifier: Option<u32>,
+    /// Studio (limited-range) RGB selection (recorded from
+    /// `VdSetStudioRGBMode` for the GPU backend).
+    pub vd_studio_rgb: Option<u32>,
     /// Loaded module facts for RtlImageXexHeaderField / XexGetModule*.
     pub image_base: u32,
     pub image_size: u32,
     pub title_id: u32,
+    /// Dash context word (reference `KernelState::dash_context_`,
+    /// set by `XamSetDashContext`, read by `XamGetDashContext`).
+    pub dash_context: u32,
     xex_header: Vec<u8>,
     entry_point_val: u32,
     module_name: String,
@@ -229,6 +242,8 @@ impl Kernel {
             nt_threads: HashMap::new(),
             files: fs::FileTable::default(),
             guest_fs: None,
+            launch_data: Vec::new(),
+            symlinks: HashMap::new(),
             notify_listeners: HashMap::new(),
             notify_position: 0,
             critical_region: 0,
@@ -238,9 +253,11 @@ impl Kernel {
             vd_ring: None,
             vd_rptr_wb: None,
             vd_gpu_identifier: None,
+            vd_studio_rgb: None,
             image_base: 0,
             image_size: 0,
             title_id: 0,
+            dash_context: 0,
             xex_header: Vec::new(),
             entry_point_val: 0,
             module_name: String::new(),

@@ -219,7 +219,69 @@ out, and the license note. Workspace license: BSD-3-Clause.
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.
 
-## Next candidates
+## 9. VMX128 integer layouts, 64-bit compares, locks/locales/tracing facts
+
+- Source: `src/xenia/cpu/ppc/ppc_decode_data.h`
+  (`FormatVX` VA-is-bits-16-20 immediate, `FormatVX128_1` 7-bit
+  VD, `FormatVX128_2` VD/VA/VB/VC split, `FormatXS` SH5-in-bit-1
+  count, `FormatVA` VC-in-bits-6-10),
+  `src/xenia/cpu/ppc/ppc_opcode_table_gen.cc` (kVX
+  `vspltisb` 0x30C / `vspltish` 0x34C / `vspltisw` 0x38C /
+  `vslb` 0x104 / `vor` 0x484 / `vspltb` 0x20C / `vperm` 0x2B /
+  `vsel` 0x2A; kVX128_1 `lvx`/`stvx`/`lvlx`/`lvrx`/`stvlx`/
+  `stvrx`; kVX128_2 `vperm128` base; XO `lvsl` 6 / `lvsr` 38 /
+  `lvebx` 7 / `lvehx` 39 / `lvewx` 71 / `lvx` 103 / `stvebx`
+  135 / `stvehx` 167 / `stvewx` 199 / `stvx` 231 / `lvlx` 519 /
+  `lvrx` 551 / `stvlx` 647 / `stvrx` 679 / `sradix` 826),
+  `src/xenia/cpu/ppc/ppc_emit_altivec.cc`
+  (`InstrEmit_vspltisb/vspltish/vspltb/vslb/vor/lvx_/stvx_/
+  lvsl_/lvsr_/vperm_/vsel_`; `lvebx/lvehx/lvewx` equal `lvx`;
+  `stvlx` writes bytes `offset..15`, `stvrx` bytes `0..offset-1`
+  with `eb==0` a no-op; `lvrx` zeroes at `eb==0`),
+  `src/xenia/cpu/hir/hir_builder.cc` + `backend/*/a64_seq_vector.cc`
+  / `x64_seq_memory.cc` (LVL/LVR/STVL/STVR TBL blends),
+  `src/xenia/cpu/ppc/ppc_emit_alu.cc` (`InstrEmit_cmp/cmpi/
+  cmpl/cmpli` L=0 32-bit vs L=1 64-bit with EXTS/zero-extended
+  immediates; `InstrEmit_sradix` n==0 copy + CA rule),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_threading.cc`
+  (`X_ERWLOCK` 0x38 layout, init/acquire/try/release counter
+  moves; `XDPC` layout + `Initialize`; `KeInitializeEvent` zero +
+  type/signal, `KeInitializeSemaphore` type/count/limit),
+  `src/xenia/kernel/xobject.h` (`X_OBJECT_TYPES`
+  sync-event 1 / semaphore 5), `src/xenia/kernel/xam/am_locale.cc`
+  (`xeGetLanguage` English fallback, `xeXamGetLocale` US 36,
+  `XamGetOnlineLanguageAndCountry` byte writes, `XLanguage`
+  English 1), `src/xenia/kernel/xam/am_info.cc`
+  (`staging_mode` 0, dash-context store + `0x8000000C`
+  broadcast, backstack empty-drain, launch-data NOT_FOUND),
+  `src/xenia/kernel/xam/am_video.cc` (`XGetVideoMode` =
+  `VdQueryVideoMode`), `src/xenia/xbox.h`
+  (`kXNotificationSystemDashContextChanged` 0x8000000C),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_hal.cc` (`avpack` 8),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_usbcam.cc`
+  (`CamNotConnected` 0), `src/xenia/kernel/xboxkrnl/
+  xboxkrnl_crypt.cc` (`XeCryptRandom` 0xFD fill),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc`
+  (`FscGet/SetCacheElementCount` 0), `src/xenia/kernel/xboxkrnl/
+  xboxkrnl_ob.cc` (`ObCreateSymbolicLink` register + qualifier
+  strip), `src/xenia/kernel/xam/am_ui.cc`
+  (`XamPackageManagerGetExperienceMode` usage notes),
+  `src/xenia/kernel/xam/xam_table.inc` + `xboxkrnl_table.inc`
+  (ordinal confirmations).
+- Taken (facts only): register-field maps, XO numbers, zero-fill /
+  no-op edges, 64-bit compare widths, lock/counter layouts,
+  locale/mode constants, offline answers.
+- Lives here: `crates/cpu/src/decode.rs` (VMX128 + `Sradix`
+  variants), `crates/cpu/src/regs.rs` (128-entry VR file),
+  `crates/cpu/src/exec.rs` (arms + unit tests),
+  `crates/kernel/src/lib.rs` (`dash_context`, `launch_data`,
+  `symlinks`, `vd_studio_rgb`), `crates/kernel/src/dispatch.rs`
+  (shims + unit tests), `crates/filesystem/src/hostdir_fs.rs`.
+- NOT taken: VMX128 FP arithmetic, blocking lock waits (explicit
+  Unsupported), download/storage backends, ETX consumers.
+- License: reference is BSD (Ben Vanik / Xenia project); our
+  tracking and logic are original under the workspace
+  BSD-3-Clause. Attribution is kept in the module docs.
 
 Concrete, data-only port targets. Each names the reference path and
 the file it would land in.

@@ -189,6 +189,40 @@ pub fn dispatch_import(
             arg(t, 4),
             t,
         ),
+        // FscGet/SetCacheElementCount (reference `xboxkrnl_io.cc`):
+        // both stubs returning 0/SUCCESS; no cache backend exists.
+        (Lib::Xboxkrnl, 0x20) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x21) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // HalGetCurrentAVPack (reference `xboxkrnl_hal.cc`): 8 = HDMI,
+        // the reference default, matching Xam 0x3CB.
+        (Lib::Xboxkrnl, 0x22) => {
+            t.gpr[3] = 8_u64;
+            Ok(())
+        }
+        // KeInitializeDpc(dpc, routine, context) (reference
+        // `xthread.h` `XDPC::Initialize`): type=19, both CPUs 0,
+        // routine + context stored; list_entry/args untouched.
+        (Lib::Xboxkrnl, 0x6F) => {
+            let (dpc, routine, context) = (arg(t, 0), arg(t, 1), arg(t, 2));
+            write_u16be(mem, dpc, 19)?;
+            mem.write_u8(dpc + 2, 0)?;
+            mem.write_u8(dpc + 3, 0)?;
+            mem.write_u32(dpc + 12, routine)?;
+            mem.write_u32(dpc + 16, context)?;
+            Ok(())
+        }
+        // ObCreateSymbolicLink(path, target) (reference
+        // `xboxkrnl_ob.cc`): register the mapping, stripping the
+        // `\??\` / `\System??\` qualifier. Re-registering the same
+        // mapping is success (the reference checks first, and one
+        // title expects success for it).
+        (Lib::Xboxkrnl, 0x103) => ob_create_symlink(kernel, mem, arg(t, 0), arg(t, 1), t),
         (Lib::Xboxkrnl, 0x152) => ke_tls_alloc(kernel, t),
         (Lib::Xboxkrnl, 0x153) => ke_tls_free(kernel, arg(t, 0), t),
         (Lib::Xboxkrnl, 0x154) => ke_tls_get(kernel, arg(t, 0), t),
@@ -322,6 +356,42 @@ pub fn dispatch_import(
             }
             Ok(())
         }
+        // Read-write locks (reference `xboxkrnl_threading.cc`
+        // `X_ERWLOCK`, 0x38 bytes). Single-threaded guest-memory
+        // implementation: uncontended acquire/release behave exactly;
+        // a contended blocking acquire is an explicit Unsupported
+        // (no fake success, no silent spin) since this runner cannot
+        // block one thread while another holds the lock.
+        (Lib::Xboxkrnl, 0x11) => erw_init(mem, arg(t, 0)),
+        (Lib::Xboxkrnl, 0x07) => erw_acquire(mem, arg(t, 0), true),
+        (Lib::Xboxkrnl, 0x08) => erw_acquire(mem, arg(t, 0), false),
+        (Lib::Xboxkrnl, 0x2DD) => erw_try(mem, arg(t, 0), true, t),
+        (Lib::Xboxkrnl, 0x2DE) => erw_try(mem, arg(t, 0), false, t),
+        (Lib::Xboxkrnl, 0x16) => erw_release(mem, arg(t, 0)),
+        // EtxProducerRegister(...): event-tracing registration. The
+        // reference has no implementation (table-only `kFunction`).
+        // Tracing is observational: report success without storing
+        // anything (no ETX consumer exists to read it back).
+        (Lib::Xboxkrnl, 0x334) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XUsbcamGetState (reference `xboxkrnl_usbcam.cc`): no camera
+        // is attached, so CamNotConnected (0).
+        (Lib::Xboxkrnl, 0x21D) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XeCryptRandom(buf, len) (reference `xboxkrnl_crypt.cc`):
+        // void; fills with 0xFD (the reference's deterministic stub,
+        // kept for run-to-run reproducibility).
+        (Lib::Xboxkrnl, 0x18A) => {
+            let (buf, len) = (arg(t, 0), arg(t, 1));
+            if len != 0 {
+                mem.write_bytes(buf, &vec![0xFD; len as usize])?;
+            }
+            Ok(())
+        }
         // ---- Video ring/command buffer (reference
         // `xboxkrnl_video.cc`) ----
         (Lib::Xboxkrnl, 0x1D5) => {
@@ -435,6 +505,14 @@ pub fn dispatch_import(
             kernel.vd_gpu_identifier = Some(arg(t, 0));
             Ok(())
         }
+        (Lib::Xboxkrnl, 0x379) => {
+            // VdSetStudioRGBMode(mode): table-only in the reference.
+            // Record the limited/full-range selection for the GPU
+            // backend; return 0 like the other Vd setters.
+            kernel.vd_studio_rgb = Some(arg(t, 0));
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
         // KiApcNormalRoutineNop(_): returns 0 (reference stub); also
         // exported as KiApcNormalRoutineNop_ (0x19D).
         (Lib::Xboxkrnl, 0x1DF) | (Lib::Xboxkrnl, 0x19D) => {
@@ -532,6 +610,174 @@ pub fn dispatch_import(
         // America, the standard answer for US titles).
         (Lib::Xam, 0x3CC) => {
             t.gpr[3] = 0x03FF_u64;
+            Ok(())
+        }
+        // XMsgInProcessCall(app, message, arg1, arg2) (reference
+        // `xam_msg.cc` + `apps/xlivebase_app.cc`): synchronous app
+        // dispatch. Only the LiveBase app (0xFC) has verified message
+        // decodes; unknown apps return X_E_NOT_FOUND and unknown
+        // messages X_E_FAIL, exactly like the reference. No guest
+        // memory is touched by the implemented messages.
+        (Lib::Xam, 0x1F4) => xmsg_in_process_call(arg(t, 0), arg(t, 1), t),
+        // XamPackageManagerGetExperienceMode(out_ptr): no dedicated
+        // reference implementation (only usage notes in `am_ui.cc`:
+        // caller passes &var with var=1, then treats ret<0 or
+        // (var&1)==0 as the no-experience path). Report the
+        // full-experience offline answer: write 1, return SUCCESS.
+        (Lib::Xam, 0x646) => {
+            let out = arg(t, 0);
+            if out == 0 {
+                t.gpr[3] = 0x57_u64; // X_ERROR_INVALID_PARAMETER
+                return Ok(());
+            }
+            mem.write_u32(out, 1)?;
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XamUserFlushLogonQueue(...): no reference implementation
+        // (table-only `kFunction`). Offline no-op success: the logon
+        // queue is empty with no signed-in users, so there is nothing
+        // to flush and no guest memory to fill.
+        (Lib::Xam, 0x220) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XamGetLanguage (reference `am_locale.cc` `xeGetLanguage`):
+        // XConfig language clamped to the base set, falling back to
+        // English (1) for out-of-range values and non-Japanese/Korean
+        // regions. Our XConfig defaults read English, so this is 1.
+        (Lib::Xam, 0x3D2) => {
+            t.gpr[3] = 1_u64;
+            Ok(())
+        }
+        // XamGetLocale (reference `am_locale.cc` `xeXamGetLocale`):
+        // XConfig country mapped through the locale table, falling
+        // back to the game region. US country + NTSC region yields
+        // 36 (US), consistent with the English/0x03FF answers above.
+        (Lib::Xam, 0x4A9) => {
+            t.gpr[3] = 36_u64;
+            Ok(())
+        }
+        // XamGetOnlineLanguageAndCountry(xuid, lang_ptr, country_ptr)
+        // (reference `am_locale.cc`): void; writes the profile (or
+        // XConfig fallback) language and country bytes. Offline with
+        // no signed-in users: English (1) + US (103), matching the
+        // XConfig table.
+        (Lib::Xam, 0x58B) => {
+            let lang_ptr = arg(t, 1);
+            let country_ptr = arg(t, 2);
+            if lang_ptr != 0 {
+                mem.write_u8(lang_ptr, 1)?;
+            }
+            if country_ptr != 0 {
+                mem.write_u8(country_ptr, 103)?;
+            }
+            Ok(())
+        }
+        // XamBackgroundDownloadSetMode(mode): table-only in the
+        // reference (no implementation found). Offline no-op success;
+        // there is no download backend yet to reconfigure.
+        (Lib::Xam, 0x9C4) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XamBackgroundDownloadNetworkStorageRegisterChangeCallback:
+        // table-only in the reference (no implementation found).
+        // Offline no-op success; with no storage backend there is
+        // nothing whose changes could fire the callback.
+        (Lib::Xam, 0x4E4) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XamGetStagingMode (reference `am_info.cc`): preview-mode
+        // flag, default 0 (retail dashboard, no debug rendering).
+        (Lib::Xam, 0x76F) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XGetVideoMode(mode_ptr) (reference `am_video.cc`): same as
+        // VdQueryVideoMode (1280x720 HDMI default).
+        (Lib::Xam, 0x3D1) => vd_query_video_mode(mem, arg(t, 0), t),
+        // XamGetDashBackstackData(data, count) (reference
+        // `am_info.cc`): drains queued backstack nodes; with none
+        // queued (nothing pushes nodes in this boot) it touches
+        // nothing and returns SUCCESS, exactly like the reference.
+        (Lib::Xam, 0x7DC) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XamFitnessClearBodyProfileRecords: table-only in the
+        // reference (no implementation found). Offline no-op success;
+        // no fitness profiles are stored.
+        (Lib::Xam, 0x4C1) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XamSetDashContext(value) (reference `am_info.cc`): store
+        // the dash context word, broadcasting
+        // SystemDashContextChanged (0x8000000C) only on change.
+        // Returns 0; the privilege check is skipped (all titles run).
+        (Lib::Xam, 0x1CC) => {
+            let value = arg(t, 0);
+            if value != kernel.dash_context {
+                kernel.dash_context = value;
+                kernel.notify_broadcast(0x8000_000C, 0);
+            }
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XamGetDashContext (reference `am_info.cc`): read the word.
+        (Lib::Xam, 0x1CD) => {
+            t.gpr[3] = (kernel.dash_context) as u64;
+            Ok(())
+        }
+        // Title launch data (reference `am_info.cc`
+        // `XamLoaderSetLaunchData`/`GetLaunchData(Size)`): empty until
+        // set; empty reads report NOT_FOUND (2) exactly like the
+        // reference, touching no guest memory.
+        (Lib::Xam, 0x1A6) => {
+            let (data, size) = (arg(t, 0), arg(t, 1) as usize);
+            kernel.launch_data.resize(size, 0);
+            if size != 0 {
+                let b = mem.read_bytes(data, size)?;
+                kernel.launch_data.copy_from_slice(b);
+            }
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        (Lib::Xam, 0x1A7) => {
+            let size_ptr = arg(t, 0);
+            if size_ptr == 0 {
+                t.gpr[3] = 0x57_u64; // X_ERROR_INVALID_PARAMETER
+                return Ok(());
+            }
+            if kernel.launch_data.is_empty() {
+                mem.write_u32(size_ptr, 0)?;
+                t.gpr[3] = 2_u64; // X_ERROR_NOT_FOUND
+                return Ok(());
+            }
+            mem.write_u32(size_ptr, kernel.launch_data.len() as u32)?;
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        (Lib::Xam, 0x1A8) => {
+            let (buf, len) = (arg(t, 0), arg(t, 1) as usize);
+            if kernel.launch_data.is_empty() {
+                t.gpr[3] = 2_u64; // X_ERROR_NOT_FOUND
+                return Ok(());
+            }
+            let n = len.min(kernel.launch_data.len());
+            if n != 0 {
+                mem.write_bytes(buf, &kernel.launch_data[..n])?;
+            }
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XdfInitialize: table-only in the reference (no
+        // implementation found). Offline no-op success; there is no
+        // disc-format backend to initialize.
+        (Lib::Xam, 0x650) => {
+            t.gpr[3] = 0_u64;
             Ok(())
         }
         _ => {
@@ -1947,6 +2193,30 @@ fn ex_get_xconfig(
 // ---- File system (reference `xboxkrnl_io.cc`, `xfile.cc`,
 // `kernel.h`, `vfs/*`; facts only) ----
 
+/// `ObCreateSymbolicLink(path_ansi, target_ansi)`: register the
+/// canonical path -> target mapping. Returns SUCCESS (0); the only
+/// failure mode (register error) cannot trigger with a HashMap
+/// backend, so success is genuine, not faked.
+fn ob_create_symlink(
+    kernel: &mut Kernel,
+    mem: &Memory,
+    path_ptr: u32,
+    target_ptr: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    let mut path = String::from_utf8_lossy(&read_ansi_bytes(mem, path_ptr)?).to_ascii_lowercase();
+    let target = String::from_utf8_lossy(&read_ansi_bytes(mem, target_ptr)?).to_ascii_lowercase();
+    for prefix in ["\\??\\", "\\system??\\"] {
+        if let Some(stripped) = path.strip_prefix(prefix) {
+            path = stripped.to_string();
+            break;
+        }
+    }
+    kernel.symlinks.insert(path, target);
+    t.gpr[3] = 0_u64;
+    Ok(())
+}
+
 /// Read a guest `X_ANSI_STRING` (length bytes at pointer).
 fn read_ansi_bytes(mem: &Memory, ptr: u32) -> Result<Vec<u8>> {
     if ptr == 0 {
@@ -2458,6 +2728,134 @@ fn nt_status_to_dos_error(status: u32) -> u32 {
         }
     }
 }
+/// `XMsgInProcessCall(app, message, _, _)` message table for the
+/// LiveBase app (0xFC). Values verified against reference
+/// `apps/xlivebase_app.cc` (`XLiveBaseLogonGetHR` and siblings);
+/// the offline answers (disconnected / not-logged-on) are the
+/// genuine no-network results, matching a box with no Live sign-in.
+fn xmsg_in_process_call(app: u32, message: u32, t: &mut ThreadState) -> Result<()> {
+    const X_E_FAIL: u32 = 0x8000_4005;
+    const X_E_NOTFOUND: u32 = 0x8007_0002;
+    let r = match app {
+        0xFC => match message {
+            0x0005_008C | 0x0005_0094 | 0x0005_8020 | 0x0005_8023 => X_E_FAIL,
+            0x0005_8003 => 0x0015_10F1, // X_ONLINE_S_LOGON_DISCONNECTED
+            0x0005_8004 | 0x0005_8037 | 0x0005_8046 => 0, // X_E_SUCCESS
+            0x0005_8006 | 0x0005_8007 => 0x8015_1802, // NOT_LOGGED_ON
+            _ => X_E_FAIL,
+        },
+        _ => X_E_NOTFOUND,
+    };
+    t.gpr[3] = (r) as u64;
+    Ok(())
+}
+
+/// Guest `X_ERWLOCK` (reference `xboxkrnl_threading.cc`, 0x38 bytes):
+/// lock_count i32 @+0, writers_waiting @+4, readers_waiting @+8,
+/// readers_entry @+12, writer event (16B) @+16, reader semaphore
+/// (20B) @+32, spin lock @+52. The semaphore limit sits @+48 and the
+/// event/semaphore signal states @+20/@+36.
+fn erw_init(mem: &mut Memory, lock: u32) -> Result<()> {
+    mem.write_u32(lock, 0xFFFF_FFFF)?; // lock_count = -1
+    mem.write_u32(lock + 4, 0)?;
+    mem.write_u32(lock + 8, 0)?;
+    mem.write_u32(lock + 12, 0)?;
+    // KeInitializeEvent(&writer_event, type=1 sync, initial=0):
+    // zero the 16-byte event, then type + signal_state.
+    mem.write_bytes(lock + 16, &[0u8; 16])?;
+    mem.write_u8(lock + 16, 1)?; // EventSynchronizationObject
+    mem.write_u32(lock + 20, 0)?;
+    // KeInitializeSemaphore(&reader_semaphore, 0, 0x7FFFFFFF).
+    mem.write_u8(lock + 32, 5)?; // SemaphoreObject
+    mem.write_u32(lock + 36, 0)?;
+    mem.write_u32(lock + 48, 0x7FFF_FFFF)?;
+    mem.write_u32(lock + 52, 0)?; // spin_lock owner
+    Ok(())
+}
+
+/// Blocking acquire. Uncontended fast paths match the reference
+/// exactly; contended (would-block) states record the reference's
+/// counter updates, then report Unsupported explicitly.
+fn erw_acquire(mem: &mut Memory, lock: u32, exclusive: bool) -> Result<()> {
+    let lc = mem.read_u32(lock)? as i32 + 1;
+    mem.write_u32(lock, lc as u32)?;
+    if exclusive {
+        if lc == 0 {
+            return Ok(());
+        }
+        mem.write_u32(lock + 4, mem.read_u32(lock + 4)? + 1)?;
+        return Err(EmuError::Unsupported(format!(
+            "contended ExAcquireReadWriteLockExclusive {:08x} would block",
+            lock
+        )));
+    }
+    let entry = mem.read_u32(lock + 12)?;
+    let waiting = mem.read_u32(lock + 4)?;
+    if lc == 0 || (entry != 0 && waiting == 0) {
+        mem.write_u32(lock + 12, entry + 1)?;
+        return Ok(());
+    }
+    mem.write_u32(lock + 8, mem.read_u32(lock + 8)? + 1)?;
+    Err(EmuError::Unsupported(format!(
+        "contended ExAcquireReadWriteLockShared {:08x} would block",
+        lock
+    )))
+}
+
+/// Try-acquire. Never blocks; 1 = acquired, 0 = busy.
+fn erw_try(mem: &mut Memory, lock: u32, exclusive: bool, t: &mut ThreadState) -> Result<()> {
+    let lc = mem.read_u32(lock)? as i32;
+    let r = if exclusive {
+        if lc < 0 {
+            mem.write_u32(lock, 0)?;
+            1
+        } else {
+            0
+        }
+    } else {
+        let entry = mem.read_u32(lock + 12)?;
+        let waiting = mem.read_u32(lock + 4)?;
+        if lc < 0 || (entry != 0 && waiting == 0) {
+            mem.write_u32(lock, (lc + 1) as u32)?;
+            mem.write_u32(lock + 12, entry + 1)?;
+            1
+        } else {
+            0
+        }
+    };
+    t.gpr[3] = (r) as u64;
+    Ok(())
+}
+
+/// Release (reference `ExReleaseReadWriteLock_entry`), including the
+/// waiter-wakeup counter moves and signal-state updates.
+fn erw_release(mem: &mut Memory, lock: u32) -> Result<()> {
+    let lc = mem.read_u32(lock)? as i32 - 1;
+    mem.write_u32(lock, lc as u32)?;
+    if lc < 0 {
+        mem.write_u32(lock + 12, 0)?;
+        return Ok(());
+    }
+    if mem.read_u32(lock + 12)? == 0 {
+        let waiting = mem.read_u32(lock + 8)?;
+        if waiting != 0 {
+            mem.write_u32(lock + 8, 0)?;
+            mem.write_u32(lock + 12, waiting)?;
+            let sig = mem.read_u32(lock + 36)?;
+            mem.write_u32(lock + 36, sig + waiting)?;
+            return Ok(());
+        }
+    }
+    let entry = mem.read_u32(lock + 12)? - 1;
+    mem.write_u32(lock + 12, entry)?;
+    if entry != 0 {
+        return Ok(());
+    }
+    mem.write_u32(lock + 4, mem.read_u32(lock + 4)? - 1)?;
+    mem.write_u32(lock + 20, 1)?; // wake one writer
+    Ok(())
+}
+
 /// `RtlGetStackLimits(low_ptr, high_ptr)`: report the recorded stack.
 fn rtl_get_stack_limits(
     kernel: &Kernel,
@@ -3606,6 +4004,602 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.gpr[3] as u32, 3);
+    }
+
+    fn xmsg_ret(app: u32, message: u32) -> u32 {
+        let mut t = thread();
+        t.gpr[3] = app as u64;
+        t.gpr[4] = message as u64;
+        xmsg_in_process_call(app, message, &mut t).unwrap();
+        t.gpr[3] as u32
+    }
+
+    #[test]
+    fn xmsg_livebase_logon_status() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x1F4),
+            Some("XMsgInProcessCall")
+        );
+        // Retail dash call: app 0xFC (LiveBase), XLiveBaseLogonGetHR.
+        assert_eq!(xmsg_ret(0xFC, 0x58003), 0x0015_10F1);
+        assert_eq!(xmsg_ret(0xFC, 0x58006), 0x8015_1802);
+        assert_eq!(xmsg_ret(0xFC, 0x58004), 0);
+        assert_eq!(xmsg_ret(0xFC, 0xDEAD), 0x8000_4005);
+        assert_eq!(xmsg_ret(0xFB, 0x58003), 0x8007_0002);
+        // Through dispatch: r3=app, r4=message.
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0xFC_u64;
+        t.gpr[4] = 0x58003_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1F4)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x0015_10F1);
+    }
+
+    #[test]
+    fn experience_mode_reports_full() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x646),
+            Some("XamPackageManagerGetExperienceMode")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        m.write_u32(0x4000, 1).unwrap();
+        t.gpr[3] = 0x4000_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x646)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u32(0x4000).unwrap(), 1);
+        // Null output pointer is an explicit parameter error.
+        t.gpr[3] = 0_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x646)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x57);
+    }
+
+    #[test]
+    fn flush_logon_queue_is_noop_success() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x220),
+            Some("XamUserFlushLogonQueue")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0x9296_DAF8_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x220)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn language_reports_english() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x3D2)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 1);
+    }
+
+    #[test]
+    fn locale_reports_us() {
+        assert_eq!(ImportTable::name_of("xam.xex", 0x4A9), Some("XamGetLocale"));
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x4A9)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 36);
+    }
+
+    #[test]
+    fn online_language_country_writes_xconfig() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        m.write_u8(0x4000, 0).unwrap();
+        m.write_u8(0x4001, 0).unwrap();
+        t.gpr[3] = 0_u64; // xuid: no signed-in user
+        t.gpr[4] = 0x4000_u64;
+        t.gpr[5] = 0x4001_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x58B)).unwrap();
+        assert_eq!(m.read_u8(0x4000).unwrap(), 1);
+        assert_eq!(m.read_u8(0x4001).unwrap(), 103);
+    }
+
+    #[test]
+    fn background_download_mode_is_noop_success() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x9C4)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn download_storage_callback_is_noop_success() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x4E4),
+            Some("XamBackgroundDownloadNetworkStorageRegisterChangeCallback")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0x9226_0938_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x4E4)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn staging_mode_reports_retail() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x76F),
+            Some("XamGetStagingMode")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x76F)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn fitness_clear_is_noop_success() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x4C1),
+            Some("XamFitnessClearBodyProfileRecords")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x4C1)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn dash_context_set_get_roundtrip() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x1CC),
+            Some("XamSetDashContext")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Retail dash call writes 0 (already 0): no broadcast, returns 0.
+        t.gpr[3] = 0_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1CC)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(k.dash_context, 0);
+        // A change stores and broadcasts; the getter reads it back.
+        t.gpr[3] = 7_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1CC)).unwrap();
+        assert_eq!(k.dash_context, 7);
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1CD)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 7);
+    }
+
+    #[test]
+    fn launch_data_empty_reports_not_found() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Retail dash call against empty launch data.
+        m.write_u32(0x4000, 0xDEAD_BEEF).unwrap();
+        t.gpr[3] = 0x4000_u64;
+        t.gpr[4] = 0x3FC_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1A8)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 2);
+        assert_eq!(m.read_u32(0x4000).unwrap(), 0xDEAD_BEEF); // untouched
+        t.gpr[3] = 0x4000_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1A7)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 2);
+        assert_eq!(m.read_u32(0x4000).unwrap(), 0);
+        // Set then serve back, truncated to the buffer.
+        m.write_bytes(0x5000, &[9, 8, 7, 6]).unwrap();
+        t.gpr[3] = 0x5000_u64;
+        t.gpr[4] = 4_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1A6)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        t.gpr[3] = 0x4000_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1A7)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u32(0x4000).unwrap(), 4);
+        t.gpr[3] = 0x6000_u64;
+        t.gpr[4] = 2_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x1A8)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_bytes(0x6000, 2).unwrap(), &[9, 8]);
+    }
+
+    #[test]
+    fn xdf_initialize_is_noop_success() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x650),
+            Some("XdfInitialize")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x650)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn xam_video_mode_matches_vd_query() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x3D1),
+            Some("XGetVideoMode")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0x4000_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x3D1)).unwrap();
+        t.gpr[3] = 0x5000_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1CA),
+        )
+        .unwrap();
+        assert_eq!(
+            m.read_bytes(0x4000, 48).unwrap(),
+            m.read_bytes(0x5000, 48).unwrap()
+        );
+        assert_eq!(m.read_u32(0x4000).unwrap(), 1280);
+        assert_eq!(m.read_u32(0x4004).unwrap(), 720);
+    }
+
+    #[test]
+    fn backstack_empty_returns_success_untouched() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x7DC),
+            Some("XamGetDashBackstackData")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        m.write_bytes(0x4000, &[0xCCu8; 16]).unwrap();
+        m.write_u32(0x5000, 4).unwrap();
+        t.gpr[3] = 0x4000_u64;
+        t.gpr[4] = 0x5000_u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x7DC)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_bytes(0x4000, 16).unwrap(), &[0xCCu8; 16]);
+        assert_eq!(m.read_u32(0x5000).unwrap(), 4);
+    }
+
+    #[test]
+    fn studio_rgb_mode_records() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x379),
+            Some("VdSetStudioRGBMode")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0x24_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x379),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(k.vd_studio_rgb, Some(0x24));
+    }
+
+    #[test]
+    fn fsc_cache_counts_stub_zero() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Retail dash call: FscSetCacheElementCount(0, 0x100).
+        t.gpr[3] = 0_u64;
+        t.gpr[4] = 0x100_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x21),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x20),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn hal_av_pack_reports_hdmi() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x22),
+            Some("HalGetCurrentAVPack")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x22),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 8);
+    }
+
+    #[test]
+    fn dpc_initializes_routine_context() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        m.write_bytes(0x4000, &[0xCCu8; 28]).unwrap();
+        t.gpr[3] = 0x4000_u64;
+        t.gpr[4] = 0x921C_89B0_u64;
+        t.gpr[5] = 0x0103_51A4_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x6F),
+        )
+        .unwrap();
+        assert_eq!(m.read_bytes(0x4000, 2).unwrap(), &[0, 19]); // type u16be
+        assert_eq!(m.read_u8(0x4002).unwrap(), 0);
+        assert_eq!(m.read_u8(0x4003).unwrap(), 0);
+        assert_eq!(m.read_u32(0x400C).unwrap(), 0x921C_89B0);
+        assert_eq!(m.read_u32(0x4010).unwrap(), 0x0103_51A4);
+    }
+
+    #[test]
+    fn symlink_registers_and_strips_qualifier() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x103),
+            Some("ObCreateSymbolicLink")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // OA + ANSI + bytes laid out in guest memory.
+        fn ansi(m: &mut Memory, at: u32, s: &[u8]) {
+            m.write_bytes(at, &(s.len() as u16).to_be_bytes()).unwrap();
+            m.write_bytes(at + 2, &(s.len() as u16).to_be_bytes())
+                .unwrap();
+            m.write_u32(at + 4, at + 8).unwrap();
+            m.write_bytes(at + 8, s).unwrap();
+        }
+        ansi(&mut m, 0x4000, b"\\??\\D:");
+        ansi(&mut m, 0x4100, b"\\Device\\Harddisk0\\Partition1");
+        t.gpr[3] = 0x4000_u64;
+        t.gpr[4] = 0x4100_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x103),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(
+            k.symlinks.get("d:").map(String::as_str),
+            Some("\\device\\harddisk0\\partition1")
+        );
+        // Re-registering the same mapping is still success.
+        t.gpr[3] = 0x4000_u64;
+        t.gpr[4] = 0x4100_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x103),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn erw_lock_exclusive_roundtrip() {
+        // Retail dash lock: init then acquire/release.
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let lock = 0x5000u32;
+        m.write_bytes(lock, &[0xAAu8; 0x38]).unwrap();
+        let call = |k: &mut Kernel,
+                    m: &mut Memory,
+                    tab: &mut ImportTable,
+                    t: &mut ThreadState,
+                    ord: u16| {
+            t.gpr[3] = lock as u64;
+            dispatch_import(k, m, tab, 0, t, &imp("xboxkrnl.exe", ord))
+        };
+        call(&mut k, &mut m, &mut tab, &mut t, 0x11).unwrap();
+        assert_eq!(m.read_u32(lock).unwrap(), 0xFFFF_FFFF); // -1
+        assert_eq!(m.read_u8(lock + 16).unwrap(), 1); // sync event
+        assert_eq!(m.read_u32(lock + 20).unwrap(), 0);
+        assert_eq!(m.read_u8(lock + 32).unwrap(), 5); // semaphore
+        assert_eq!(m.read_u32(lock + 48).unwrap(), 0x7FFF_FFFF);
+        // Exclusive acquire fast path: -1 -> 0.
+        call(&mut k, &mut m, &mut tab, &mut t, 0x07).unwrap();
+        assert_eq!(m.read_u32(lock).unwrap(), 0);
+        // Contended exclusive acquire is explicit, never silent.
+        let e = call(&mut k, &mut m, &mut tab, &mut t, 0x07)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("would block"), "got: {}", e);
+        // Clean roundtrip from a fresh init.
+        call(&mut k, &mut m, &mut tab, &mut t, 0x11).unwrap();
+        call(&mut k, &mut m, &mut tab, &mut t, 0x07).unwrap();
+        call(&mut k, &mut m, &mut tab, &mut t, 0x16).unwrap();
+        assert_eq!(m.read_u32(lock).unwrap(), 0xFFFF_FFFF);
+        assert_eq!(m.read_u32(lock + 12).unwrap(), 0);
+        // Shared acquire/release pair.
+        call(&mut k, &mut m, &mut tab, &mut t, 0x08).unwrap();
+        assert_eq!(m.read_u32(lock + 12).unwrap(), 1);
+        call(&mut k, &mut m, &mut tab, &mut t, 0x16).unwrap();
+        assert_eq!(m.read_u32(lock).unwrap(), 0xFFFF_FFFF);
+        // Try-exclusive: 1 when free, 0 when held.
+        t.gpr[3] = lock as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x2DD),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 1);
+        t.gpr[3] = lock as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x2DD),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        call(&mut k, &mut m, &mut tab, &mut t, 0x16).unwrap();
+        // Try-shared on a free lock acquires.
+        t.gpr[3] = lock as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x2DE),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 1);
+        assert_eq!(m.read_u32(lock + 12).unwrap(), 1);
+    }
+
+    #[test]
+    fn etx_producer_register_is_noop_success() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x334),
+            Some("EtxProducerRegister")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0x9201_C9F0_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x334),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn usbcam_reports_not_connected() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x21D),
+            Some("XUsbcamGetState")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x21D),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn crypt_random_fills_fd() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x18A),
+            Some("XeCryptRandom")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        m.write_bytes(0x4000, &[0u8; 16]).unwrap();
+        t.gpr[3] = 0x4000_u64;
+        t.gpr[4] = 0x10_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x18A),
+        )
+        .unwrap();
+        assert_eq!(m.read_bytes(0x4000, 16).unwrap(), &[0xFD; 16]);
+        // Zero length touches nothing and still succeeds.
+        t.gpr[3] = 0x4000_u64;
+        t.gpr[4] = 0_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x18A),
+        )
+        .unwrap();
     }
 
     #[test]

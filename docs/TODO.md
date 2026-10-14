@@ -83,35 +83,73 @@ Terminal states only: impossible, done, or something rendering.
       VdIsHSIOTrainingSucceeded, VdSetDisplayMode, 1280x720 query,
       AsicID 0x11), MmGetPhysicalAddress, KiApcNormalRoutineNop,
       RtlNtStatusToDosError (reference table, PATH_NOT_FOUND->3)
+- [x] CPU 64-bit compares (reference `ppc_emit_alu.cc`
+      `InstrEmit_cmp/cmpi/cmpl/cmpli`): L=1 compares full GPRs
+      (signed/unsigned; immediates sign/zero-extended); X-form L-bit
+      fix (L is RT bit 0, was misread as bit 1); `sradix` (XO 826,
+      XS form with SH5-masked match, sign-fill + CA)
+- [x] CPU VMX128 integer subset (VR file widened to 128): `lvsl`/
+      `lvsr` permute controls, `vspltisb`/`vspltish`/`vspltisw`,
+      `vslb`, `vor`, `vspltb`, `lvx`/`stvx` + `lvlx`/`lvrx`/`stvlx`/
+      `stvrx` (zero-fill/no-op edges per backend TBL notes) +
+      `lvebx`/`lvehx`/`lvewx`/`stvebx`/`stvehx`/`stvewx` element ops +
+      128-bit forms, `vperm`/`vperm128`/`vsel`; FP vector arithmetic
+      still `Unsupported`
+- [x] Filesystem `HostDirFs`: read-only host-directory backend
+      (recursive index, lazy Arc cache, dir listings) for extracted
+      layouts and system-update dirs; tested
+- [x] Dash boot (HostDirFs over system-update dir): 63 imports served
+      through locale/video/sync init — XMsgInProcessCall (LiveBase
+      offline table), XamPackageManagerGetExperienceMode=1,
+      XamUserFlushLogonQueue noop, XamGetLanguage=1 (English),
+      XamGetLocale=36 (US), XamGetOnlineLanguageAndCountry (1/103),
+      XamBackgroundDownload{SetMode, ...RegisterChangeCallback} noop,
+      XamGetStagingMode=0, XamFitnessClearBodyProfileRecords noop,
+      XamSetDashContext (+Get, broadcast 0x8000000C on change),
+      XamLoader{Set,Get,GetSize}LaunchData (NOT_FOUND when empty),
+      XdfInitialize noop, XamGetDashBackstackData (empty drain),
+      XGetVideoMode (=VdQueryVideoMode), ExReadWriteLock family
+      (guest-memory X_ERWLOCK: init/acquire/try/release, contended
+      acquire explicit Unsupported), EtxProducerRegister noop,
+      XUsbcamGetState=0 (not connected), XeCryptRandom (0xFD fill per
+      reference), Fsc{Get,Set}CacheElementCount=0, ObCreateSymbolicLink
+      (canonical table), KeInitializeDpc (XDPC layout), HalGetCurrentAVPack=8,
+      VdSetStudioRGBMode (recorded); retail `sradix`/`vperm128`/
+      `vperm` words execute (vector memcpy loops)
 
 ## Active
 
 - [ ] Retail frontier (STFS-backed boot): wild virtual call at
       `0x821503A4` (`bctr` to `0x67735C65` = path-tail bytes). Object
-      at `0x010338F0` reuses a path-string buffer; ctor zeroes +0..+12
-      but never sets the +16 vtable slot the method reads. Proven so
-      far: reproduces with a single catalog entry (N=1) and blanked
-      bodies (value-independent); identical under a shifted heap base
-      (address-independent); file bytes genuine (single sync 37KB
-      read); every import called in the window returns sane values;
-      two spawned worker threads are independent; waits honest
-      (TIMEOUT, threads never fake-done); free-then-realloc cycle is
-      legitimate (freelist link/unlink observed); no silent
-      mis-dispatch in 500k steps (every other indirect branch lands
-      in-image); no GPU polling at all (2 MMIO writes, 0 reads);
-      caller chain mapped, single callers throughout
-      (`0x82150248` <- `0x820E839C` <- `0x820E8308` <- `0x820F9584`);
-      the 347k-step virtual method is GPU driver bring-up, fully
-      served. Still open: which hardware-executed +16 writer (or
-      branch avoiding the read) we skip — needs trace-diff harness
-      or fresh eyes; empty-catalog boot runs 65M+ steps into its main
-      loop (no fault there, needs GPU draw path for anything
-      observable)
+      at `0x010338F0` is a FRESH 52-byte alloc (`addi r3,0,52` +
+      `new` at `0x820E8330`, ctor at `0x82150150` zeroes +0..+12);
+      full lifecycle traced: path stb-built into the block, ctor
+      zeroes +0..+12, method runs 430K steps, calls stale +16.
+      No `stw` to +16 exists in method/ctor/callees (whole-run watch:
+      +16 only ever held string bytes) — the object is never
+      C++-constructed, so the divergence is the CALLER passing a raw
+      buffer (uninitialized/wrong pointer), not a skipped store.
+      Guard decoded (`bc` bo=4 = branch-if-false: proceed iff
+      `r3&0xFF==0`; r3=0x10000 proceeds correctly). Still open:
+      which caller input (catalog bytes vs import output) selects the
+      wrong pointer — candidate: first-vcall r3=0x10000; needs
+      callee-side store search or trace-diff harness
+- [ ] Dash frontier (HostDirFs boot): 63 imports to an entry-table
+      walk at `0x921B86BC` (`lwz r8,896(r11)`, r11=0x603400A2 from
+      version-string bytes). Walk runs 65537 iterations by
+      construction (r24=0x10002 from flag code, verified correct);
+      table copies verified faithful (vector memcpy, coherent
+      "vs_3_0.2.0.9407.0"); zero entries are safe, string bytes fault.
+      Skip-fault run proves the walk is structurally lost (spins into
+      wild space). Same shape as Braid: walk overruns valid entries
+      into string data — shared COUNT-vs-DATA class. Still open:
+      which bound/source differs (copy length vs walk count)
 
 ## Next (retail-driven, in expected order)
 
-- [ ] `fctid`/`fcfid` edge cases, VMX128
-- [ ] Kernel shims on demand (file I/O first, then video mode, content)
+- [ ] VMX128 FP arithmetic (`vaddfp`, `vmulfp`, `vperm`-style float);
+      trace-diff harness for the two table-walk frontiers
+- [ ] Kernel shims on demand (GPU ring pump, file data, content)
 - [ ] Commit + push; update PORTING.md / COMPATIBILITY.md
 
 ## Later roadmap

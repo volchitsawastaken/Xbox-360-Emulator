@@ -919,6 +919,16 @@ pub enum Decoded {
         sh: u32,
         rc: bool,
     },
+    // Shift right algebraic doubleword immediate (primary 31, XS
+    // form, XO 826; reference `InstrEmit_sradix`). 6-bit count is
+    // SH5 (word bit 1) << 5 | SH (RB field); n==0 copies with CA=0,
+    // else sign-fills with CA = sign & any-shifted-out-1.
+    Sradix {
+        rs: u32,
+        ra: u32,
+        sh: u32,
+        rc: bool,
+    },
     // SPR moves
     Mfcr {
         rt: u32,
@@ -1071,6 +1081,196 @@ pub enum Decoded {
     Vmx {
         word: u32,
     },
+    // Vector splat immediate signed byte (primary 4, kVX; reference
+    // `ppc_emit_altivec.cc` `InstrEmit_vspltisb`). Immediate is the
+    // 5-bit VA field, sign-extended; VD is a VR index (0-31).
+    Vspltisb {
+        vd: u32,
+        simm: u32,
+    },
+    // Classic vector permute/select (primary 4, kVA 6-bit XOs;
+    // reference `InstrEmit_vperm_`/`vsel_`). vperm: VD[i] =
+    // (VA||VB)[VC[i] & 31]; vsel: per-bit VD = VC ? VB : VA.
+    Vperm {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        vc: u32,
+    },
+    Vsel {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        vc: u32,
+    },
+    // Vector permute, 128-bit form (primary 5, kVX128_2 base
+    // 0x14000000; reference `InstrEmit_vperm128`). VD/VA/VB are
+    // 7-bit (VA has a third high bit), VC is the 3-bit control
+    // index. VD[i] = (VA||VB)[VC[i] & 31], PPC byte order.
+    Vperm128 {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        vc: u32,
+    },
+    // Vector splat immediate signed halfword/word (primary 4, kVX
+    // XOs 0x34C/0x38C; reference `InstrEmit_vspltish/vspltw`... the
+    // immediate forms). 5-bit VA sign-extended to 16/32, splatted as
+    // 8 halfwords / 4 words big-endian; 0 zeroes the register.
+    Vspltish {
+        vd: u32,
+        simm: u32,
+    },
+    Vspltisw {
+        vd: u32,
+        simm: u32,
+    },
+    // Vector alignment helpers (primary 31; reference
+    // `InstrEmit_lvsl_`/`lvsr_`): permute-control for unaligned
+    // vector loads, from EA low 4 bits. XO 6 = lvsl, 38 = lvsr.
+    Lvsl {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lvsr {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    // Vector shift left bytes (primary 4, kVX XO 0x104; reference
+    // `InstrEmit_vslb`/`VECTOR_SHL_V128`): per-byte logical shift,
+    // amounts masked to 3 bits.
+    Vslb {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
+    // Vector OR (primary 4, kVX XO 0x484; reference `InstrEmit_vor`):
+    // full 128-bit OR.
+    Vor {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
+    // Vector splat byte (primary 4, kVX XO 0x20C; reference
+    // `InstrEmit_vspltb`): splat VB[VA & 0xF] across VD.
+    Vspltb {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
+    // Vector load/store indexed, 128-bit forms (primary 4, kVX128_1;
+    // reference `InstrEmit_lvx128`/`stvx128`). VD is 7-bit
+    // (low 5 + bits 0-1); EA aligns down to 16; bytes transfer raw
+    // (the VR file and memory accessors share PPC byte order).
+    Lvx128 {
+        vd: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvx128 {
+        vd: u32,
+        ra: u32,
+        rb: u32,
+    },
+    // Vector indexed loads/stores, 32-reg forms (primary 31; XOs per
+    // reference `ppc_opcode_table_gen.cc` bases: lvx=103, stvx=231,
+    // lvlx=519, lvrx=551, stvlx=647, stvrx=679). lvx/stvx move an
+    // aligned quad raw; lvlx/lvrx load a partial quad with zero fill
+    // (reference backend LVL/LVR TBL logic); stvlx/stvrx store a
+    // partial quad (reference STVL/STVR; stvrx with eb==0 is a
+    // no-op that touches no memory, per the reference memcpy note).
+    Lvx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lvlx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lvrx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvlx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvrx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    // Vector element loads/stores (primary 31; XOs per reference
+    // bases: lvebx=7, lvehx=39, lvewx=71, stvebx=135, stvehx=167,
+    // stvewx=199). Power ISA semantics: one element transfers,
+    // loads zero the rest. (The reference JIT shortcuts the loads
+    // to full quads; the precise form here keeps the needed byte
+    // identical while zeroing the rest per the ISA.)
+    Lvebx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lvehx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lvewx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvebx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvehx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvewx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    // Cell-extension partial loads/stores, 128-bit forms (primary 4,
+    // kVX128_1; bases lvlx128=0x403, lvrx128=0x443, stvlx128=0x503,
+    // stvrx128=0x543). Same semantics as the 32-reg forms with a
+    // 7-bit VD.
+    Lvlx128 {
+        vd: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lvrx128 {
+        vd: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvlx128 {
+        vd: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stvrx128 {
+        vd: u32,
+        ra: u32,
+        rb: u32,
+    },
     Unsupported {
         opc: u32,
         word: u32,
@@ -1120,7 +1320,96 @@ pub fn decode(word: u32) -> Result<Decoded> {
             ra,
             simm: d as i16,
         }),
-        4 => Ok(Decoded::Vmx { word }),
+        4 => {
+            // VMX128 primary: kVX vector ops decoded by low-11 XO so
+            // far (vspltisb 0x30C, vslb 0x104); everything else stays
+            // tracked. kVX fields: VD=(>>21), VA=(>>16), VB=(>>11).
+            match word & 0x7FF {
+                0x30C => Ok(Decoded::Vspltisb { vd: rt, simm: ra }),
+                // kVA 6-bit XOs share the low-11 window (VC lives in
+                // bits 6-10); match on the low 6 bits.
+                _ if word & 0x3F == 0x2B => Ok(Decoded::Vperm {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                    vc: (word >> 6) & 0x1F,
+                }),
+                _ if word & 0x3F == 0x2A => Ok(Decoded::Vsel {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                    vc: (word >> 6) & 0x1F,
+                }),
+                0x34C => Ok(Decoded::Vspltish { vd: rt, simm: ra }),
+                0x38C => Ok(Decoded::Vspltisw { vd: rt, simm: ra }),
+                0x104 => Ok(Decoded::Vslb {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                }),
+                0x484 => Ok(Decoded::Vor {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                }),
+                0x20C => Ok(Decoded::Vspltb {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                }),
+                // kVX128_1 loads/stores. XO match excludes the VD-high
+                // bits (word bits 2-3, already zero in the bases);
+                // VD is 7-bit (reference FormatVX128_1).
+                _ if word & 0x7F3 == 0x0C3 => Ok(Decoded::Lvx128 {
+                    vd: rt | (((word >> 2) & 0x3) << 5),
+                    ra,
+                    rb,
+                }),
+                _ if word & 0x7F3 == 0x1C3 => Ok(Decoded::Stvx128 {
+                    vd: rt | (((word >> 2) & 0x3) << 5),
+                    ra,
+                    rb,
+                }),
+                // Cell partial 128-bit forms (mask out VD-high bits).
+                _ if word & 0x7F3 == 0x403 => Ok(Decoded::Lvlx128 {
+                    vd: rt | (((word >> 2) & 0x3) << 5),
+                    ra,
+                    rb,
+                }),
+                _ if word & 0x7F3 == 0x443 => Ok(Decoded::Lvrx128 {
+                    vd: rt | (((word >> 2) & 0x3) << 5),
+                    ra,
+                    rb,
+                }),
+                _ if word & 0x7F3 == 0x503 => Ok(Decoded::Stvlx128 {
+                    vd: rt | (((word >> 2) & 0x3) << 5),
+                    ra,
+                    rb,
+                }),
+                _ if word & 0x7F3 == 0x543 => Ok(Decoded::Stvrx128 {
+                    vd: rt | (((word >> 2) & 0x3) << 5),
+                    ra,
+                    rb,
+                }),
+                _ => Ok(Decoded::Vmx { word }),
+            }
+        }
+        5 => {
+            // kVX128_2 vperm128 (base 0x14000000): match with every
+            // register field masked (VD/VA/VB lows+highs, VC);
+            // reserved bits 4/9 must be clear. Anything else stays
+            // tracked. Field map: reference `FormatVX128_2`.
+            if word & 0xFC00_0210 == 0x1400_0000 {
+                Ok(Decoded::Vperm128 {
+                    vd: rt | (((word >> 2) & 0x3) << 5),
+                    va: ra | (((word >> 5) & 0x1) << 5) | (((word >> 10) & 0x1) << 6),
+                    vb: rb | ((word & 0x3) << 5),
+                    vc: (word >> 6) & 0x7,
+                })
+            } else {
+                Ok(Decoded::Vmx { word })
+            }
+        }
         7 => Ok(Decoded::Mulli {
             rt,
             ra,
@@ -1260,7 +1549,7 @@ pub fn decode(word: u32) -> Result<Decoded> {
             match xo {
                 0 => Ok(Decoded::Cmp {
                     bf: rt >> 2,
-                    l: rt & 0x2 != 0,
+                    l: rt & 0x1 != 0,
                     ra,
                     rb,
                 }),
@@ -1270,11 +1559,25 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 21 => Ok(Decoded::Ldx { rt, ra, rb }),
                 23 => Ok(Decoded::Lwzx { rt, ra, rb }),
                 53 => Ok(Decoded::Ldux { rt, ra, rb }),
+                6 => Ok(Decoded::Lvsl { rt, ra, rb }),
+                38 => Ok(Decoded::Lvsr { rt, ra, rb }),
+                7 => Ok(Decoded::Lvebx { rt, ra, rb }),
+                39 => Ok(Decoded::Lvehx { rt, ra, rb }),
+                71 => Ok(Decoded::Lvewx { rt, ra, rb }),
+                103 => Ok(Decoded::Lvx { rt, ra, rb }),
+                135 => Ok(Decoded::Stvebx { rs: rt, ra, rb }),
+                167 => Ok(Decoded::Stvehx { rs: rt, ra, rb }),
+                199 => Ok(Decoded::Stvewx { rs: rt, ra, rb }),
+                231 => Ok(Decoded::Stvx { rs: rt, ra, rb }),
+                519 => Ok(Decoded::Lvlx { rt, ra, rb }),
+                551 => Ok(Decoded::Lvrx { rt, ra, rb }),
+                647 => Ok(Decoded::Stvlx { rs: rt, ra, rb }),
+                679 => Ok(Decoded::Stvrx { rs: rt, ra, rb }),
                 28 => Ok(Decoded::And { rs: rt, ra, rb, rc }),
                 60 => Ok(Decoded::Andc { rs: rt, ra, rb, rc }),
                 32 => Ok(Decoded::Cmpl {
                     bf: rt >> 2,
-                    l: rt & 0x2 != 0,
+                    l: rt & 0x1 != 0,
                     ra,
                     rb,
                 }),
@@ -1300,6 +1603,14 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     rs: rt,
                     ra,
                     sh: rb,
+                    rc,
+                }),
+                // sradix shares the XO field with its SH5 count bit
+                // (word bit 1), so match with that bit masked out.
+                _ if xo & 0x3FE == 826 => Ok(Decoded::Sradix {
+                    rs: rt,
+                    ra,
+                    sh: (((word >> 1) & 1) << 5) | rb,
                     rc,
                 }),
                 144 => Ok(Decoded::Mtcrf {

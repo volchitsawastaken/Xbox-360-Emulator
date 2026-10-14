@@ -81,8 +81,11 @@ pub struct ThreadState {
     /// Reservation for lwarx/stwcx.
     pub reserved: bool,
     pub reserved_addr: u32,
-    /// VMX128 file (stored, ops tracked as unsupported until M6).
-    pub vr: [[u8; 16]; 32],
+    /// VMX128 file: 128 vector registers of 16 bytes in PPC order
+    /// (vr[i] = lowest-address byte). kVX ops address v0-v31;
+    /// 128-bit forms (kVX128_1) address all 128. Ops tracked as
+    /// unsupported until implemented one by one against retail.
+    pub vr: [[u8; 16]; 128],
     pub vscr: u32,
     /// Machine State Register (mfmsr/mtmsr; bit 48 EE, bit 62 RI).
     /// Starts 0 (interrupts disabled); no interrupt model yet.
@@ -103,7 +106,7 @@ impl ThreadState {
             xer: Xer(0),
             reserved: false,
             reserved_addr: 0,
-            vr: [[0; 16]; 32],
+            vr: [[0; 16]; 128],
             vscr: 0,
             msr: 0,
             id,

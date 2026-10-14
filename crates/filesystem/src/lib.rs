@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use x360_common::{EmuError, Result};
 
+pub mod hostdir_fs;
 pub mod stfs;
 pub mod stfs_fs;
 

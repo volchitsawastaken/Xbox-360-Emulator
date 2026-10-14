@@ -168,7 +168,15 @@ fn cmp_signed(t: &mut ThreadState, bf: u32, a: i32, b: i32) {
     update_cr_bf(t, bf, a < b, a > b, a == b);
 }
 
+fn cmp_signed64(t: &mut ThreadState, bf: u32, a: i64, b: i64) {
+    update_cr_bf(t, bf, a < b, a > b, a == b);
+}
+
 fn cmp_unsigned(t: &mut ThreadState, bf: u32, a: u32, b: u32) {
+    update_cr_bf(t, bf, a < b, a > b, a == b);
+}
+
+fn cmp_unsigned64(t: &mut ThreadState, bf: u32, a: u64, b: u64) {
     update_cr_bf(t, bf, a < b, a > b, a == b);
 }
 
@@ -354,51 +362,51 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Cmpi { bf, l, ra, simm } => {
+            // L=0 compares low 32 as signed; L=1 compares full 64
+            // against the sign-extended immediate (reference
+            // `InstrEmit_cmpi`).
             if l {
-                return Err(EmuError::Unsupported(format!(
-                    "cmpi L=1 needs 64-bit regs word={:08x} pc={:08x}",
-                    word, t.pc
-                )));
+                cmp_signed64(t, bf, t.gpr[ra as usize] as i64, simm as i64);
+            } else {
+                cmp_signed(t, bf, (t.gpr[ra as usize] as u32) as i32, simm as i32);
             }
-            cmp_signed(t, bf, (t.gpr[ra as usize] as u32) as i32, simm as i32);
             t.pc = next;
             Ok(None)
         }
         Decoded::Cmpli { bf, l, ra, uimm } => {
+            // L=1 compares full 64 against the zero-extended immediate
+            // (reference `InstrEmit_cmpli`: i48.0 || SI).
             if l {
-                return Err(EmuError::Unsupported(format!(
-                    "cmpli L=1 needs 64-bit regs word={:08x} pc={:08x}",
-                    word, t.pc
-                )));
+                cmp_unsigned64(t, bf, t.gpr[ra as usize], uimm as u64);
+            } else {
+                cmp_unsigned(t, bf, t.gpr[ra as usize] as u32, uimm as u32);
             }
-            cmp_unsigned(t, bf, t.gpr[ra as usize] as u32, uimm as u32);
             t.pc = next;
             Ok(None)
         }
         Decoded::Cmp { bf, l, ra, rb } => {
+            // L selects 64-bit (full GPRs) vs 32-bit signed low halves
+            // (reference `InstrEmit_cmp`).
             if l {
-                return Err(EmuError::Unsupported(format!(
-                    "cmp L=1 needs 64-bit regs word={:08x} pc={:08x}",
-                    word, t.pc
-                )));
+                cmp_signed64(t, bf, t.gpr[ra as usize] as i64, t.gpr[rb as usize] as i64);
+            } else {
+                cmp_signed(
+                    t,
+                    bf,
+                    (t.gpr[ra as usize] as u32) as i32,
+                    (t.gpr[rb as usize] as u32) as i32,
+                );
             }
-            cmp_signed(
-                t,
-                bf,
-                (t.gpr[ra as usize] as u32) as i32,
-                (t.gpr[rb as usize] as u32) as i32,
-            );
             t.pc = next;
             Ok(None)
         }
         Decoded::Cmpl { bf, l, ra, rb } => {
+            // Unsigned twin of Cmp (reference `InstrEmit_cmpl`).
             if l {
-                return Err(EmuError::Unsupported(format!(
-                    "cmpl L=1 needs 64-bit regs word={:08x} pc={:08x}",
-                    word, t.pc
-                )));
+                cmp_unsigned64(t, bf, t.gpr[ra as usize], t.gpr[rb as usize]);
+            } else {
+                cmp_unsigned(t, bf, t.gpr[ra as usize] as u32, t.gpr[rb as usize] as u32);
             }
-            cmp_unsigned(t, bf, t.gpr[ra as usize] as u32, t.gpr[rb as usize] as u32);
             t.pc = next;
             Ok(None)
         }
@@ -1797,6 +1805,26 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Sradix { rs, ra, sh, rc } => {
+            // Immediate twin of sradx (reference InstrEmit_sradix):
+            // n==0 copies with CA=0, else sign-fill with CA = sign
+            // & any-shifted-out-1 (low-n-bits mask).
+            let rt = t.gpr[rs as usize];
+            let (v, ca) = if sh == 0 {
+                (rt, false)
+            } else {
+                let v = ((rt as i64) >> sh) as u64;
+                let mask = if sh >= 64 { u64::MAX } else { (1u64 << sh) - 1 };
+                ((v), (rt >> 63) == 1 && (rt & mask) != 0)
+            };
+            t.xer.set_ca(ca);
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Lwzx { rt, ra, rb } => {
             let ea = ea_idx(ra, rb, t);
             t.gpr[rt as usize] = (mem.read_u32(ea)?) as u64;
@@ -2205,6 +2233,365 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Vslb { vd, va, vb } => {
+            // Per-byte `va[i] << (vb[i] & 7)` (reference VECTOR_SHL).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for (i, d) in v.iter_mut().enumerate() {
+                *d = a[i].wrapping_shl((b[i] & 7) as u32);
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vor { vd, va, vb } => {
+            // Full 128-bit OR (reference InstrEmit_vor).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..16 {
+                v[i] = a[i] | b[i];
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vspltb { vd, va, vb } => {
+            // Splat VB[VA & 0xF] (reference InstrEmit_vspltb).
+            let b = t.vr[vb as usize][(va & 0xF) as usize];
+            t.vr[vd as usize] = [b; 16];
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvx128 { vd, ra, rb } => {
+            // 16 bytes from EA aligned down (reference InstrEmit_lvx_).
+            let ea = ea_idx(ra, rb, t) & !0xF;
+            let b = mem.read_bytes(ea, 16)?;
+            t.vr[vd as usize].copy_from_slice(b);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvx128 { vd, ra, rb } => {
+            // 16 bytes to EA aligned down (reference InstrEmit_stvx_).
+            let ea = ea_idx(ra, rb, t) & !0xF;
+            let v = t.vr[vd as usize];
+            mem.write_bytes(ea, &v)?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvx { rt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t) & !0xF;
+            let b = mem.read_bytes(ea, 16)?;
+            t.vr[rt as usize].copy_from_slice(b);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvx { rs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t) & !0xF;
+            let v = t.vr[rs as usize];
+            mem.write_bytes(ea, &v)?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvlx { rt, ra, rb } => {
+            // Tail of the quad from EA, low-placed, rest zero
+            // (reference backend LVL TBL: vd[i] = mem[i+o] or 0).
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            let base = ea & !0xF;
+            let b = mem.read_bytes(base, 16)?;
+            let mut v = [0u8; 16];
+            for i in 0..16 {
+                if i + o < 16 {
+                    v[i] = b[i + o];
+                }
+            }
+            t.vr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvrx { rt, ra, rb } => {
+            // Head of the quad before EA, high-placed, rest zero
+            // (reference backend LVR: zero for o==0, correct).
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            let base = ea & !0xF;
+            let mut v = [0u8; 16];
+            if o != 0 {
+                let b = mem.read_bytes(base, 16)?;
+                for i in 0..16 {
+                    if i + o >= 16 {
+                        v[i] = b[i + o - 16];
+                    }
+                }
+            }
+            t.vr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvlx { rs, ra, rb } => {
+            // Low bytes of vs to the quad tail (reference STVL:
+            // bytes o..15; o==0 is a full store).
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            let base = ea & !0xF;
+            let v = t.vr[rs as usize];
+            if o == 0 {
+                mem.write_bytes(base, &v)?;
+            } else {
+                mem.write_bytes(base + o as u32, &v[..16 - o])?;
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvrx { rs, ra, rb } => {
+            // High bytes of vs to the quad head (reference STVR;
+            // o==0 touches no memory at all, never faults).
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            if o != 0 {
+                let base = ea & !0xF;
+                let v = t.vr[rs as usize];
+                mem.write_bytes(base, &v[16 - o..])?;
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvebx { rt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            let mut v = [0u8; 16];
+            v[o] = mem.read_u8(ea)?;
+            t.vr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvehx { rt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let eal = ea & !1;
+            let el = ((ea & 0xF) >> 1) as usize;
+            let b = mem.read_bytes(eal, 2)?;
+            let mut v = [0u8; 16];
+            v[el * 2] = b[0];
+            v[el * 2 + 1] = b[1];
+            t.vr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvewx { rt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let eal = ea & !3;
+            let el = ((ea & 0xF) >> 2) as usize;
+            let b = mem.read_bytes(eal, 4)?;
+            let mut v = [0u8; 16];
+            v[el * 4..el * 4 + 4].copy_from_slice(b);
+            t.vr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvebx { rs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            mem.write_u8(ea, t.vr[rs as usize][o])?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvehx { rs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let eal = ea & !1;
+            let el = ((ea & 0xF) >> 1) as usize;
+            let v = t.vr[rs as usize];
+            mem.write_bytes(eal, &v[el * 2..el * 2 + 2])?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvewx { rs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let eal = ea & !3;
+            let el = ((ea & 0xF) >> 2) as usize;
+            let v = t.vr[rs as usize];
+            mem.write_bytes(eal, &v[el * 4..el * 4 + 4])?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvlx128 { vd, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            let base = ea & !0xF;
+            let b = mem.read_bytes(base, 16)?;
+            let mut v = [0u8; 16];
+            for i in 0..16 {
+                if i + o < 16 {
+                    v[i] = b[i + o];
+                }
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvrx128 { vd, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            let base = ea & !0xF;
+            let mut v = [0u8; 16];
+            if o != 0 {
+                let b = mem.read_bytes(base, 16)?;
+                for i in 0..16 {
+                    if i + o >= 16 {
+                        v[i] = b[i + o - 16];
+                    }
+                }
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvlx128 { vd, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            let base = ea & !0xF;
+            let v = t.vr[vd as usize];
+            if o == 0 {
+                mem.write_bytes(base, &v)?;
+            } else {
+                mem.write_bytes(base + o as u32, &v[..16 - o])?;
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stvrx128 { vd, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let o = (ea & 0xF) as usize;
+            if o != 0 {
+                let base = ea & !0xF;
+                let v = t.vr[vd as usize];
+                mem.write_bytes(base, &v[16 - o..])?;
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vspltisb { vd, simm } => {
+            // Splat sign-extended 5-bit immediate across all 16 bytes
+            // (reference InstrEmit_vspltisb; splat-0 coincides with zero).
+            let b = if simm & 0x10 != 0 {
+                (simm | 0xFFFF_FFF0) as u8
+            } else {
+                simm as u8
+            };
+            t.vr[vd as usize] = [b; 16];
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vspltish { vd, simm } => {
+            // Splat sign-extended 5-bit immediate as 8 big-endian
+            // halfwords (reference InstrEmit_vspltish); 0 zeroes.
+            let mut v = [0u8; 16];
+            if simm != 0 {
+                let h = if simm & 0x10 != 0 {
+                    (simm | 0xFFFF_FFF0) as u16
+                } else {
+                    simm as u16
+                };
+                for i in 0..8 {
+                    v[2 * i] = (h >> 8) as u8;
+                    v[2 * i + 1] = h as u8;
+                }
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vspltisw { vd, simm } => {
+            // Splat sign-extended 5-bit immediate as 4 big-endian
+            // words (reference vspltisw immediate form); 0 zeroes.
+            let mut v = [0u8; 16];
+            if simm != 0 {
+                let w = if simm & 0x10 != 0 {
+                    simm | 0xFFFF_FFE0
+                } else {
+                    simm
+                };
+                for i in 0..4 {
+                    v[4 * i] = (w >> 24) as u8;
+                    v[4 * i + 1] = (w >> 16) as u8;
+                    v[4 * i + 2] = (w >> 8) as u8;
+                    v[4 * i + 3] = w as u8;
+                }
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvsl { rt, ra, rb } => {
+            // Shift-left permute control: base {0..15} plus EA low
+            // 4 bits, byte-wrapped without masking (reference backend
+            // `LOAD_VECTOR_SHL`: add, mod 256; high values are valid
+            // 5-bit vperm selectors).
+            let sh = (ea_idx(ra, rb, t) & 0xF) as u8;
+            let mut v = [0u8; 16];
+            for (i, b) in v.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_add(sh);
+            }
+            t.vr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lvsr { rt, ra, rb } => {
+            // Shift-right permute control: base {16..31} minus EA low
+            // 4 bits, byte-wrapped (reference `LOAD_VECTOR_SHR`).
+            let sh = (ea_idx(ra, rb, t) & 0xF) as u8;
+            let mut v = [0u8; 16];
+            for (i, b) in v.iter_mut().enumerate() {
+                *b = (16 + i as u8).wrapping_sub(sh);
+            }
+            t.vr[rt as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vperm { vd, va, vb, vc } => {
+            // Same select as the 128-bit form, 32-reg file.
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let c = t.vr[vc as usize];
+            let mut v = [0u8; 16];
+            for (i, d) in v.iter_mut().enumerate() {
+                let s = (c[i] & 31) as usize;
+                *d = if s < 16 { a[s] } else { b[s - 16] };
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vsel { vd, va, vb, vc } => {
+            // Per-bit select: VD = (VA & ~VC) | (VB & VC)
+            // (reference InstrEmit_vsel_ comment).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let c = t.vr[vc as usize];
+            let mut v = [0u8; 16];
+            for (i, d) in v.iter_mut().enumerate() {
+                *d = (a[i] & !c[i]) | (b[i] & c[i]);
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vperm128 { vd, va, vb, vc } => {
+            // Byte select from the VA||VB concat (reference
+            // InstrEmit_vperm_ / HIR Permute; PPC byte order here).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let c = t.vr[vc as usize];
+            let mut v = [0u8; 16];
+            for (i, d) in v.iter_mut().enumerate() {
+                let s = (c[i] & 31) as usize;
+                *d = if s < 16 { a[s] } else { b[s - 16] };
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Vmx { word } => Err(EmuError::Unsupported(format!(
             "VMX128 word={:08x} pc={:08x}",
             word, t.pc
@@ -2466,6 +2853,371 @@ mod tests {
         assert_eq!(t.fpr[6], 7.5);
         let bad = (31u32 << 26) | (6 << 21) | (10 << 11) | (631 << 1);
         assert!(expect_unsupported(bad, &mut t, &mut m).contains("lfdux"));
+    }
+
+    #[test]
+    fn vector_align_helpers() {
+        // Retail dash word: lvsl v13,r0,r4 -> 0x7DA0200C.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x7DA0_200C).unwrap(),
+            Decoded::Lvsl {
+                rt: 13,
+                ra: 0,
+                rb: 4
+            }
+        ));
+        t.gpr[4] = 0x1003_u64;
+        run_word(0x7DA0_200C, &mut t, &mut m);
+        assert_eq!(
+            t.vr[13],
+            [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+        );
+        // lvsr base {16..31} minus shift (backend LOAD_VECTOR_SHR).
+        t.gpr[4] = 0x1003_u64;
+        let lvsr = (31u32 << 26) | (13 << 21) | (4 << 11) | (38 << 1);
+        assert!(matches!(
+            decode(lvsr).unwrap(),
+            Decoded::Lvsr {
+                rt: 13,
+                ra: 0,
+                rb: 4
+            }
+        ));
+        run_word(lvsr, &mut t, &mut m);
+        assert_eq!(
+            t.vr[13],
+            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+        );
+        // Zero shift: identity bases.
+        t.gpr[4] = 0x1000_u64;
+        run_word(0x7DA0_200C, &mut t, &mut m);
+        assert_eq!(
+            t.vr[13],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+    }
+
+    #[test]
+    fn vslb_shifts_per_byte() {
+        // Retail dash word: vslb v0,v12,v0 -> 0x100C0104.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x100C_0104).unwrap(),
+            Decoded::Vslb {
+                vd: 0,
+                va: 12,
+                vb: 0
+            }
+        ));
+        t.vr[12] = [0x01, 0x02, 0x80, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        t.vr[0] = [1, 3, 1, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        run_word(0x100C_0104, &mut t, &mut m);
+        // Shift amounts masked to 3 bits: 0x80<<0, 0xFF<<0... check:
+        // v[0]=0x01<<1, v[1]=0x02<<3, v[2]=0x80<<1, v[3]=0xFF<<0.
+        assert_eq!(
+            t.vr[0],
+            [0x02, 0x10, 0x00, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn vor_ors_full_register() {
+        // Retail dash word: vor v0,v13,v0 -> 0x100D0484.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x100D_0484).unwrap(),
+            Decoded::Vor {
+                vd: 0,
+                va: 13,
+                vb: 0
+            }
+        ));
+        t.vr[13] = [0xF0u8; 16];
+        t.vr[0] = [0x0Fu8; 16];
+        run_word(0x100D_0484, &mut t, &mut m);
+        assert_eq!(t.vr[0], [0xFFu8; 16]);
+    }
+
+    #[test]
+    fn vspltb_splats_indexed_byte() {
+        // Retail dash word: vspltb v0,v0,v0 -> 0x1000020C.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x1000_020C).unwrap(),
+            Decoded::Vspltb {
+                vd: 0,
+                va: 0,
+                vb: 0
+            }
+        ));
+        t.vr[3] = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+            0x1E, 0x1F,
+        ];
+        // vspltb v2,v5,v3 (VD=2, VA=5, VB=3): splat VB[5] = 0x15.
+        let w = (4u32 << 26) | (2 << 21) | (5 << 16) | (3 << 11) | 0x20C;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.vr[2], [0x15u8; 16]);
+        // Index wraps at 16: VA=17 -> VB[1].
+        let w2 = (4u32 << 26) | (2 << 21) | (17 << 16) | (3 << 11) | 0x20C;
+        run_word(w2, &mut t, &mut m);
+        assert_eq!(t.vr[2], [0x11u8; 16]);
+    }
+
+    #[test]
+    fn lvx_stvx128_roundtrip_retail() {
+        // Retail dash word 0x100051C3 is stvx128 v0 (VD low 0, high 0).
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x1000_51C3).unwrap(),
+            Decoded::Stvx128 { vd: 0, .. }
+        ));
+        t.vr[0] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        t.gpr[9] = 0x4003_u64;
+        // stvx128 v0,r0,r9: EA aligns 0x4003 down to 0x4000.
+        let stvx = (4u32 << 26) | (9 << 11) | 0x1C0 | 0x3;
+        run_word(stvx, &mut t, &mut m);
+        assert_eq!(
+            m.read_bytes(0x4000, 16).unwrap(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        // lvx128 v3,r0,r9 loads it back (VD=3).
+        t.vr[3] = [0u8; 16];
+        let lvx = (4u32 << 26) | (3 << 21) | (9 << 11) | 0x0C0 | 3;
+        assert!(matches!(
+            decode(lvx).unwrap(),
+            Decoded::Lvx128 { vd: 3, .. }
+        ));
+        run_word(lvx, &mut t, &mut m);
+        assert_eq!(
+            t.vr[3],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        // 7-bit VD: bits 2-3 extend the index (v64 here).
+        let hi = (4u32 << 26) | (9 << 11) | 0x0C0 | (2 << 2) | 3;
+        assert!(matches!(
+            decode(hi).unwrap(),
+            Decoded::Lvx128 { vd: 64, .. }
+        ));
+    }
+
+    #[test]
+    fn vector_indexed_partial_family() {
+        // Retail dash fault word: stvrx r0,r10,r11 -> 0x7C0A5D4E.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x7C0A_5D4E).unwrap(),
+            Decoded::Stvrx {
+                rs: 0,
+                ra: 10,
+                rb: 11
+            }
+        ));
+        // Quad [0x5000..0x5010) = 0..15; EA 0x5003 (o=3).
+        m.write_bytes(
+            0x5000,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        )
+        .unwrap();
+        t.gpr[10] = 0x5000_u64;
+        t.gpr[11] = 0x3_u64;
+        // lvlx loads the tail low-placed, rest zero.
+        run_word(xform(2, 10, 11, 519, 0), &mut t, &mut m);
+        assert_eq!(
+            t.vr[2],
+            [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 0, 0]
+        );
+        // lvrx loads the head high-placed, rest zero.
+        run_word(xform(3, 10, 11, 551, 0), &mut t, &mut m);
+        assert_eq!(t.vr[3], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]);
+        // Roundtrip: stvlx stores low bytes to the tail.
+        t.vr[4] = [30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 0, 0, 0];
+        run_word(xform(4, 10, 11, 647, 0), &mut t, &mut m);
+        assert_eq!(
+            m.read_bytes(0x5000, 16).unwrap(),
+            &[0, 1, 2, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
+        );
+        // stvrx stores high bytes to the head.
+        t.vr[5] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 51, 52];
+        run_word(xform(5, 10, 11, 679, 0), &mut t, &mut m);
+        assert_eq!(
+            m.read_bytes(0x5000, 16).unwrap(),
+            &[50, 51, 52, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42]
+        );
+        // Aligned edges: lvlx full, lvrx zero, stvlx full, stvrx no-op.
+        t.gpr[11] = 0x0_u64;
+        run_word(xform(6, 10, 11, 519, 0), &mut t, &mut m);
+        assert_eq!(
+            m.read_bytes(0x5000, 16).unwrap(),
+            &t.vr[6][..],
+            "aligned lvlx equals the quad"
+        );
+        run_word(xform(7, 10, 11, 551, 0), &mut t, &mut m);
+        assert_eq!(t.vr[7], [0u8; 16]);
+        let before = m.read_bytes(0x5000, 16).unwrap().to_vec();
+        run_word(xform(7, 10, 11, 679, 0), &mut t, &mut m);
+        assert_eq!(m.read_bytes(0x5000, 16).unwrap(), &before[..]);
+        // lvx/stvx aligned roundtrip (primary 31).
+        t.vr[8] = [9u8; 16];
+        run_word(xform(8, 10, 11, 231, 0), &mut t, &mut m);
+        t.vr[8] = [0u8; 16];
+        run_word(xform(8, 10, 11, 103, 0), &mut t, &mut m);
+        assert_eq!(t.vr[8], [9u8; 16]);
+        // Element ops: single byte/half/word with zero fill.
+        m.write_bytes(0x5010, &[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+        t.gpr[10] = 0x5010_u64;
+        run_word(xform(9, 10, 11, 7, 0), &mut t, &mut m); // lvebx
+        assert_eq!(t.vr[9][0], 0xAA);
+        assert!(t.vr[9][1..].iter().all(|&b| b == 0));
+        run_word(xform(9, 10, 11, 135, 0), &mut t, &mut m); // stvebx
+        assert_eq!(m.read_u8(0x5010).unwrap(), 0xAA);
+        t.vr[10] = [0u8; 16];
+        t.vr[10][0] = 0x11;
+        t.vr[10][1] = 0x22;
+        run_word(xform(10, 10, 11, 167, 0), &mut t, &mut m); // stvehx
+        assert_eq!(m.read_bytes(0x5010, 2).unwrap(), &[0x11, 0x22]);
+        run_word(xform(11, 10, 11, 39, 0), &mut t, &mut m); // lvehx
+        assert_eq!(&t.vr[11][0..2], &[0x11, 0x22]);
+        assert!(t.vr[11][2..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn vspltisb_splats_retail_word() {
+        // Retail dash word: vspltisb v0,4 -> 0x1004030C.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x1004_030C).unwrap(),
+            Decoded::Vspltisb { vd: 0, simm: 4 }
+        ));
+        run_word(0x1004_030C, &mut t, &mut m);
+        assert_eq!(t.vr[0], [4u8; 16]);
+        // Negative immediate sign-extends from 5 bits (0x1F -> 0xFF).
+        run_word(0x1004_030C | (0x1F << 16), &mut t, &mut m);
+        assert_eq!(t.vr[0], [0xFFu8; 16]);
+        // Zero immediate zeroes the register.
+        t.vr[1] = [0xAAu8; 16];
+        run_word(0x1020_030C, &mut t, &mut m); // vspltisb v1,0
+        assert_eq!(t.vr[1], [0u8; 16]);
+        // Other primary-4 words stay tracked-unsupported.
+        assert!(matches!(decode(0x1000_0083).unwrap(), Decoded::Vmx { .. }));
+    }
+
+    #[test]
+    fn vspltish_isw_splat_retail_words() {
+        // Retail dash word: vspltish v0,0 -> 0x1000034C (zeroes).
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x1000_034C).unwrap(),
+            Decoded::Vspltish { vd: 0, simm: 0 }
+        ));
+        t.vr[0] = [0xAAu8; 16];
+        run_word(0x1000_034C, &mut t, &mut m);
+        assert_eq!(t.vr[0], [0u8; 16]);
+        // vspltish v1,0x1F: sign-extended 0xFFFF as halfwords.
+        let w = (4u32 << 26) | (1 << 21) | (0x1F << 16) | 0x34C;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.vr[1], [0xFFu8; 16]);
+        // vspltish v2,1: 0x0001 repeated.
+        let w2 = (4u32 << 26) | (2 << 21) | (1 << 16) | 0x34C;
+        run_word(w2, &mut t, &mut m);
+        assert_eq!(t.vr[2], [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        // vspltisw v3,0x1F: 0xFFFFFFFF as words.
+        let w3 = (4u32 << 26) | (3 << 21) | (0x1F << 16) | 0x38C;
+        assert!(matches!(
+            decode(w3).unwrap(),
+            Decoded::Vspltisw { vd: 3, simm: 0x1F }
+        ));
+        run_word(w3, &mut t, &mut m);
+        assert_eq!(t.vr[3], [0xFFu8; 16]);
+        // vspltisw v4,2: 0x00000002 repeated.
+        let w4 = (4u32 << 26) | (4 << 21) | (2 << 16) | 0x38C;
+        run_word(w4, &mut t, &mut m);
+        assert_eq!(t.vr[4], [0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 2]);
+    }
+
+    #[test]
+    fn vperm128_selects_concat_retail_word() {
+        // Retail dash word: vperm128 v63,v63,v62,v0 -> 0x17FFF025.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x17FF_F025).unwrap(),
+            Decoded::Vperm128 {
+                vd: 63,
+                va: 63,
+                vb: 62,
+                vc: 0
+            }
+        ));
+        // Other primary-5 arithmetic (e.g. vaddfp128) stays tracked.
+        assert!(matches!(decode(0x1400_0010).unwrap(), Decoded::Vmx { .. }));
+        // Classic vperm/vsel share the select core on v0-v31.
+        assert!(matches!(
+            decode(0x1021_102B).unwrap(),
+            Decoded::Vperm {
+                vd: 1,
+                va: 1,
+                vb: 2,
+                vc: 0
+            }
+        ));
+        t.vr[63] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        t.vr[62] = [
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ];
+        // Control: low half from VA, high half from VB.
+        t.vr[0] = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23];
+        run_word(0x17FF_F025, &mut t, &mut m);
+        assert_eq!(
+            t.vr[63],
+            [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23]
+        );
+        // Classic composition: lvsl control rotates the quad.
+        t.gpr[4] = 0x4003_u64;
+        run_word(0x7C00_200C, &mut t, &mut m); // lvsl v0,r0,r4 (o=3)
+        m.write_bytes(
+            0x4000,
+            &[
+                10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+            ],
+        )
+        .unwrap();
+        run_word(0x13E0_20C7, &mut t, &mut m); // lvx128 v63,r0,r4
+        run_word(0x17FF_F025, &mut t, &mut m); // vperm128 v63,v63,v62,v0
+        assert_eq!(
+            t.vr[63],
+            [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 16, 17, 18]
+        );
+    }
+
+    #[test]
+    fn vperm_vsel_classic_retail_word() {
+        // Retail dash word: vperm v1,v1,v2,v0 -> 0x1021102B.
+        let (mut t, mut m) = setup();
+        t.vr[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        t.vr[2] = [16u8; 16];
+        t.vr[0] = [8u8; 16]; // select VA[8]
+        run_word(0x1021_102B, &mut t, &mut m);
+        assert_eq!(t.vr[1], [8u8; 16]);
+        // vsel: per-bit mask (VC=0xF0 picks nibbles from each side).
+        let vsel = (4u32 << 26) | (5 << 21) | (6 << 16) | (7 << 11) | (8 << 6) | 0x2A;
+        assert!(matches!(
+            decode(vsel).unwrap(),
+            Decoded::Vsel {
+                vd: 5,
+                va: 6,
+                vb: 7,
+                vc: 8
+            }
+        ));
+        t.vr[6] = [0xFFu8; 16];
+        t.vr[7] = [0x00u8; 16];
+        t.vr[8] = [0xF0u8; 16];
+        run_word(vsel, &mut t, &mut m);
+        assert_eq!(t.vr[5], [0x0Fu8; 16]);
+        t.vr[8] = [0x0Fu8; 16];
+        run_word(vsel, &mut t, &mut m);
+        assert_eq!(t.vr[5], [0xF0u8; 16]);
     }
 
     #[test]
@@ -3110,12 +3862,43 @@ mod tests {
     }
 
     #[test]
-    fn cmp_l64_is_explicit() {
+    fn cmp_l64_compares_full_width() {
         let (mut t, mut m) = setup();
-        // cmpli with L=1 (bit 21).
-        let w = (10u32 << 26) | (1 << 21) | (3 << 16) | 5;
-        let d = decode(w).unwrap();
-        assert!(execute(d, w, &mut t, &mut m).is_err());
+        // Retail dash word: cmpli cr?,r?,0 with L=1 -> 0x2B2A0000.
+        let d = decode(0x2B2A_0000).unwrap();
+        assert!(matches!(
+            decode(0x2B2A_0000).unwrap(),
+            Decoded::Cmpli { l: true, .. }
+        ));
+        // cmpli L=1: full 64-bit unsigned vs zero-extended uimm.
+        t.gpr[10] = 0x1_0000_0001_u64;
+        let w = (10u32 << 26) | (1 << 21) | (10 << 16) | 1;
+        run_word(w, &mut t, &mut m); // cmpli cr0,r10,1 (L=1)
+        assert_eq!(t.cr.field(0), 0b0100); // GT
+        t.gpr[10] = 1_u64;
+        run_word(w, &mut t, &mut m);
+        assert_eq!(t.cr.field(0), 0b0010); // EQ
+                                           // High half decides: low-half-equal values differ in 64 bits.
+        t.gpr[9] = 0x1_0000_0005_u64;
+        t.gpr[11] = 0x0000_0005_u64;
+        let _ = d;
+        // cmpd cr6,r9,r11 (X-form L=1: RT=(6<<2)|1=25).
+        let cmpd = (31u32 << 26) | (25 << 21) | (9 << 16) | (11 << 11);
+        assert!(matches!(
+            decode(cmpd).unwrap(),
+            Decoded::Cmp { bf: 6, l: true, .. }
+        ));
+        run_word(cmpd, &mut t, &mut m);
+        assert_eq!(t.cr.field(6), 0b0100); // GT in 64 bits, EQ in 32
+                                           // cmpld equal in 64 bits.
+        let cmpld = (31u32 << 26) | (25 << 21) | (9 << 16) | (9 << 11) | (32 << 1);
+        run_word(cmpld, &mut t, &mut m);
+        assert_eq!(t.cr.field(6), 0b0010);
+        // cmpi L=1 sign-extends the immediate to 64.
+        t.gpr[12] = 0xFFFF_FFFF_FFFF_FFFF_u64; // -1
+        let cmpi = (11u32 << 26) | (1 << 21) | (12 << 16) | 0xFFFF;
+        run_word(cmpi, &mut t, &mut m); // cmpi cr0,r12,-1 (L=1)
+        assert_eq!(t.cr.field(0), 0b0010);
     }
 
     #[test]
@@ -3454,6 +4237,46 @@ mod tests {
         assert_eq!((t.gpr[4] as u32), 0);
         assert!(!t.xer.ca());
         assert_eq!(t.cr.field(0), 0b0010);
+    }
+
+    #[test]
+    fn sradix_retail_word() {
+        // Retail dash word: sradix r11,r11,1 -> 0x7D6B0E74.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x7D6B_0E74).unwrap(),
+            Decoded::Sradix {
+                rs: 11,
+                ra: 11,
+                sh: 1,
+                rc: false
+            }
+        ));
+        t.gpr[11] = 0x8000_0000_0000_0001;
+        run_word(0x7D6B_0E74, &mut t, &mut m);
+        assert_eq!(t.gpr[11], 0xC000_0000_0000_0000);
+        assert!(t.xer.ca()); // sign set, shifted-out 1
+                             // Zero count copies and clears CA.
+        let z = (31u32 << 26) | (11 << 21) | (11 << 16) | (826 << 1);
+        t.gpr[11] = 0x8000_0000_0000_0001;
+        t.xer.set_ca(true);
+        run_word(z, &mut t, &mut m);
+        assert_eq!(t.gpr[11], 0x8000_0000_0000_0001);
+        assert!(!t.xer.ca());
+        // Positive value: shifted-out bits never set CA.
+        t.gpr[11] = 0x0000_0000_0000_0003;
+        run_word(0x7D6B_0E74, &mut t, &mut m);
+        assert_eq!(t.gpr[11], 1);
+        assert!(!t.xer.ca());
+        // SH5 extends the count (n=32): word bit 1 set.
+        let hi = (31u32 << 26) | (11 << 21) | (11 << 16) | (826 << 1) | 2;
+        assert!(matches!(
+            decode(hi).unwrap(),
+            Decoded::Sradix { sh: 32, .. }
+        ));
+        t.gpr[11] = 0xFFFF_FFFF_0000_0000;
+        run_word(hi, &mut t, &mut m);
+        assert_eq!(t.gpr[11], 0xFFFF_FFFF_FFFF_FFFF);
     }
 
     // --- subfic / cntlzw verification ---
