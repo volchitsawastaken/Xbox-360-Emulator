@@ -119,21 +119,33 @@ Terminal states only: impossible, done, or something rendering.
 
 ## Active
 
-- [ ] Retail frontier (STFS-backed boot): wild virtual call at
-      `0x821503A4` (`bctr` to `0x67735C65` = path-tail bytes). Object
-      at `0x010338F0` is a FRESH 52-byte alloc (`addi r3,0,52` +
-      `new` at `0x820E8330`, ctor at `0x82150150` zeroes +0..+12);
-      full lifecycle traced: path stb-built into the block, ctor
-      zeroes +0..+12, method runs 430K steps, calls stale +16.
-      No `stw` to +16 exists in method/ctor/callees (whole-run watch:
-      +16 only ever held string bytes) — the object is never
-      C++-constructed, so the divergence is the CALLER passing a raw
-      buffer (uninitialized/wrong pointer), not a skipped store.
-      Guard decoded (`bc` bo=4 = branch-if-false: proceed iff
-      `r3&0xFF==0`; r3=0x10000 proceeds correctly). Still open:
-      which caller input (catalog bytes vs import output) selects the
-      wrong pointer — candidate: first-vcall r3=0x10000; needs
-      callee-side store search or trace-diff harness
+- [ ] Retail frontier (STFS-backed boot): ROOT CAUSE FOUND — the game
+      takes its graphics-failure path ("Unable to initialize graphics,
+      for an unknown reason. To fix this problem, you could try
+      downloading the newest version of DirectX...", formatted at
+      steps ~452K/474K via `0x82155B58` into buffers `0x01054C70` /
+      `0x010302D0`). The factory object at `0x010434B0` keeps +120
+      (device) virgin-NULL for the whole run (polling watch: zero
+      writes): guest device creation (347K-step vcall at `0x82149900`
+      returning `0x10000`) never produces a device without a real GPU.
+      Both wild faults are downstream of the failure path, not heap
+      corruption: (1) `bctr` at `0x821503A4` to `0x67735C65` reads
+      `+16` of the fresh 52-byte object `0x010338F0` — a
+      device-dependent slot the failed init never fills (ctor only
+      zeroes +0..+12; polling watch proves no writer); skip-hack to a
+      `blr` proves the slot is call-then-ignore. (2) With (1) skipped,
+      boot advances into the game's error formatter, whose 512-byte
+      message legitimately targets game-heap buffer `0x010302D0` but
+      that buffer was carved from the 1MB arena overlapping the live
+      intrusive node table at `0x01030000` (slots init to self at step
+      ~636, clobbered from step 476876) — so the later table walk at
+      `0x8236BC18` reads message text ("em, you...") as nodes.
+      NEXT: make device creation succeed — implement Vd ring-buffer
+      shims with real guest-struct init per reference
+      (`VdInitializeRingBuffer`, `VdEnableRingBufferRPtrWriteBack`,
+      `VdSetSystemCommandBufferGpuIdentifierAddress`: base/size/put
+      pointers the 347K-step init actually consumes), then a minimal
+      ring pump; re-run and confirm the failure path is no longer taken
 - [ ] Dash frontier (HostDirFs boot): 63 imports to an entry-table
       walk at `0x921B86BC` (`lwz r8,896(r11)`, r11=0x603400A2 from
       version-string bytes). Walk runs 65537 iterations by
@@ -147,9 +159,11 @@ Terminal states only: impossible, done, or something rendering.
 
 ## Next (retail-driven, in expected order)
 
-- [ ] VMX128 FP arithmetic (`vaddfp`, `vmulfp`, `vperm`-style float);
-      trace-diff harness for the two table-walk frontiers
-- [ ] Kernel shims on demand (GPU ring pump, file data, content)
+- [ ] Vd ring-buffer shims with real guest-struct init (reference
+      `xboxkrnl_video.cc` facts) + minimal ring pump; goal: Braid
+      no longer formats "Unable to initialize graphics"
+- [ ] VMX128 FP arithmetic (`vaddfp`, `vmulfp`, float permutes)
+- [ ] Kernel shims on demand (file data, content)
 - [ ] Commit + push; update PORTING.md / COMPATIBILITY.md
 
 ## Later roadmap
