@@ -3,6 +3,15 @@
 Statuses: done (verified), active (in progress), next (queued), later.
 Terminal states only: impossible, done, or something rendering.
 
+## Entire Xbox 360 emulation total: ~5 out of 100%
+
+100% = running ANY game released for the Xbox 360. Honest breakdown:
+- CPU interpreter (integer+FPU, no JIT) 40% · VMX128 0% · MMU/paging 0%
+- Kernel (of ~300+ used imports across xboxkrnl/xam) ~15%
+- GPU (shaders/eDRAM/draw path) 3% · audio 5% · input 0% · storage/saves 40%
+- Scheduler 15% · networking 10% · frontend 35% · per-game compat work 2%
+- One 2D XBLA title (Braid) booting into init; zero titles rendering
+
 ## Done (verified by tests and/or retail runs)
 
 - [x] Workspace (12 crates), PPC interpreter core, 512MB mirrored memory
@@ -46,12 +55,36 @@ Terminal states only: impossible, done, or something rendering.
 - [x] Retail Braid boots 8M steps fault-free into file I/O
       (`NtCreateFile` next): WSAStartup, semaphore, thread create +
       ObReference + affinity, game region, XConfig language served
+- [x] File I/O shims on the read-only STFS backend: `NtCreateFile`/
+      `NtOpenFile` (OBJECT_ATTRIBUTES + ANSI path normalize, disposition
+      table, ACCESS_DENIED on write intents), `NtReadFile` (offset/pos
+      windows, IOSB, PENDING for async opens, EOF), `NtClose`,
+      `NtQueryInformationFile` (Internal/Position/NetworkOpen sizes);
+      `StfsFs` lazy backend; gate now 2M steps fault-free, 26 imports
+- [x] CPU indexed-dword family: `ldx`/`ldux`/`stdx`/`stdux`
+      (XOs 21/53/149/181); FP A-form fix (real 5-bit XO, nonzero FRC
+      decodes — retail `fmuls` word 0xEC200732); dword shifts
+      (`sldx`/`srdx`/`sradx` + CA), `mfmsr`/`mtmsr`/`mtmsrd` (masked EE),
+      `stfiwx` (983) / `lfiwax` (855) XO corrections
+- [x] Guest MMIO window per reference map: `0x7FC80000` (3.5MB real
+      backing, game programs GPU ring registers there) + `0x7F000000`
+      writeback/XPS window (12.5MB zeroed); EXEC denied in both
+- [x] Kernel: KeEnter/LeaveCriticalRegion nesting, video-init batch
+      (VdInitializeEngines, VdCallGraphicsNotificationRoutines=0,
+      VdGetCurrentDisplayGamma TV+2.22222233, VdRetrainEDRAM(Worker)=0,
+      VdIsHSIOTrainingSucceeded, VdSetDisplayMode, 1280x720 query,
+      AsicID 0x11), MmGetPhysicalAddress, KiApcNormalRoutineNop,
+      RtlNtStatusToDosError (reference table, PATH_NOT_FOUND->3)
 
 ## Active
 
-- [ ] Filesystem frontier: `NtCreateFile` (0xD2) hit at 8M steps
-      (game opens its first file). Next: file I/O shims mapped onto
-      the STFS package / content subsystem
+- [ ] Retail frontier (STFS-backed boot): wild virtual call at
+      `0x821503A4` (`bctr` to `0x67735C65` = path-tail bytes). Object
+      at `0x010338F0` reuses a path-string buffer; ctor zeroes +0..+12
+      but never sets the +16 vtable slot the method reads. Heap-layout
+      divergence under investigation (game-private heap inside the
+      1MB `0x01030000` arena); all ISA/import faults to this point
+      are cleared
 
 ## Next (retail-driven, in expected order)
 

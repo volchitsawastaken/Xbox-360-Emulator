@@ -420,6 +420,52 @@ pub enum Decoded {
         ra: u32,
         rb: u32,
     },
+    // Indexed floating loads/stores (primary 31): single forms
+    // convert to/from double like their D-form siblings; double
+    // forms move 8 bytes; `*u` forms write EA back to RA (ra=0 is
+    // ISA-invalid, explicit error). XOs: lfsx=535, lfsux=567,
+    // lfdx=599, lfdux=631, stfsx=663, stfsux=695, stfdx=727,
+    // stfdux=759 (reference `ppc_opcode_table_gen.cc` bases).
+    Lfsx {
+        frt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lfsux {
+        frt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lfdx {
+        frt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Lfdux {
+        frt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stfsx {
+        frs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stfsux {
+        frs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stfdx {
+        frs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stfdux {
+        frs: u32,
+        ra: u32,
+        rb: u32,
+    },
     // 64-bit rotates (MDS-form, primary 30). `mb` is the raw 6-bit
     // mask-begin/end field; rotates feed shifts, extracts, and
     // bitfield inserts. XO: rldicl=0, rldicr=1, rldic=2, rldimi=3.
@@ -746,6 +792,28 @@ pub enum Decoded {
         ra: u32,
         rb: u32,
     },
+    // X-form doubleword indexed (ldx=21, ldux=53, stdx=149,
+    // stdux=181; reference opcode-table bases).
+    Ldx {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Ldux {
+        rt: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stdx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
+    Stdux {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+    },
     Lwarx {
         rt: u32,
         ra: u32,
@@ -824,6 +892,27 @@ pub enum Decoded {
         rb: u32,
         rc: bool,
     },
+    // 64-bit shifts (reference `ppc_emit_alu.cc` sldx/srdx/sradx):
+    // 7-bit shift counts, >=64 yields 0 (sradx: sign fill + CA).
+    // XOs: sldx=27, srdx=539, sradx=794.
+    Sldx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+    },
+    Srdx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+    },
+    Sradx {
+        rs: u32,
+        ra: u32,
+        rb: u32,
+        rc: bool,
+    },
     Srawi {
         rs: u32,
         ra: u32,
@@ -833,6 +922,19 @@ pub enum Decoded {
     // SPR moves
     Mfcr {
         rt: u32,
+    },
+    // MSR moves (XO 83/146): stored per-thread, no interrupt model.
+    Mfmsr {
+        rt: u32,
+    },
+    Mtmsr {
+        rs: u32,
+    },
+    // mtmsrd (XO 178): masked MSR write (reference only commits
+    // EE, i.e. value bit 0x8000, preserving the rest).
+    Mtmsrd {
+        rs: u32,
+        l: u32,
     },
     Mtcrf {
         rs: u32,
@@ -1165,7 +1267,9 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 4 => Ok(Decoded::Tw { to: rt, ra, rb }),
                 68 => Ok(Decoded::Td { to: rt, ra, rb }),
                 20 => Ok(Decoded::Lwarx { rt, ra, rb }),
+                21 => Ok(Decoded::Ldx { rt, ra, rb }),
                 23 => Ok(Decoded::Lwzx { rt, ra, rb }),
+                53 => Ok(Decoded::Ldux { rt, ra, rb }),
                 28 => Ok(Decoded::And { rs: rt, ra, rb, rc }),
                 60 => Ok(Decoded::Andc { rs: rt, ra, rb, rc }),
                 32 => Ok(Decoded::Cmpl {
@@ -1189,6 +1293,9 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 407 => Ok(Decoded::Sthx { rs: rt, ra, rb }),
                 439 => Ok(Decoded::Sthux { rs: rt, ra, rb }),
                 792 => Ok(Decoded::Sraw { rs: rt, ra, rb, rc }),
+                27 => Ok(Decoded::Sldx { rs: rt, ra, rb, rc }),
+                539 => Ok(Decoded::Srdx { rs: rt, ra, rb, rc }),
+                794 => Ok(Decoded::Sradx { rs: rt, ra, rb, rc }),
                 824 => Ok(Decoded::Srawi {
                     rs: rt,
                     ra,
@@ -1201,7 +1308,15 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 }),
                 150 => Ok(Decoded::Stwcx { rs: rt, ra, rb }),
                 151 => Ok(Decoded::Stwx { rs: rt, ra, rb }),
+                149 => Ok(Decoded::Stdx { rs: rt, ra, rb }),
+                181 => Ok(Decoded::Stdux { rs: rt, ra, rb }),
                 19 => Ok(Decoded::Mfcr { rt }),
+                83 => Ok(Decoded::Mfmsr { rt }),
+                146 => Ok(Decoded::Mtmsr { rs: rt }),
+                178 => Ok(Decoded::Mtmsrd {
+                    rs: rt,
+                    l: (rb >> 4) & 1,
+                }),
                 24 => Ok(Decoded::Slw { rs: rt, ra, rb, rc }),
                 26 => Ok(Decoded::Cntlzw { rs: rt, ra, rc }),
                 58 => Ok(Decoded::Cntlzd { rs: rt, ra, rc }),
@@ -1257,8 +1372,16 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 922 => Ok(Decoded::Extsh { rs: rt, ra, rc }),
                 954 => Ok(Decoded::Extsb { rs: rt, ra, rc }),
                 986 => Ok(Decoded::Extsw { rs: rt, ra, rc }),
-                659 => Ok(Decoded::Stfiwx { frs: rt, ra, rb }),
-                769 => Ok(Decoded::Lfiwax { frt: rt, ra, rb }),
+                983 => Ok(Decoded::Stfiwx { frs: rt, ra, rb }),
+                855 => Ok(Decoded::Lfiwax { frt: rt, ra, rb }),
+                535 => Ok(Decoded::Lfsx { frt: rt, ra, rb }),
+                567 => Ok(Decoded::Lfsux { frt: rt, ra, rb }),
+                599 => Ok(Decoded::Lfdx { frt: rt, ra, rb }),
+                631 => Ok(Decoded::Lfdux { frt: rt, ra, rb }),
+                663 => Ok(Decoded::Stfsx { frs: rt, ra, rb }),
+                695 => Ok(Decoded::Stfsux { frs: rt, ra, rb }),
+                727 => Ok(Decoded::Stfdx { frs: rt, ra, rb }),
+                759 => Ok(Decoded::Stfdux { frs: rt, ra, rb }),
                 _ => Ok(Decoded::Unsupported {
                     opc,
                     word,
@@ -1389,80 +1512,86 @@ pub fn decode(word: u32) -> Result<Decoded> {
         // Single-precision arithmetic (primary 59): same XO layout
         // as the double side, result rounded to f32.
         59 => {
+            // Single-precision: A-form ops carry FRC in the top 5
+            // bits of the 10-bit XO field, so match X-form (full
+            // 10-bit) first, then A-form on the low 5 bits.
             let xo = (word >> 1) & 0x3FF;
+            let xo5 = xo & 0x1F;
             let rc = word & 1 != 0;
             let frc = (word >> 6) & 0x1F;
             match xo {
-                18 => Ok(Decoded::Fdiv {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    rc,
-                    single: true,
-                }),
-                20 => Ok(Decoded::Fsub {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    rc,
-                    single: true,
-                }),
-                21 => Ok(Decoded::Fadd {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    rc,
-                    single: true,
-                }),
-                22 => Ok(Decoded::Fsqrt {
-                    frt: rt,
-                    frb: rb,
-                    rc,
-                    single: true,
-                }),
                 24 => Ok(Decoded::Fres {
                     frt: rt,
                     frb: rb,
                     rc,
                 }),
-                25 => Ok(Decoded::Fmul {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    rc,
-                    single: true,
-                }),
-                28 => Ok(Decoded::Fmsub {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    frc,
-                    rc,
-                    single: true,
-                }),
-                29 => Ok(Decoded::Fmadd {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    frc,
-                    rc,
-                    single: true,
-                }),
-                30 => Ok(Decoded::Fnmsub {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    frc,
-                    rc,
-                    single: true,
-                }),
-                31 => Ok(Decoded::Fnmadd {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    frc,
-                    rc,
-                    single: true,
+                _ if matches!(xo5, 18 | 20 | 21 | 22 | 25 | 28 | 29 | 30 | 31) => Ok(match xo5 {
+                    18 => Decoded::Fdiv {
+                        frt: rt,
+                        fra: ra,
+                        frb: rb,
+                        rc,
+                        single: true,
+                    },
+                    20 => Decoded::Fsub {
+                        frt: rt,
+                        fra: ra,
+                        frb: rb,
+                        rc,
+                        single: true,
+                    },
+                    21 => Decoded::Fadd {
+                        frt: rt,
+                        fra: ra,
+                        frb: rb,
+                        rc,
+                        single: true,
+                    },
+                    22 => Decoded::Fsqrt {
+                        frt: rt,
+                        frb: rb,
+                        rc,
+                        single: true,
+                    },
+                    25 => Decoded::Fmul {
+                        frt: rt,
+                        fra: ra,
+                        frb: rb,
+                        rc,
+                        single: true,
+                    },
+                    28 => Decoded::Fmsub {
+                        frt: rt,
+                        fra: ra,
+                        frb: rb,
+                        frc,
+                        rc,
+                        single: true,
+                    },
+                    29 => Decoded::Fmadd {
+                        frt: rt,
+                        fra: ra,
+                        frb: rb,
+                        frc,
+                        rc,
+                        single: true,
+                    },
+                    30 => Decoded::Fnmsub {
+                        frt: rt,
+                        fra: ra,
+                        frb: rb,
+                        frc,
+                        rc,
+                        single: true,
+                    },
+                    _ => Decoded::Fnmadd {
+                        frt: rt,
+                        fra: ra,
+                        frb: rb,
+                        frc,
+                        rc,
+                        single: true,
+                    },
                 }),
                 _ => Ok(Decoded::Unsupported {
                     opc,
@@ -1497,61 +1626,53 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     frb: rb,
                     rc,
                 }),
-                18 => Ok(Decoded::Fdiv {
+                x if x & 31 == 18 => Ok(Decoded::Fdiv {
                     frt: rt,
                     fra: ra,
                     frb: rb,
                     rc,
                     single: false,
                 }),
-                20 => Ok(Decoded::Fsub {
+                x if x & 31 == 20 => Ok(Decoded::Fsub {
                     frt: rt,
                     fra: ra,
                     frb: rb,
                     rc,
                     single: false,
                 }),
-                21 => Ok(Decoded::Fadd {
+                x if x & 31 == 21 => Ok(Decoded::Fadd {
                     frt: rt,
                     fra: ra,
                     frb: rb,
                     rc,
                     single: false,
                 }),
-                22 => Ok(Decoded::Fsqrt {
+                x if x & 31 == 22 => Ok(Decoded::Fsqrt {
                     frt: rt,
                     frb: rb,
                     rc,
                     single: false,
                 }),
-                23 => Ok(Decoded::Fsel {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    frc,
-                    rc,
-                }),
-                25 => Ok(Decoded::Fmul {
-                    frt: rt,
-                    fra: ra,
-                    frb: rb,
-                    rc,
-                    single: false,
-                }),
-                26 => Ok(Decoded::Frsqrte {
-                    frt: rt,
-                    frb: rb,
-                    rc,
-                }),
-                28 => Ok(Decoded::Fmsub {
+                x if x & 31 == 23 => Ok(Decoded::Fsel {
                     frt: rt,
                     fra: ra,
                     frb: rb,
                     frc,
                     rc,
+                }),
+                x if x & 31 == 25 => Ok(Decoded::Fmul {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    rc,
                     single: false,
                 }),
-                29 => Ok(Decoded::Fmadd {
+                x if x & 31 == 26 => Ok(Decoded::Frsqrte {
+                    frt: rt,
+                    frb: rb,
+                    rc,
+                }),
+                x if x & 31 == 28 => Ok(Decoded::Fmsub {
                     frt: rt,
                     fra: ra,
                     frb: rb,
@@ -1559,7 +1680,7 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     rc,
                     single: false,
                 }),
-                30 => Ok(Decoded::Fnmsub {
+                x if x & 31 == 29 => Ok(Decoded::Fmadd {
                     frt: rt,
                     fra: ra,
                     frb: rb,
@@ -1567,7 +1688,15 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     rc,
                     single: false,
                 }),
-                31 => Ok(Decoded::Fnmadd {
+                x if x & 31 == 30 => Ok(Decoded::Fnmsub {
+                    frt: rt,
+                    fra: ra,
+                    frb: rb,
+                    frc,
+                    rc,
+                    single: false,
+                }),
+                x if x & 31 == 31 => Ok(Decoded::Fnmadd {
                     frt: rt,
                     fra: ra,
                     frb: rb,

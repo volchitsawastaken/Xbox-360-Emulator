@@ -812,6 +812,90 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Lfsx { frt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let b = mem.read_bytes(ea, 4)?;
+            t.fpr[frt as usize] = f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lfsux { frt, ra, rb } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "lfsux with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            let b = mem.read_bytes(ea, 4)?;
+            t.fpr[frt as usize] = f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64;
+            t.gpr[ra as usize] = ea as u64;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lfdx { frt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let b = mem.read_bytes(ea, 8)?;
+            t.fpr[frt as usize] =
+                f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Lfdux { frt, ra, rb } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "lfdux with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            let b = mem.read_bytes(ea, 8)?;
+            t.fpr[frt as usize] =
+                f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+            t.gpr[ra as usize] = ea as u64;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stfsx { frs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            let v = t.fpr[frs as usize] as f32;
+            mem.write_bytes(ea, &v.to_be_bytes())?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stfsux { frs, ra, rb } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "stfsux with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            let v = t.fpr[frs as usize] as f32;
+            mem.write_bytes(ea, &v.to_be_bytes())?;
+            t.gpr[ra as usize] = ea as u64;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stfdx { frs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            mem.write_bytes(ea, &t.fpr[frs as usize].to_be_bytes())?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stfdux { frs, ra, rb } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "stfdux with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            mem.write_bytes(ea, &t.fpr[frs as usize].to_be_bytes())?;
+            t.gpr[ra as usize] = ea as u64;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Fadd {
             frt,
             fra,
@@ -1644,6 +1728,49 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Sldx { rs, ra, rb, rc } => {
+            let sh = (t.gpr[rb as usize] & 0x7F) as u32;
+            let v = if sh >= 64 {
+                0
+            } else {
+                t.gpr[rs as usize] << sh
+            };
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Srdx { rs, ra, rb, rc } => {
+            let sh = (t.gpr[rb as usize] & 0x7F) as u32;
+            let v = if sh >= 64 {
+                0
+            } else {
+                t.gpr[rs as usize] >> sh
+            };
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Sradx { rs, ra, rb, rc } => {
+            let rt = t.gpr[rs as usize];
+            let sh = (t.gpr[rb as usize] & 0x7F) as u32;
+            let clamp = sh.min(63);
+            let v = ((rt as i64) >> clamp) as u64;
+            // CA = sign & ((v << clamp) != rt) (reference sradx).
+            let ca = (rt >> 63) == 1 && (v.wrapping_shl(clamp) != rt);
+            t.xer.set_ca(ca);
+            t.gpr[ra as usize] = v;
+            if rc {
+                update_cr0_64(t, v);
+            }
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Srawi { rs, ra, sh, rc } => {
             let (v, ca) = sraw_core(t.gpr[rs as usize] as u32, sh & 0x1F);
             t.xer.set_ca(ca);
@@ -1657,6 +1784,44 @@ pub fn execute(
         Decoded::Lwzx { rt, ra, rb } => {
             let ea = ea_idx(ra, rb, t);
             t.gpr[rt as usize] = (mem.read_u32(ea)?) as u64;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Ldx { rt, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            t.gpr[rt as usize] = mem.read_u64(ea)?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Ldux { rt, ra, rb } => {
+            if ra == 0 || ra == rt {
+                return Err(EmuError::Unsupported(format!(
+                    "ldux with ra=0 or ra=rt word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            t.gpr[rt as usize] = mem.read_u64(ea)?;
+            t.gpr[ra as usize] = (ea) as u64;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stdx { rs, ra, rb } => {
+            let ea = ea_idx(ra, rb, t);
+            mem.write_u64(ea, t.gpr[rs as usize])?;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Stdux { rs, ra, rb } => {
+            if ra == 0 {
+                return Err(EmuError::Unsupported(format!(
+                    "stdux with ra=0 word={:08x} pc={:08x}",
+                    word, t.pc
+                )));
+            }
+            let ea = ea_idx(ra, rb, t);
+            mem.write_u64(ea, t.gpr[rs as usize])?;
+            t.gpr[ra as usize] = (ea) as u64;
             t.pc = next;
             Ok(None)
         }
@@ -1801,6 +1966,23 @@ pub fn execute(
         }
         Decoded::Mfcr { rt } => {
             t.gpr[rt as usize] = (t.cr.0) as u64;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Mfmsr { rt } => {
+            t.gpr[rt as usize] = t.msr;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Mtmsr { rs } => {
+            t.msr = t.gpr[rs as usize];
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Mtmsrd { rs, l: _ } => {
+            // Only EE (value bit 0x8000) commits; the rest is
+            // preserved (reference `InstrEmit_mtmsrd`).
+            t.msr = (t.msr & !0x8000) | (t.gpr[rs as usize] & 0x8000);
             t.pc = next;
             Ok(None)
         }
@@ -2095,6 +2277,97 @@ mod tests {
     }
 
     #[test]
+    fn dword_indexed_roundtrip() {
+        // Retail word: ldx r3,r11,r31 -> 0x7C6BF82A.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x7C6B_F82A).unwrap(),
+            Decoded::Ldx {
+                rt: 3,
+                ra: 11,
+                rb: 31
+            }
+        ));
+        t.gpr[11] = 0x4000_u64;
+        t.gpr[31] = 0x100_u64;
+        m.write_u64(0x4100, 0x1122_3344_5566_7788).unwrap();
+        run_word(0x7C6B_F82A, &mut t, &mut m);
+        assert_eq!(t.gpr[3], 0x1122_3344_5566_7788);
+        // stdx + update forms.
+        run_word(xform(3, 11, 30, 149, 0), &mut t, &mut m); // stdx r3,r11,r30?
+                                                            // (r30 = 0 here, so stores back to 0x4000)
+        assert_eq!(m.read_u64(0x4000).unwrap(), 0x1122_3344_5566_7788);
+        t.gpr[30] = 0x200_u64;
+        run_word(xform(4, 11, 30, 181, 0), &mut t, &mut m); // stdux r4,r11,r30
+        assert_eq!((t.gpr[11] as u32), 0x4200);
+        run_word(xform(5, 11, 30, 53, 0), &mut t, &mut m); // ldux r5,r11,r30
+        assert_eq!((t.gpr[11] as u32), 0x4400);
+        let bad = xform(5, 0, 30, 53, 0);
+        assert!(expect_unsupported(bad, &mut t, &mut m).contains("ldux"));
+    }
+
+    #[test]
+    fn dword_shifts() {
+        // Retail word: srdx r9,r6,r10 -> 0x7D265436.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x7D26_5436).unwrap(),
+            Decoded::Srdx {
+                rs: 9,
+                ra: 6,
+                rb: 10,
+                rc: false
+            }
+        ));
+        t.gpr[9] = 0xFF00_0000_0000_00FF;
+        t.gpr[10] = 8;
+        run_word(0x7D26_5436, &mut t, &mut m);
+        assert_eq!(t.gpr[6], 0x00FF_0000_0000_0000);
+        // Shift >= 64 yields 0.
+        t.gpr[10] = 64;
+        run_word(0x7D26_5436, &mut t, &mut m);
+        assert_eq!(t.gpr[6], 0);
+        // sldx + sradx (sign fill + CA).
+        t.gpr[9] = 1;
+        t.gpr[10] = 63;
+        run_word(xform(9, 6, 10, 27, 0), &mut t, &mut m); // sldx
+        assert_eq!(t.gpr[6], 0x8000_0000_0000_0000);
+        t.gpr[9] = 0x8000_0000_0000_0001;
+        t.gpr[10] = 1;
+        run_word(xform(9, 6, 10, 794, 0), &mut t, &mut m); // sradx
+        assert_eq!(t.gpr[6], 0xC000_0000_0000_0000);
+        assert!(t.xer.ca());
+        t.gpr[10] = 0;
+        run_word(xform(9, 6, 10, 794, 0), &mut t, &mut m);
+        assert_eq!(t.gpr[6], 0x8000_0000_0000_0001);
+        assert!(!t.xer.ca());
+    }
+
+    #[test]
+    fn msr_moves_roundtrip() {
+        // Retail word: mfmsr r9 -> 0x7D2000A6 (XO 83).
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x7D20_00A6).unwrap(),
+            Decoded::Mfmsr { rt: 9 }
+        ));
+        run_word(0x7D20_00A6, &mut t, &mut m);
+        assert_eq!(t.gpr[9], 0);
+        t.gpr[3] = 0x8000;
+        run_word(xform(3, 0, 0, 146, 0), &mut t, &mut m); // mtmsr r3
+        run_word(0x7D20_00A6, &mut t, &mut m);
+        assert_eq!(t.gpr[9], 0x8000);
+        // Retail word: mtmsrd r13,r0 -> 0x7DA10164 (masked EE write).
+        assert!(matches!(
+            decode(0x7DA1_0164).unwrap(),
+            Decoded::Mtmsrd { rs: 13, l: 0 }
+        ));
+        t.gpr[13] = 0xFFFF_FFFF_FFFF_FFFF;
+        run_word(0x7DA1_0164, &mut t, &mut m);
+        assert_eq!(t.msr, 0x8000);
+    }
+
+    #[test]
     fn stw_lwz_roundtrip() {
         let (mut t, mut m) = setup();
         t.gpr[3] = 0x2000_u64;
@@ -2128,7 +2401,76 @@ mod tests {
     }
 
     #[test]
+    fn indexed_float_load_store() {
+        // Retail fault word: stfiwx f0,r29,r9 -> 0x7C1D4FAE
+        // (XO 983, not lfdx: masked base 0x7C0007AE per the reference
+        // opcode table and IBM Appendix F).
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0x7C1D_4FAE).unwrap(),
+            Decoded::Stfiwx {
+                frs: 0,
+                ra: 29,
+                rb: 9
+            }
+        ));
+        t.fpr[0] = f64::from_bits(0x0000_0000_0000_002A);
+        t.gpr[29] = 0x3000_u64;
+        t.gpr[9] = 0x40_u64;
+        run_word(0x7C1D_4FAE, &mut t, &mut m);
+        assert_eq!(m.read_u32(0x3040).unwrap(), 0x2A);
+        // lfdx double roundtrip.
+        let lfdx = (31u32 << 26) | (1 << 21) | (29 << 16) | (9 << 11) | (599 << 1);
+        m.write_bytes(0x3040, &(-3.75f64).to_be_bytes()).unwrap();
+        run_word(lfdx, &mut t, &mut m); // lfdx f1,r29,r9
+        assert_eq!(t.fpr[1], -3.75);
+        // lfsx single->double.
+        m.write_bytes(0x3050, &2.5f32.to_be_bytes()).unwrap();
+        let lfsx = (31u32 << 26) | (4 << 21) | (29 << 16) | (10 << 11) | (535 << 1);
+        t.gpr[10] = 0x50_u64;
+        run_word(lfsx, &mut t, &mut m); // lfsx f4,r29,r10
+        assert_eq!(t.fpr[4], 2.5);
+        // stfdx/stfsx store back.
+        t.fpr[5] = 1.25;
+        let stfdx = (31u32 << 26) | (5 << 21) | (29 << 16) | (11 << 11) | (727 << 1);
+        t.gpr[11] = 0x60_u64;
+        run_word(stfdx, &mut t, &mut m); // stfdx f5,r29,r11
+        assert_eq!(m.read_u64(0x3060).unwrap(), 1.25f64.to_bits());
+        let stfsx = (31u32 << 26) | (5 << 21) | (29 << 16) | (12 << 11) | (663 << 1);
+        t.gpr[12] = 0x70_u64;
+        run_word(stfsx, &mut t, &mut m); // stfsx f5,r29,r12
+        let b = m.read_bytes(0x3070, 4).unwrap();
+        assert_eq!(f32::from_be_bytes([b[0], b[1], b[2], b[3]]), 1.25);
+        // Update forms write EA back; ra=0 is an explicit error.
+        m.write_bytes(0x3080, &7.5f64.to_be_bytes()).unwrap();
+        t.gpr[10] = 0x80_u64;
+        let lfdux = (31u32 << 26) | (6 << 21) | (29 << 16) | (10 << 11) | (631 << 1);
+        run_word(lfdux, &mut t, &mut m); // lfdux f6,r29,r10
+        assert_eq!((t.gpr[29] as u32), 0x3080);
+        assert_eq!(t.fpr[6], 7.5);
+        let bad = (31u32 << 26) | (6 << 21) | (10 << 11) | (631 << 1);
+        assert!(expect_unsupported(bad, &mut t, &mut m).contains("lfdux"));
+    }
+
+    #[test]
     fn float_load_store_roundtrip() {
+        // Retail A-form with nonzero FRC: fmuls f1,f0,f0 with frc=28
+        // -> 0xEC200732. The 10-bit XO field carries FRC above the
+        // real 5-bit XO (25); decoding must not require FRC == 0.
+        let (mut t, mut m) = setup();
+        assert!(matches!(
+            decode(0xEC20_0732).unwrap(),
+            Decoded::Fmul {
+                frt: 1,
+                fra: 0,
+                frb: 0,
+                single: true,
+                ..
+            }
+        ));
+        t.fpr[0] = 2.0;
+        run_word(0xEC20_0732, &mut t, &mut m);
+        assert_eq!(t.fpr[1], 4.0);
         let (mut t, mut m) = setup();
         // Retail word shape: lfs f0,r8,24264 -> 0xC0085EC8.
         t.gpr[8] = 0x3000_u64;
@@ -2174,16 +2516,17 @@ mod tests {
         let fadd = (63u32 << 26) | (3 << 21) | (1 << 16) | (2 << 11) | (21 << 1);
         run_word(fadd, &mut t, &mut m); // fadd f3,f1,f2
         assert_eq!(t.fpr[3], 3.75);
-        // fctiwz + stfiwx pair: 3.75 -> 3 stored as word.
+        // fctiwz + stfiwx pair: 3.75 -> 3 stored as word
+        // (stfiwx XO 983 per IBM Appendix F; 659 is mfsrin).
         t.fpr[4] = 3.75;
         let fctiwz = (63u32 << 26) | (5 << 21) | (4 << 11) | (15 << 1);
         run_word(fctiwz, &mut t, &mut m); // fctiwz f5,f4
         t.gpr[8] = 0x3000_u64;
-        let stfiwx = (31u32 << 26) | (5 << 21) | (8 << 11) | (659 << 1);
+        let stfiwx = (31u32 << 26) | (5 << 21) | (8 << 11) | (983 << 1);
         run_word(stfiwx, &mut t, &mut m); // stfiwx f5,r8,0
         assert_eq!(m.read_u32(0x3000).unwrap(), 3);
-        // lfiwax inverts it.
-        let lfiwax = (31u32 << 26) | (6 << 21) | (8 << 11) | (769 << 1);
+        // lfiwax inverts it (XO 855 per LLVM PPCInstrInfo).
+        let lfiwax = (31u32 << 26) | (6 << 21) | (8 << 11) | (855 << 1);
         run_word(lfiwax, &mut t, &mut m); // lfiwax f6,r8,0
         assert_eq!(t.fpr[6], 3.0);
         // fcmpu orders onto the asked field; NaN is FU.

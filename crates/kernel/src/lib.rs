@@ -7,11 +7,13 @@
 //! - 2: console putc of low byte of `r3` (returns 0)
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use x360_common::{EmuError, Result};
 use x360_cpu::regs::ThreadState;
 
 pub mod boot;
 pub mod dispatch;
+pub mod fs;
 pub mod imports;
 pub mod ordinals;
 pub mod variables;
@@ -32,6 +34,9 @@ struct Event {
     signaled: bool,
     waiters: Vec<u32>,
 }
+
+/// Read-window result: (backing bytes, start, length, NTSTATUS).
+pub type FileReadResult = std::result::Result<(Arc<[u8]>, u64, usize, u32), u32>;
 
 /// Kernel state. Owns scheduling and objects.
 pub struct Kernel {
@@ -60,6 +65,38 @@ pub struct Kernel {
     pub nt_mutants: HashMap<u32, NtMutant>,
     pub nt_timers: HashMap<u32, NtTimer>,
     pub nt_threads: HashMap<u32, NtThread>,
+    /// Open guest files/directories by handle (reference `XFile`
+    /// objects; guest structs pending — handles resolve through this
+    /// table, not `nt_guest_object`, until then).
+    pub files: fs::FileTable,
+    /// Game file bytes backing NtCreateFile etc. Set by the launcher
+    /// (STFS package, host dir); None = no game mounted.
+    pub guest_fs: Option<Arc<dyn fs::GuestFs>>,
+    /// XAM notification listeners by handle (reference
+    /// `XNotifyListener`) plus the UI position word.
+    pub notify_listeners: HashMap<u32, NotifyListener>,
+    pub notify_position: u32,
+    /// Critical-region nesting (reference `EnterCriticalRegion`:
+    /// disables APC delivery; single-threaded runner needs only the
+    /// count, no per-thread table, until threads are scheduled).
+    pub critical_region: u32,
+    /// Video engines init record (reference `VdInitializeEngines`).
+    pub vd_engines: Option<VdEngines>,
+    /// Title-terminate notifications (reference
+    /// `RegisterTitleTerminateNotification`).
+    pub terminate_notifications: Vec<TerminateNotification>,
+    /// Graphics interrupt callback + user data (reference
+    /// `VdSetGraphicsInterruptCallback`).
+    pub vd_interrupt: Option<(u32, u32)>,
+    /// Ring buffer base + size_log2 (reference
+    /// `VdInitializeRingBuffer`).
+    pub vd_ring: Option<(u32, u32)>,
+    /// Read-pointer writeback base + block_log2 (reference
+    /// `VdEnableRingBufferRPtrWriteBack`).
+    pub vd_rptr_wb: Option<(u32, u32)>,
+    /// System command-buffer GPU identifier address (reference
+    /// `VdSetSystemCommandBufferGpuIdentifierAddress`).
+    pub vd_gpu_identifier: Option<u32>,
     /// Loaded module facts for RtlImageXexHeaderField / XexGetModule*.
     pub image_base: u32,
     pub image_size: u32,
@@ -103,6 +140,35 @@ pub struct NtTimer {
     pub timer_type: u32,
     pub signaled: bool,
     pub guest_ptr: u32,
+}
+
+/// XAM notification listener (reference `xnotifylistener.h/.cc`).
+#[derive(Debug, Clone)]
+pub struct NotifyListener {
+    pub mask: u64,
+    pub is_system: bool,
+    pub version: u32,
+    pub queue: VecDeque<(u32, u32)>,
+}
+
+/// Video engine init facts (reference `xboxkrnl_video.cc`
+/// `VdInitializeEngines`: PFP/ME microcode pointers + cleanup
+/// callback, consumed by the GPU command-processor backend later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VdEngines {
+    pub unk0: u32,
+    pub callback: u32,
+    pub arg: u32,
+    pub pfp_ptr: u32,
+    pub me_ptr: u32,
+}
+
+/// Title-terminate notification (reference `kernel.h`
+/// `X_EX_TITLE_TERMINATE_REGISTRATION`: routine + priority).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminateNotification {
+    pub routine: u32,
+    pub priority: u32,
 }
 
 /// NT thread (reference `xthread.cc` / `X_KTHREAD` in `xthread.h`).
@@ -161,6 +227,17 @@ impl Kernel {
             nt_mutants: HashMap::new(),
             nt_timers: HashMap::new(),
             nt_threads: HashMap::new(),
+            files: fs::FileTable::default(),
+            guest_fs: None,
+            notify_listeners: HashMap::new(),
+            notify_position: 0,
+            critical_region: 0,
+            vd_engines: None,
+            terminate_notifications: Vec::new(),
+            vd_interrupt: None,
+            vd_ring: None,
+            vd_rptr_wb: None,
+            vd_gpu_identifier: None,
             image_base: 0,
             image_size: 0,
             title_id: 0,
@@ -809,6 +886,10 @@ impl Kernel {
             // Waiting on a thread completes when it exits.
             return Ok(th.exited);
         }
+        if self.files.contains(handle) {
+            // Open files are waitable and synchronously complete.
+            return Ok(true);
+        }
         Err(EmuError::Other(format!("bad wait handle {:08x}", handle)))
     }
 
@@ -939,6 +1020,148 @@ impl Kernel {
         }
         // No NT object for the caller: this is the initial thread.
         Ok(true)
+    }
+
+    // ---- Guest files (reference `xboxkrnl_io.cc`, `xfile.cc`) ----
+
+    /// Mount a file backend (STFS package, host dir).
+    pub fn set_fs(&mut self, fs: Arc<dyn fs::GuestFs>) {
+        self.guest_fs = Some(fs);
+    }
+
+    /// Open a normalized path per the disposition table. Returns
+    /// (handle, IOSB action) or the NTSTATUS code. Write intents on
+    /// the read-only backend are ACCESS_DENIED, never silent success.
+    pub fn file_open(
+        &mut self,
+        path: String,
+        lookup: fs::FsLookup,
+        disposition: u32,
+        options: u32,
+    ) -> std::result::Result<(u32, u32), u32> {
+        let kind = match &lookup {
+            fs::FsLookup::File(_) => fs::LookupKind::File,
+            fs::FsLookup::Dir(_) => fs::LookupKind::Dir,
+            fs::FsLookup::NotFound => fs::LookupKind::Missing,
+        };
+        let action = fs::open_action(
+            disposition,
+            kind,
+            options & fs::OPT_DIRECTORY_FILE != 0,
+            options & fs::OPT_NON_DIRECTORY_FILE != 0,
+        )?;
+        let is_dir = kind == fs::LookupKind::Dir;
+        let data = match lookup {
+            fs::FsLookup::File(bytes) => Some(bytes),
+            _ => None,
+        };
+        let synchronous = options & (fs::OPT_SYNC_ALERT | fs::OPT_SYNC_NONALERT) != 0;
+        let handle = self.alloc_handle().0;
+        self.files.insert(
+            handle,
+            fs::OpenFile {
+                path,
+                data,
+                pos: 0,
+                is_dir,
+                synchronous,
+            },
+        );
+        Ok((handle, action))
+    }
+
+    /// Read window for an open file handle: (data, start, len, status).
+    pub fn file_read(&mut self, handle: u32, want: u64, offset: Option<u64>) -> FileReadResult {
+        let f = self
+            .files
+            .get_mut(handle)
+            .ok_or(crate::dispatch::STATUS_INVALID_HANDLE)?;
+        // Directories are not readable (reference: reads go through
+        // the file entry, never directory bytes).
+        let data = f.data.clone().ok_or(fs::STATUS_END_OF_FILE)?;
+        if f.is_dir {
+            return Err(fs::STATUS_END_OF_FILE);
+        }
+        let (start, n, status) = fs::file_read_window(data.len() as u64, f.pos, want, offset);
+        // Commit the new position exactly like the reference: an
+        // explicit nonzero offset seeks first, then the position
+        // advances by what was read (EOF keeps the clamped position).
+        if let Some(off) = offset {
+            if off != u64::MAX && off != 0 {
+                f.pos = off;
+            }
+        }
+        f.pos = start + n as u64;
+        Ok((data, start, n, status))
+    }
+
+    // ---- XAM notifications (reference `am_notify.cc`,
+    // `xnotifylistener.h/.cc`; facts only) ----
+
+    /// Create a notification listener. `max_version` is capped at 10
+    /// like the reference. Returns the handle.
+    pub fn notify_create(&mut self, mask: u64, is_system: bool, version: u32) -> u32 {
+        let h = self.alloc_handle().0;
+        self.notify_listeners.insert(
+            h,
+            NotifyListener {
+                mask,
+                is_system,
+                version: version.min(10),
+                queue: VecDeque::new(),
+            },
+        );
+        h
+    }
+
+    /// Broadcast a notification id + data to every listener whose
+    /// mask selects the id's area and whose version admits it
+    /// (reference `EnqueueNotification`: bit `mask_index` = id bits
+    /// 25-30, version gate = id bits 16-24). Queues are capped at 256
+    /// (oldest dropped, logged) — the reference grows unboundedly,
+    /// which a runaway broadcaster must not be allowed to do here.
+    pub fn notify_broadcast(&mut self, id: u32, data: u32) {
+        let mask_index = (id >> 25) & 0x3F;
+        let version = (id >> 16) & 0x1FF;
+        for (h, l) in self.notify_listeners.iter_mut() {
+            if l.mask & (1u64 << mask_index) == 0 {
+                continue;
+            }
+            if version > l.version {
+                continue;
+            }
+            l.queue.push_back((id, data));
+            if l.queue.len() > 256 {
+                l.queue.pop_front();
+                log::warn!("kernel: notify listener {:08x} overflow, dropped oldest", h);
+            }
+        }
+    }
+
+    /// Dequeue from a listener. `match_id` 0 = oldest; otherwise the
+    /// first queued entry with that id. Returns (dequeued, id, param).
+    pub fn notify_get_next(&mut self, handle: u32, match_id: u32) -> Option<(bool, u32, u32)> {
+        let l = self.notify_listeners.get_mut(&handle)?;
+        if match_id != 0 {
+            let mut found = None;
+            for (i, (id, param)) in l.queue.iter().enumerate() {
+                if *id == match_id {
+                    found = Some((i, *id, *param));
+                    break;
+                }
+            }
+            match found {
+                Some((i, id, param)) => {
+                    l.queue.remove(i);
+                    Some((true, id, param))
+                }
+                None => Some((false, match_id, 0)),
+            }
+        } else if let Some((id, param)) = l.queue.pop_front() {
+            Some((true, id, param))
+        } else {
+            Some((false, 0, 0))
+        }
     }
 
     /// Syscall dispatch. Implemented numbers grow with M6; others are

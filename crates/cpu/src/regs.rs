@@ -84,6 +84,9 @@ pub struct ThreadState {
     /// VMX128 file (stored, ops tracked as unsupported until M6).
     pub vr: [[u8; 16]; 32],
     pub vscr: u32,
+    /// Machine State Register (mfmsr/mtmsr; bit 48 EE, bit 62 RI).
+    /// Starts 0 (interrupts disabled); no interrupt model yet.
+    pub msr: u64,
     pub id: usize,
 }
 
@@ -102,6 +105,7 @@ impl ThreadState {
             reserved_addr: 0,
             vr: [[0; 16]; 32],
             vscr: 0,
+            msr: 0,
             id,
         }
     }

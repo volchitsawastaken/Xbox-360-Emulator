@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 x360-common = { path = "../common" }
+x360-kernel = { path = "../kernel" }
 log = "0.4"
 sha1 = "0.10"

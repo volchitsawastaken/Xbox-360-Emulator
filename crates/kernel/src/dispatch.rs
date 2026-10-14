@@ -29,6 +29,9 @@ pub const STATUS_MUTANT_NOT_OWNED: u32 = 0xC000_0046;
 pub const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_0047;
 pub const STATUS_BUFFER_TOO_SMALL: u32 = 0x8000_0005;
 pub const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
+pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
+pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+pub const STATUS_PENDING: u32 = 0x0000_0103;
 // Win32-flavored errors for module APIs (reference `xbox.h`).
 pub const ERROR_SUCCESS: u32 = 0x0000_0000;
 pub const ERROR_NOT_FOUND: u32 = 0x0000_0490;
@@ -129,6 +132,63 @@ pub fn dispatch_import(
         (Lib::Xboxkrnl, 0xBA) => mm_alloc_phys_ex(kernel, mem, t),
         (Lib::Xboxkrnl, 0xBD) => mm_free_phys(kernel, arg(t, 1), t),
         (Lib::Xboxkrnl, 0xC5) => mm_query_alloc_size(kernel, arg(t, 0), t),
+        (Lib::Xboxkrnl, 0xBE) => {
+            // MmGetPhysicalAddress(virt): mirror collapse (reference
+            // `GetPhysicalAddress`; 0 when unmapped, never fabricated).
+            t.gpr[3] = (mem.to_physical(arg(t, 0))) as u64;
+            Ok(())
+        }
+        // ---- File system (reference `xboxkrnl_io.cc`) ----
+        (Lib::Xboxkrnl, 0xD2) => nt_create_file(
+            kernel,
+            mem,
+            arg(t, 0),
+            arg(t, 1),
+            arg(t, 2),
+            arg(t, 3),
+            arg(t, 5),
+            arg(t, 6),
+            arg(t, 7),
+            crate::fs::stack_arg(mem, t.gpr[1] as u32, 0).unwrap_or(0),
+            t,
+        ),
+        (Lib::Xboxkrnl, 0xDF) => nt_create_file(
+            kernel,
+            mem,
+            arg(t, 0),
+            arg(t, 1),
+            arg(t, 2),
+            arg(t, 3),
+            0,
+            0,
+            crate::fs::DISP_OPEN,
+            arg(t, 4),
+            t,
+        ),
+        (Lib::Xboxkrnl, 0xF0) => nt_read_file(
+            kernel,
+            mem,
+            arg(t, 0),
+            arg(t, 1),
+            arg(t, 2),
+            arg(t, 3),
+            arg(t, 4),
+            arg(t, 5),
+            arg(t, 6),
+            arg(t, 7),
+            t,
+        ),
+        (Lib::Xboxkrnl, 0xCF) => nt_close_file(kernel, arg(t, 0), t),
+        (Lib::Xboxkrnl, 0xE8) => nt_query_info_file(
+            kernel,
+            mem,
+            arg(t, 0),
+            arg(t, 1),
+            arg(t, 2),
+            arg(t, 3),
+            arg(t, 4),
+            t,
+        ),
         (Lib::Xboxkrnl, 0x152) => ke_tls_alloc(kernel, t),
         (Lib::Xboxkrnl, 0x153) => ke_tls_free(kernel, arg(t, 0), t),
         (Lib::Xboxkrnl, 0x154) => ke_tls_get(kernel, arg(t, 0), t),
@@ -192,6 +252,19 @@ pub fn dispatch_import(
         (Lib::Xboxkrnl, 0x10B) | (Lib::Xboxkrnl, 0x10A) => {
             ob_lookup_thread(kernel, mem, arg(t, 0), arg(t, 1), t)
         }
+        // KeEnter/LeaveCriticalRegion: void; nest count only.
+        (Lib::Xboxkrnl, 0x5F) => {
+            kernel.critical_region += 1;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x7D) => {
+            if kernel.critical_region == 0 {
+                log::warn!("kernel: KeLeaveCriticalRegion without enter");
+            } else {
+                kernel.critical_region -= 1;
+            }
+            Ok(())
+        }
         // ---- Ke* thread APIs (reference `xboxkrnl_threading.cc`) ----
         (Lib::Xboxkrnl, 0x97) => ke_set_affinity(kernel, mem, arg(t, 0), arg(t, 1), arg(t, 2), t),
         (Lib::Xboxkrnl, 0x81) => ke_query_priority(kernel, arg(t, 0), t),
@@ -210,8 +283,167 @@ pub fn dispatch_import(
             arg(t, 4),
             t,
         ),
+        // ---- Video driver (reference `xboxkrnl_video.cc`) ----
+        (Lib::Xboxkrnl, 0x1C2) => {
+            // VdInitializeEngines(unk, callback, arg, pfp, me):
+            // records the microcode + callback for the GPU backend,
+            // returns 1 like the reference.
+            kernel.vd_engines = Some(crate::VdEngines {
+                unk0: arg(t, 0),
+                callback: arg(t, 1),
+                arg: arg(t, 2),
+                pfp_ptr: arg(t, 3),
+                me_ptr: arg(t, 4),
+            });
+            t.gpr[3] = 1_u64;
+            Ok(())
+        }
+        // ExRegisterTitleTerminateNotification(reg, create): void in
+        // the reference; tracks {routine, priority} (reference
+        // `xboxkrnl_modules.cc`).
+        (Lib::Xboxkrnl, 0x15) => {
+            let reg = arg(t, 0);
+            let create = arg(t, 1);
+            if reg != 0 {
+                let routine = mem.read_u32(reg).unwrap_or(0);
+                let priority = mem.read_u32(reg + 4).unwrap_or(0);
+                if create != 0 {
+                    kernel
+                        .terminate_notifications
+                        .retain(|n| n.routine != routine);
+                    kernel
+                        .terminate_notifications
+                        .push(crate::TerminateNotification { routine, priority });
+                } else {
+                    kernel
+                        .terminate_notifications
+                        .retain(|n| n.routine != routine);
+                }
+            }
+            Ok(())
+        }
+        // ---- Video ring/command buffer (reference
+        // `xboxkrnl_video.cc`) ----
+        (Lib::Xboxkrnl, 0x1D5) => {
+            // VdSetGraphicsInterruptCallback(callback, user_data): void.
+            kernel.vd_interrupt = Some((arg(t, 0), arg(t, 1)));
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1C3) => {
+            // VdInitializeRingBuffer(ptr, size_log2): void.
+            kernel.vd_ring = Some((arg(t, 0), arg(t, 1)));
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1B6) => {
+            // VdEnableRingBufferRPtrWriteBack(ptr, block_log2): void.
+            kernel.vd_rptr_wb = Some((arg(t, 0), arg(t, 1)));
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1BD) => {
+            // VdGetSystemCommandBuffer(p0, p1): p0 zeroed 0x94 with
+            // 0xBEEF0000 first, p1 = 0xBEEF0001.
+            let p0 = arg(t, 0);
+            let p1 = arg(t, 1);
+            if p0 != 0 {
+                mem.write_bytes(p0, &[0u8; 0x94])?;
+                mem.write_u32(p0, 0xBEEF_0000)?;
+            }
+            if p1 != 0 {
+                mem.write_u32(p1, 0xBEEF_0001)?;
+            }
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1BC) => {
+            // VdGetGraphicsAsicID: 0x11 (games with < 0x10 take the
+            // EDRAM-retrain path instead).
+            t.gpr[3] = 0x11_u64;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1C6) => {
+            // VdIsHSIOTrainingSucceeded: TRUE.
+            t.gpr[3] = 1_u64;
+            Ok(())
+        }
+        // VdRetrainEDRAM(Worker): 0 in the reference.
+        (Lib::Xboxkrnl, 0x269) | (Lib::Xboxkrnl, 0x26A) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1C7) => {
+            // VdPersistDisplay(unk, out_ptr): 64-byte block + 1
+            // (reference allocates 64/align-32 from its heap).
+            let out = arg(t, 1);
+            let addr = kernel.alloc_mem(64, 32)?;
+            mem.write_bytes(addr, &[0u8; 64])?;
+            if out != 0 {
+                mem.write_u32(out, addr)?;
+            }
+            t.gpr[3] = 1_u64;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1DC) => {
+            // VdShutdownEngines: void, ignored in the reference.
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1D3) => {
+            // VdSetDisplayMode(flags): 0 in the reference.
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1B1) => {
+            // VdCallGraphicsNotificationRoutines(unk, args_ptr): the
+            // reference asserts unk==1 and returns 0 without invoking
+            // anything (no routines can be registered: the register
+            // call has no implementation even in the reference).
+            if arg(t, 0) != 1 {
+                log::warn!(
+                    "kernel: VdCallGraphicsNotificationRoutines unk={:08x}",
+                    arg(t, 0)
+                );
+            }
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1B9) => {
+            // VdGetCurrentDisplayGamma(type_ptr, power_ptr): TV
+            // (BT.709) + 2.22222233, the reference cvar defaults.
+            let ty = arg(t, 0);
+            let pw = arg(t, 1);
+            if ty != 0 {
+                mem.write_u32(ty, 2)?;
+            }
+            if pw != 0 {
+                // Reference default `kernel_display_gamma_power`
+                // (f64 cvar 2.22222233, read back as float).
+                mem.write_bytes(pw, &(2.22222233_f64 as f32).to_be_bytes())?;
+            }
+            Ok(())
+        }
+        // VdQueryVideoMode/VdQueryRealVideoMode(mode_ptr): 1280x720
+        // HDMI default (reference `VdQueryVideoMode` with the default
+        // `av_pack_hdmi_sz` + NTSCM region: widescreen, hi-def, 60Hz,
+        // pixel_rate 0x8A). Layout from `kernel.h` `X_VIDEO_MODE`.
+        (Lib::Xboxkrnl, 0x1CA) | (Lib::Xboxkrnl, 0x2D2) => vd_query_video_mode(mem, arg(t, 0), t),
+        (Lib::Xboxkrnl, 0x1C9) => {
+            // VdQueryVideoFlags: widescreen|>=1280 for the mode above.
+            t.gpr[3] = 3_u64;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0x1D9) => {
+            // VdSetSystemCommandBufferGpuIdentifierAddress(addr): void
+            // stub in the reference; record for the GPU backend.
+            kernel.vd_gpu_identifier = Some(arg(t, 0));
+            Ok(())
+        }
+        // KiApcNormalRoutineNop(_): returns 0 (reference stub); also
+        // exported as KiApcNormalRoutineNop_ (0x19D).
+        (Lib::Xboxkrnl, 0x1DF) | (Lib::Xboxkrnl, 0x19D) => {
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
         (Lib::Xboxkrnl, 0x12B) => rtl_xex_header_field(kernel, arg(t, 0), arg(t, 1), t),
         (Lib::Xboxkrnl, 0x12A) => rtl_get_stack_limits(kernel, mem, arg(t, 0), arg(t, 1), t),
+        (Lib::Xboxkrnl, 0x135) => rtl_nt_status_to_dos_error(arg(t, 0), t),
         (Lib::Xboxkrnl, 0x195) => xex_get_module_handle(kernel, mem, arg(t, 0), arg(t, 1), t),
         (Lib::Xboxkrnl, 0x194) => xex_check_privilege(kernel, arg(t, 0), t),
         (Lib::Xboxkrnl, 0x03) => {
@@ -242,6 +474,59 @@ pub fn dispatch_import(
         // with high 0x0202 and returns 0). Stateless success for now;
         // real sockets arrive with socket()/connect() shims.
         (Lib::Xam, 0x1) => netdll_wsa_startup(mem, arg(t, 1), arg(t, 2), t),
+        // XAM notifications (reference `am_notify.cc`).
+        (Lib::Xam, 0x28A) => {
+            // Mask arrives as a full 64-bit register, not two halves.
+            let h = kernel.notify_create(t.gpr[3], false, arg(t, 1));
+            t.gpr[3] = (h) as u64;
+            Ok(())
+        }
+        (Lib::Xam, 0x291) => {
+            let h = kernel.notify_create(t.gpr[3], arg(t, 1) != 0, arg(t, 2));
+            t.gpr[3] = (h) as u64;
+            Ok(())
+        }
+        (Lib::Xam, 0x28B) => {
+            xnotify_get_next(kernel, mem, arg(t, 0), arg(t, 1), arg(t, 2), arg(t, 3), t)
+        }
+        (Lib::Xam, 0x28C) => {
+            // XNotifyPositionUI: void in the reference; record the word.
+            kernel.notify_position = arg(t, 0);
+            Ok(())
+        }
+        (Lib::Xam, 0x28D) => {
+            // XNotifyDelayUI: ignored in the reference, returns 0.
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        (Lib::Xam, 0x28E) => {
+            kernel.notify_broadcast(arg(t, 0), arg(t, 1));
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
+        // XamContentGetLicenseMask (reference `am_content.cc`): sync
+        // path writes the mask and returns SUCCESS. Bit 0 = full
+        // version license for XBLA titles (per the reference `license_mask`
+        // docs); this box owns the running title, so bit 0 is set —
+        // hardware truth for a purchased title, not the reference's
+        // default-deny cvar.
+        (Lib::Xam, 0x266) => {
+            let mask_ptr = arg(t, 0);
+            let overlapped = arg(t, 1);
+            if mask_ptr == 0 {
+                t.gpr[3] = 0x57_u64; // X_ERROR_INVALID_PARAMETER
+                return Ok(());
+            }
+            if overlapped != 0 {
+                // No overlapped completion machinery yet: report
+                // pending without writing (documented gap).
+                t.gpr[3] = 0x3E5_u64; // X_ERROR_IO_PENDING
+                return Ok(());
+            }
+            mem.write_u32(mask_ptr, 1)?;
+            t.gpr[3] = 0_u64;
+            Ok(())
+        }
         // XGetGameRegion (reference `am_locale.cc`: region table indexed
         // by XCONFIG country; US index 1 yields 0x03FF = NTSC North
         // America, the standard answer for US titles).
@@ -1168,6 +1453,7 @@ fn nt_wait_multiple(
             && !kernel.nt_mutants.contains_key(h)
             && !kernel.nt_timers.contains_key(h)
             && !kernel.nt_threads.contains_key(h)
+            && !kernel.files.contains(*h)
         {
             t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
             return Ok(());
@@ -1658,7 +1944,351 @@ fn ex_get_xconfig(
     Ok(())
 }
 
+// ---- File system (reference `xboxkrnl_io.cc`, `xfile.cc`,
+// `kernel.h`, `vfs/*`; facts only) ----
+
+/// Read a guest `X_ANSI_STRING` (length bytes at pointer).
+fn read_ansi_bytes(mem: &Memory, ptr: u32) -> Result<Vec<u8>> {
+    if ptr == 0 {
+        return Err(EmuError::Other("null ansi string".into()));
+    }
+    let hdr = mem.read_bytes(ptr, 8)?;
+    let len = u16::from_be_bytes([hdr[0], hdr[1]]) as usize;
+    if len > 4096 {
+        return Err(EmuError::Other("ansi string too long".into()));
+    }
+    let buf = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+    if buf == 0 && len != 0 {
+        return Err(EmuError::Other("null ansi buffer".into()));
+    }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(mem.read_bytes(buf, len)?.to_vec())
+}
+
+/// Write an `X_IO_STATUS_BLOCK` (status u32 + information u32).
+fn write_iosb(mem: &mut Memory, ptr: u32, status: u32, info: u32) -> Result<()> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    mem.write_u32(ptr, status)?;
+    mem.write_u32(ptr + 4, info)?;
+    Ok(())
+}
+
+/// Failed-open epilogue (reference: `*handle_out = INVALID_HANDLE`,
+/// IOSB carries the status, r3 carries the status).
+fn fail_open(
+    mem: &mut Memory,
+    handle_out: u32,
+    iosb_ptr: u32,
+    status: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    use crate::fs::INVALID_HANDLE_VALUE;
+    if handle_out != 0 {
+        mem.write_u32(handle_out, INVALID_HANDLE_VALUE)?;
+    }
+    write_iosb(mem, iosb_ptr, status, 0)?;
+    t.gpr[3] = (status) as u64;
+    Ok(())
+}
+
+/// Shared NtCreateFile/NtOpenFile core. `file_attr`/`share` are
+/// accepted and ignored (single-user read-only backend, documented).
+#[allow(clippy::too_many_arguments)]
+fn nt_create_file(
+    kernel: &mut Kernel,
+    mem: &mut Memory,
+    handle_out: u32,
+    desired_access: u32,
+    attrs_ptr: u32,
+    iosb_ptr: u32,
+    _file_attr: u32,
+    _share: u32,
+    disposition: u32,
+    options: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    use crate::fs::{
+        normalize_guest_path, ROOT_DOS_DEVICES, STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_INVALID,
+        STATUS_OBJECT_PATH_NOT_FOUND,
+    };
+    // The reference rejects a null attribute block outright.
+    if attrs_ptr == 0 {
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
+        return Ok(());
+    }
+    let root = mem.read_u32(attrs_ptr)?;
+    let name_ptr = mem.read_u32(attrs_ptr + 4)?;
+    // Relative opens resolve against an open directory handle.
+    let mut base: Option<String> = None;
+    if root != ROOT_DOS_DEVICES && root != 0 {
+        match kernel.files.get(root) {
+            Some(f) if f.is_dir => base = Some(f.path.clone()),
+            _ => {
+                return fail_open(mem, handle_out, iosb_ptr, STATUS_INVALID_HANDLE, t);
+            }
+        }
+    }
+    let raw = read_ansi_bytes(mem, name_ptr).unwrap_or_default();
+    let path = match normalize_guest_path(&raw, base.as_deref()) {
+        Ok(p) => p,
+        Err(status) => {
+            return fail_open(mem, handle_out, iosb_ptr, status, t);
+        }
+    };
+    let Some(backend) = kernel.guest_fs.clone() else {
+        return fail_open(mem, handle_out, iosb_ptr, STATUS_OBJECT_PATH_NOT_FOUND, t);
+    };
+    // Enforce ASCII like the reference (IsValidPath rejects >=127;
+    // normalize already rejected, this is the belt).
+    if !path.is_ascii() {
+        return fail_open(mem, handle_out, iosb_ptr, STATUS_OBJECT_NAME_INVALID, t);
+    }
+    let lookup = backend.lookup(&path);
+    // Read-only backend: write intents are ACCESS_DENIED (reference
+    // create-fails), checked after the disposition table resolves.
+    let write_wanted = desired_access
+        & (crate::fs::ACCESS_GENERIC_WRITE
+            | crate::fs::ACCESS_WRITE_DATA
+            | crate::fs::ACCESS_APPEND_DATA)
+        != 0;
+    match kernel.file_open(path.clone(), lookup, disposition, options) {
+        Ok((handle, action)) => {
+            if write_wanted {
+                kernel.files.remove(handle);
+                return fail_open(mem, handle_out, iosb_ptr, STATUS_ACCESS_DENIED, t);
+            }
+            if handle_out != 0 {
+                mem.write_u32(handle_out, handle)?;
+            }
+            write_iosb(mem, iosb_ptr, STATUS_SUCCESS, action)?;
+            log::info!(
+                "kernel: opened {} -> handle {:08x} (action {})",
+                path,
+                handle,
+                action
+            );
+            t.gpr[3] = (STATUS_SUCCESS) as u64;
+            Ok(())
+        }
+        Err(status) => fail_open(mem, handle_out, iosb_ptr, status, t),
+    }
+}
+
+/// `NtReadFile(handle, event, apc_routine, apc_ctx, iosb, buf, len,
+/// offset_ptr)`: always completes synchronously (reference takes the
+/// sync path unconditionally); non-synchronous opens report PENDING
+/// with valid IOSB (reference `!synchronous && != END_OF_FILE`).
+/// APC delivery has no mechanism yet: a nonzero routine is logged
+/// and skipped (documented), the bytes are still delivered.
+#[allow(clippy::too_many_arguments)]
+fn nt_read_file(
+    kernel: &mut Kernel,
+    mem: &mut Memory,
+    handle: u32,
+    event: u32,
+    apc_routine: u32,
+    _apc_ctx: u32,
+    iosb_ptr: u32,
+    buf: u32,
+    len: u32,
+    offset_ptr: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    if event != 0 && !kernel.nt_events.contains_key(&event) {
+        write_iosb(mem, iosb_ptr, STATUS_INVALID_HANDLE, 0)?;
+        t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
+        return Ok(());
+    }
+    if !kernel.files.contains(handle) {
+        write_iosb(mem, iosb_ptr, STATUS_INVALID_HANDLE, 0)?;
+        t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
+        return Ok(());
+    }
+    let offset = if offset_ptr != 0 {
+        Some(mem.read_u64(offset_ptr)?)
+    } else {
+        None
+    };
+    match kernel.file_read(handle, len as u64, offset) {
+        Ok((data, start, n, status)) => {
+            if n > 0 {
+                mem.write_bytes(buf, &data[start as usize..start as usize + n])?;
+            }
+            write_iosb(mem, iosb_ptr, status, n as u32)?;
+            if event != 0 {
+                let _ = kernel.nt_set_event(event);
+                mirror_event(kernel, mem, event);
+            }
+            if apc_routine & !1 != 0 {
+                log::warn!(
+                    "kernel: NtReadFile APC {:08x} skipped (no APC delivery yet)",
+                    apc_routine & !1
+                );
+            }
+            let sync = kernel
+                .files
+                .get(handle)
+                .map(|f| f.synchronous)
+                .unwrap_or(true);
+            if !sync && status != crate::fs::STATUS_END_OF_FILE && status == STATUS_SUCCESS {
+                t.gpr[3] = (STATUS_PENDING) as u64;
+            } else {
+                t.gpr[3] = (status) as u64;
+            }
+            Ok(())
+        }
+        Err(status) => {
+            write_iosb(mem, iosb_ptr, status, 0)?;
+            t.gpr[3] = (status) as u64;
+            Ok(())
+        }
+    }
+}
+
+/// `NtClose(handle)`: files are released; other tracked NT objects
+/// release a reference and stay valid; unknown handles are
+/// INVALID_HANDLE (reference `ReleaseHandle`).
+fn nt_close_file(kernel: &mut Kernel, handle: u32, t: &mut ThreadState) -> Result<()> {
+    if kernel.files.remove(handle) {
+        t.gpr[3] = (STATUS_SUCCESS) as u64;
+        return Ok(());
+    }
+    if kernel.nt_guest_object(handle).is_some()
+        || kernel.nt_events.contains_key(&handle)
+        || kernel.nt_semaphores.contains_key(&handle)
+        || kernel.nt_mutants.contains_key(&handle)
+        || kernel.nt_timers.contains_key(&handle)
+        || kernel.nt_threads.contains_key(&handle)
+    {
+        t.gpr[3] = (STATUS_SUCCESS) as u64;
+        return Ok(());
+    }
+    t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
+    Ok(())
+}
+
+/// FNV-1a/64 for stable file index numbers (deterministic across
+/// runs, unlike SipHash).
+fn fnv1a_64(s: &str) -> u64 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01B3);
+    }
+    h
+}
+
+// FileInformationClass values (reference `info/file.h`).
+const INFO_INTERNAL: u32 = 6;
+const INFO_POSITION: u32 = 14;
+const INFO_XCTD: u32 = 27;
+const INFO_NETWORK_OPEN: u32 = 34;
+const INFO_MODE: u32 = 16;
+const INFO_ALIGNMENT: u32 = 17;
+const INFO_SECTOR: u32 = 26;
+const INFO_IOPRIORITY: u32 = 32;
+const INFO_NAME: u32 = 9;
+const INFO_ALLOCATION: u32 = 19;
+const INFO_BASIC: u32 = 4;
+
+/// `NtQueryInformationFile(handle, iosb, info, len, class)`
+/// (reference `xboxkrnl_io_info.cc`). Length/handle/class failures
+/// return before touching the buffer or IOSB, exactly like the
+/// reference. Supported: Internal (path hash), Position (live
+/// offset), NetworkOpen (size/attrs, zero times — the read-only
+/// backend carries no timestamps).
+#[allow(clippy::too_many_arguments)]
+fn nt_query_info_file(
+    kernel: &mut Kernel,
+    mem: &mut Memory,
+    handle: u32,
+    iosb_ptr: u32,
+    info_ptr: u32,
+    info_len: u32,
+    class: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    let min_len = match class {
+        INFO_INTERNAL => 8,
+        INFO_POSITION => 8,
+        INFO_XCTD => 4,
+        INFO_NETWORK_OPEN => 56,
+        INFO_MODE | INFO_ALIGNMENT | INFO_SECTOR | INFO_IOPRIORITY => 4,
+        INFO_NAME | INFO_ALLOCATION => 8,
+        INFO_BASIC => 40,
+        _ => 0,
+    };
+    if min_len == 0 {
+        t.gpr[3] = (STATUS_INVALID_INFO_CLASS) as u64;
+        return Ok(());
+    }
+    if info_len < min_len {
+        t.gpr[3] = (STATUS_INFO_LENGTH_MISMATCH) as u64;
+        return Ok(());
+    }
+    let Some(f) = kernel.files.get(handle) else {
+        t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
+        return Ok(());
+    };
+    let (status, out_len) = match class {
+        INFO_INTERNAL => {
+            let idx = fnv1a_64(&f.path);
+            mem.write_bytes(info_ptr, &vec![0u8; info_len as usize])?;
+            mem.write_u64(info_ptr, idx)?;
+            (STATUS_SUCCESS, 8)
+        }
+        INFO_POSITION => {
+            let pos = f.pos;
+            mem.write_bytes(info_ptr, &vec![0u8; info_len as usize])?;
+            mem.write_u64(info_ptr, pos)?;
+            (STATUS_SUCCESS, 8)
+        }
+        INFO_NETWORK_OPEN => {
+            let size = f.data.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+            let attrs = if f.is_dir { 0x10u32 } else { 0x80u32 };
+            mem.write_bytes(info_ptr, &vec![0u8; info_len as usize])?;
+            // times (4x u64) stay zero: no timestamps on this backend.
+            mem.write_u64(info_ptr + 32, size)?; // allocation_size
+            mem.write_u64(info_ptr + 40, size)?; // end_of_file
+            mem.write_u32(info_ptr + 48, attrs)?;
+            mem.write_u32(info_ptr + 52, 0)?; // pad
+            (STATUS_SUCCESS, 56)
+        }
+        // Reference: XCTD and the length-only classes land in the
+        // default arm -> INVALID_PARAMETER with zero output.
+        _ => {
+            mem.write_bytes(info_ptr, &vec![0u8; info_len as usize])?;
+            (STATUS_INVALID_PARAMETER, 0)
+        }
+    };
+    write_iosb(mem, iosb_ptr, status, out_len)?;
+    t.gpr[3] = (status) as u64;
+    Ok(())
+}
+
 // ---- Module queries ----
+
+/// `VdQueryVideoMode(mode_ptr)`: fills `X_VIDEO_MODE` (48 bytes).
+fn vd_query_video_mode(mem: &mut Memory, ptr: u32, _t: &mut ThreadState) -> Result<()> {
+    if ptr == 0 {
+        return Ok(());
+    }
+    mem.write_bytes(ptr, &[0u8; 48])?;
+    mem.write_u32(ptr, 1280)?;
+    mem.write_u32(ptr + 4, 720)?;
+    mem.write_u32(ptr + 8, 0)?; // interlaced
+    mem.write_u32(ptr + 12, 1)?; // widescreen
+    mem.write_u32(ptr + 16, 1)?; // hi-def
+    mem.write_bytes(ptr + 20, &60.0f32.to_be_bytes())?;
+    mem.write_u32(ptr + 24, 1)?; // NTSCM
+    mem.write_u32(ptr + 28, 0x8A)?; // pixel_rate
+    mem.write_u32(ptr + 32, 0x01)?; // widescreen_flag
+    Ok(())
+}
 
 /// `NetDll_WSAStartup(version, data_ptr)`: X_WSADATA is 0x190 bytes
 /// (version/version_high u16be, 257+129 description bytes, two u16,
@@ -1678,6 +2308,156 @@ fn netdll_wsa_startup(
     Ok(())
 }
 
+/// `XNotifyGetNext(handle, match, id_ptr, param_ptr)` (reference
+/// `am_notify.cc`): param/id words are zeroed first; a null id
+/// pointer returns 0; unknown handles return 0; otherwise 1 when an
+/// entry was dequeued, else 0.
+fn xnotify_get_next(
+    kernel: &mut Kernel,
+    mem: &mut Memory,
+    handle: u32,
+    match_id: u32,
+    id_ptr: u32,
+    param_ptr: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    if param_ptr != 0 {
+        mem.write_u32(param_ptr, 0)?;
+    }
+    if id_ptr == 0 {
+        t.gpr[3] = 0_u64;
+        return Ok(());
+    }
+    mem.write_u32(id_ptr, 0)?;
+    let Some((dequeued, id, param)) = kernel.notify_get_next(handle, match_id) else {
+        t.gpr[3] = 0_u64;
+        return Ok(());
+    };
+    if dequeued {
+        mem.write_u32(id_ptr, id)?;
+        if param_ptr != 0 {
+            mem.write_u32(param_ptr, param)?;
+        }
+        t.gpr[3] = 1_u64;
+    } else {
+        t.gpr[3] = 0_u64;
+    }
+    Ok(())
+}
+
+/// `RtlNtStatusToDosError(status)` (reference
+/// `xboxkrnl_error.cc` `xeRtlNtStatusToDosError`): NTSTATUS to Win32
+/// error. Structural rules are exact (identity for 0 / 0x20000000-bit,
+/// low-word for 0x8007xx / 0xC001xx, 317 fallback). The table below
+/// covers every status this kernel emits (entries verified against
+/// `error_table_0x00000103` / `error_table_0xC0000001`); anything else
+/// returns 317 (ERROR_MR_MID_NOT_FOUND) exactly like the reference
+/// does for unmapped codes. Extend the table (from the reference)
+/// when retail surfaces a new status instead of guessing.
+fn rtl_nt_status_to_dos_error(status: u32, t: &mut ThreadState) -> Result<()> {
+    t.gpr[3] = (nt_status_to_dos_error(status)) as u64;
+    Ok(())
+}
+
+fn nt_status_to_dos_error(status: u32) -> u32 {
+    if status == 0 || (status & 0x2000_0000) != 0 {
+        return status;
+    }
+    if (status >> 16) == 0x8007 {
+        return status & 0xFFFF;
+    }
+    let mut s = status;
+    if (s & 0xF000_0000) == 0xD000_0000 {
+        s &= !0x3000_0000;
+    }
+    // (base, entries): verified against the reference tables.
+    const T103: &[u32] = &[997];
+    const TC0000001: &[u32] = &[
+        31,
+        1,
+        87,
+        24,
+        0x3E6,
+        0x3E7,
+        0x5AE,
+        6,
+        0x3E9,
+        0xC1,
+        87,
+        0,
+        87,
+        2,
+        2,
+        1,
+        38,
+        0x22,
+        0x15,
+        0x6F9,
+        0x1B,
+        0xEA,
+        8,
+        0x1E7,
+        0x1E7,
+        87,
+        87,
+        1,
+        0xC000_001D,
+        5,
+        5,
+        0xC1,
+        5,
+        5,
+        122,
+        6,
+        0xC000_0025,
+        0xC000_0026,
+        0,
+        0,
+        0,
+        0x9E,
+        0xC000_002B,
+        0x1E7,
+        0x1E7,
+        0,
+        0,
+        87,
+        0,
+        0x571,
+        123,
+        2,
+        183,
+        0,
+        6,
+        0,
+        0xA1,
+        3,
+    ];
+    for (base, table) in [(0x0000_0103u32, T103), (0xC000_0001u32, TC0000001)] {
+        if s < base {
+            break;
+        }
+        let idx = (s - base) as usize;
+        if idx < table.len() {
+            let r = table[idx];
+            if r != 0 {
+                return r;
+            }
+            break;
+        }
+    }
+    // Late table entries this kernel emits (verified individually).
+    match s {
+        0xC000_00BA => 5,   // FILE_IS_A_DIRECTORY -> ACCESS_DENIED
+        0xC000_00F1 => 87,  // INVALID_PARAMETER_3 -> INVALID_PARAMETER
+        0xC000_0103 => 267, // NOT_A_DIRECTORY -> ERROR_DIRECTORY
+        _ => {
+            if (s >> 16) == 0xC001 {
+                return s & 0xFFFF;
+            }
+            317 // ERROR_MR_MID_NOT_FOUND, like the reference.
+        }
+    }
+}
 /// `RtlGetStackLimits(low_ptr, high_ptr)`: report the recorded stack.
 fn rtl_get_stack_limits(
     kernel: &Kernel,
@@ -1790,6 +2570,228 @@ mod tests {
             kind: crate::imports::ImportKind::Function,
             thunk_addr: 0x8200_2000,
         }
+    }
+
+    #[test]
+    fn vd_initialize_engines_records() {
+        // Hex sanity: dispatch arms must match the authoritative table.
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1D5),
+            Some("VdSetGraphicsInterruptCallback")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1C3),
+            Some("VdInitializeRingBuffer")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1B6),
+            Some("VdEnableRingBufferRPtrWriteBack")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1BD),
+            Some("VdGetSystemCommandBuffer")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1BC),
+            Some("VdGetGraphicsAsicID")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1C6),
+            Some("VdIsHSIOTrainingSucceeded")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1C7),
+            Some("VdPersistDisplay")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1DC),
+            Some("VdShutdownEngines")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1D3),
+            Some("VdSetDisplayMode")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0x1B53_0000;
+        t.gpr[4] = 0x8218_4060;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0x8200_5818;
+        t.gpr[7] = 0x8200_5C98;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1C2),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 1);
+        let vd = k.vd_engines.expect("recorded");
+        assert_eq!(vd.callback, 0x8218_4060);
+        assert_eq!(vd.pfp_ptr, 0x8200_5818);
+        assert_eq!(vd.me_ptr, 0x8200_5C98);
+        // Interrupt callback + ring records.
+        t.gpr[3] = 0x8218_1718;
+        t.gpr[4] = 0x0104_3800;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1D5),
+        )
+        .unwrap();
+        assert_eq!(k.vd_interrupt, Some((0x8218_1718, 0x0104_3800)));
+        t.gpr[3] = 0x0110_0000;
+        t.gpr[4] = 20;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1C3),
+        )
+        .unwrap();
+        assert_eq!(k.vd_ring, Some((0x0110_0000, 20)));
+        // System command buffer magics.
+        let p0 = 0x8400_C000;
+        let p1 = 0x8400_C100;
+        t.gpr[3] = p0 as u64;
+        t.gpr[4] = p1 as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1BD),
+        )
+        .unwrap();
+        assert_eq!(m.read_u32(p0).unwrap(), 0xBEEF_0000);
+        assert_eq!(m.read_u32(p0 + 4).unwrap(), 0);
+        assert_eq!(m.read_u32(p1).unwrap(), 0xBEEF_0001);
+        // Asic ID steers clear of the EDRAM-retrain path.
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1BC),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x11);
+        // Video mode struct + flags.
+        let vm = 0x8400_C200;
+        t.gpr[3] = vm as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1CA),
+        )
+        .unwrap();
+        assert_eq!(m.read_u32(vm).unwrap(), 1280);
+        assert_eq!(m.read_u32(vm + 4).unwrap(), 720);
+        assert_eq!(m.read_u32(vm + 12).unwrap(), 1);
+        assert_eq!(m.read_u32(vm + 16).unwrap(), 1);
+        assert_eq!(m.read_u32(vm + 24).unwrap(), 1);
+        assert_eq!(m.read_u32(vm + 28).unwrap(), 0x8A);
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1C9),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 3);
+        // Graphics notification call is a 0-return like the reference.
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1B1),
+            Some("VdCallGraphicsNotificationRoutines")
+        );
+        t.gpr[3] = 1;
+        t.gpr[4] = 0x8400_C300;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1B1),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        // Display gamma defaults: TV + power.
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1B9),
+            Some("VdGetCurrentDisplayGamma")
+        );
+        let gt = 0x8400_C400;
+        let gp = 0x8400_C404;
+        t.gpr[3] = gt as u64;
+        t.gpr[4] = gp as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1B9),
+        )
+        .unwrap();
+        assert_eq!(m.read_u32(gt).unwrap(), 2);
+        let b = m.read_bytes(gp, 4).unwrap();
+        assert_eq!(
+            f32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            2.22222233_f64 as f32
+        );
+    }
+
+    #[test]
+    fn terminate_notification_register_remove() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let reg = 0x8400_B000;
+        m.write_u32(reg, 0x8256_09C0).unwrap();
+        m.write_u32(reg + 4, 1).unwrap();
+        t.gpr[3] = reg as u64;
+        t.gpr[4] = 1;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x15),
+        )
+        .unwrap();
+        assert_eq!(k.terminate_notifications.len(), 1);
+        assert_eq!(k.terminate_notifications[0].routine, 0x8256_09C0);
+        t.gpr[3] = reg as u64;
+        t.gpr[4] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x15),
+        )
+        .unwrap();
+        assert!(k.terminate_notifications.is_empty());
     }
 
     #[test]
@@ -2189,6 +3191,466 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn nt_file_open_read_close() {
+        use crate::fs::{FsLookup, GuestFs};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        struct MockFs {
+            files: HashMap<String, Vec<u8>>,
+        }
+        impl GuestFs for MockFs {
+            fn lookup(&self, path: &str) -> FsLookup {
+                if let Some(b) = self.files.get(path) {
+                    return FsLookup::File(Arc::from(b.as_slice()));
+                }
+                FsLookup::NotFound
+            }
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn open_path(
+            k: &mut Kernel,
+            m: &mut Memory,
+            tab: &mut ImportTable,
+            t: &mut ThreadState,
+            raw: &[u8],
+            access: u32,
+            disposition: u32,
+            options: u32,
+        ) -> (u32, u32, u32) {
+            // OA + ANSI + bytes laid out in guest memory.
+            let oa = 0x8400_A000;
+            let an = 0x8400_A010;
+            let sb = 0x8400_A020;
+            let ho = 0x8400_A100;
+            let io = 0x8400_A108;
+            m.write_bytes(sb, raw).unwrap();
+            m.write_u32(oa, 0xFFFF_FFFD).unwrap();
+            m.write_u32(oa + 4, an).unwrap();
+            m.write_u32(oa + 8, 0x40).unwrap();
+            let lb = (raw.len() as u16).to_be_bytes();
+            m.write_bytes(an, &[lb[0], lb[1], lb[0], lb[1]]).unwrap();
+            m.write_u32(an + 4, sb).unwrap();
+            t.gpr[3] = ho as u64;
+            t.gpr[4] = access as u64;
+            t.gpr[5] = oa as u64;
+            t.gpr[6] = io as u64;
+            t.gpr[7] = 0;
+            t.gpr[8] = 0x80;
+            t.gpr[9] = 1;
+            t.gpr[10] = disposition as u64;
+            // options is the 9th arg: spill to the guest stack.
+            let r1 = 0x8400_B000;
+            t.gpr[1] = r1 as u64;
+            m.write_bytes(r1, &[0u8; 64]).unwrap();
+            m.write_u32(r1 + 8, options).unwrap();
+            dispatch_import(k, m, tab, 7, t, &imp("xboxkrnl.exe", 0xD2)).unwrap();
+            (
+                t.gpr[3] as u32,
+                m.read_u32(ho).unwrap(),
+                m.read_u32(io + 4).unwrap(),
+            )
+        }
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        k.set_fs(Arc::new(MockFs {
+            files: [("data/strings/english.mo".to_string(), vec![9, 8, 7, 6, 5])].into(),
+        }));
+        // Open existing for read, synchronous: SUCCESS, OPENED(1).
+        let (st, h, action) = open_path(
+            &mut k,
+            &mut m,
+            &mut tab,
+            &mut t,
+            b"game:\\data\\strings\\english.mo",
+            0x0010_0081,
+            1,
+            0x20,
+        );
+        assert_eq!(st, STATUS_SUCCESS);
+        assert_eq!(action, 1);
+        assert_ne!(h, 0xFFFF_FFFF);
+        // Read 3 bytes at offset 0: bytes delivered, IOSB 3.
+        let buf = 0x8400_C000;
+        let rio = 0x8400_C100;
+        t.gpr[3] = h as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0;
+        t.gpr[7] = rio as u64;
+        t.gpr[8] = buf as u64;
+        t.gpr[9] = 3;
+        t.gpr[10] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xF0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+        assert_eq!(m.read_u32(rio + 4).unwrap(), 3);
+        assert_eq!(m.read_bytes(buf, 3).unwrap(), &[9, 8, 7]);
+        // Second read continues at position 3: 2 bytes left.
+        t.gpr[3] = h as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0;
+        t.gpr[7] = rio as u64;
+        t.gpr[8] = buf as u64;
+        t.gpr[9] = 16;
+        t.gpr[10] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xF0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+        assert_eq!(m.read_u32(rio + 4).unwrap(), 2);
+        // Third read hits EOF.
+        t.gpr[3] = h as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0;
+        t.gpr[7] = rio as u64;
+        t.gpr[8] = buf as u64;
+        t.gpr[9] = 16;
+        t.gpr[10] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xF0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, crate::fs::STATUS_END_OF_FILE);
+        // Close, then read-after-close is INVALID_HANDLE.
+        t.gpr[3] = h as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xCF),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+        t.gpr[3] = h as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0;
+        t.gpr[7] = rio as u64;
+        t.gpr[8] = buf as u64;
+        t.gpr[9] = 3;
+        t.gpr[10] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xF0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
+        // Missing file, disposition OPEN: NOT_FOUND + invalid handle.
+        let (st, h, _) = open_path(
+            &mut k,
+            &mut m,
+            &mut tab,
+            &mut t,
+            b"game:\\nope.bin",
+            0x0010_0081,
+            1,
+            0,
+        );
+        assert_eq!(st, crate::fs::STATUS_OBJECT_NAME_NOT_FOUND);
+        assert_eq!(h, 0xFFFF_FFFF);
+        // Write access on read-only backend: ACCESS_DENIED.
+        let (st, h, _) = open_path(
+            &mut k,
+            &mut m,
+            &mut tab,
+            &mut t,
+            b"game:\\data\\strings\\english.mo",
+            0x4000_0000,
+            1,
+            0,
+        );
+        assert_eq!(st, crate::fs::STATUS_ACCESS_DENIED);
+        assert_eq!(h, 0xFFFF_FFFF);
+        // Bad characters: NAME_INVALID.
+        let (st, _, _) = open_path(
+            &mut k,
+            &mut m,
+            &mut tab,
+            &mut t,
+            b"game:\\a|b.bin",
+            0x0010_0081,
+            1,
+            0,
+        );
+        assert_eq!(st, crate::fs::STATUS_OBJECT_NAME_INVALID);
+        // Unknown device: PATH_NOT_FOUND.
+        let (st, _, _) = open_path(
+            &mut k,
+            &mut m,
+            &mut tab,
+            &mut t,
+            b"mu:\\save.bin",
+            0x0010_0081,
+            1,
+            0,
+        );
+        assert_eq!(st, crate::fs::STATUS_OBJECT_PATH_NOT_FOUND);
+        // Unknown close handle: INVALID_HANDLE.
+        t.gpr[3] = 0xDEAD_BEEF;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xCF),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
+        // Non-synchronous open: reads report PENDING with valid IOSB
+        // (reference sync-path shape), bytes still delivered.
+        let (st, h2, _) = open_path(
+            &mut k,
+            &mut m,
+            &mut tab,
+            &mut t,
+            b"game:\\data\\strings\\english.mo",
+            0x0010_0081,
+            1,
+            0,
+        );
+        assert_eq!(st, STATUS_SUCCESS);
+        t.gpr[3] = h2 as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0;
+        t.gpr[7] = rio as u64;
+        t.gpr[8] = buf as u64;
+        t.gpr[9] = 2;
+        t.gpr[10] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xF0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_PENDING);
+        assert_eq!(m.read_u32(rio).unwrap(), STATUS_SUCCESS);
+        assert_eq!(m.read_u32(rio + 4).unwrap(), 2);
+        assert_eq!(m.read_bytes(buf, 2).unwrap(), &[9, 8]);
+    }
+
+    #[test]
+    fn nt_query_info_file_shapes() {
+        use crate::fs::FsLookup;
+        use std::sync::Arc;
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let bytes: Arc<[u8]> = Arc::from([1u8, 2, 3, 4, 5].as_slice());
+        let (h, _) = k
+            .file_open(
+                "data/x.bin".to_string(),
+                FsLookup::File(bytes),
+                crate::fs::DISP_OPEN,
+                0,
+            )
+            .expect("open");
+        let info = 0x8400_D000;
+        let iosb = 0x8400_D100;
+        m.write_bytes(info, &[0xCCu8; 64]).unwrap();
+        // NetworkOpen (34): size + attrs land at the reference offsets.
+        t.gpr[3] = h as u64;
+        t.gpr[4] = iosb as u64;
+        t.gpr[5] = info as u64;
+        t.gpr[6] = 56;
+        t.gpr[7] = 34;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xE8),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+        assert_eq!(m.read_u64(info + 40).unwrap(), 5);
+        assert_eq!(m.read_u32(info + 48).unwrap(), 0x80);
+        assert_eq!(m.read_u32(iosb + 4).unwrap(), 56);
+        // Position (14): live offset (0 before any read).
+        t.gpr[3] = h as u64;
+        t.gpr[4] = iosb as u64;
+        t.gpr[5] = info as u64;
+        t.gpr[6] = 8;
+        t.gpr[7] = 14;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xE8),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+        assert_eq!(m.read_u64(info).unwrap(), 0);
+        // Short buffer: MISMATCH, buffer untouched.
+        m.write_bytes(info, &[0xCCu8; 8]).unwrap();
+        t.gpr[3] = h as u64;
+        t.gpr[4] = iosb as u64;
+        t.gpr[5] = info as u64;
+        t.gpr[6] = 4;
+        t.gpr[7] = 14;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xE8),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INFO_LENGTH_MISMATCH);
+        assert_eq!(m.read_bytes(info, 8).unwrap(), &[0xCCu8; 8]);
+        // Unknown class: INVALID_INFO_CLASS.
+        t.gpr[3] = h as u64;
+        t.gpr[4] = iosb as u64;
+        t.gpr[5] = info as u64;
+        t.gpr[6] = 64;
+        t.gpr[7] = 99;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xE8),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_INFO_CLASS);
+        // Bad handle: INVALID_HANDLE.
+        t.gpr[3] = 0xDEAD_BEEF;
+        t.gpr[4] = iosb as u64;
+        t.gpr[5] = info as u64;
+        t.gpr[6] = 56;
+        t.gpr[7] = 34;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xE8),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
+    }
+
+    #[test]
+    fn rtl_nt_status_to_dos_error_maps() {
+        // Retail fault ordinal: RtlNtStatusToDosError(309).
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x135),
+            Some("RtlNtStatusToDosError")
+        );
+        // Spot values verified against reference error_table_0xC0000001
+        // / error_table_0x00000103.
+        assert_eq!(nt_status_to_dos_error(0xC000_003A), 3); // PATH_NOT_FOUND
+        assert_eq!(nt_status_to_dos_error(0xC000_0034), 2); // NAME_NOT_FOUND
+        assert_eq!(nt_status_to_dos_error(0xC000_0022), 5); // ACCESS_DENIED
+        assert_eq!(nt_status_to_dos_error(0xC000_0008), 6); // INVALID_HANDLE
+        assert_eq!(nt_status_to_dos_error(0xC000_000D), 87); // INVALID_PARAMETER
+        assert_eq!(nt_status_to_dos_error(0x0000_0103), 997); // PENDING
+        assert_eq!(nt_status_to_dos_error(0), 0);
+        assert_eq!(nt_status_to_dos_error(0xC000_0103), 267); // NOT_A_DIRECTORY
+        assert_eq!(nt_status_to_dos_error(0xDEAD_BEEF), 317); // unmapped fallback
+                                                              // Through dispatch: r3 in, r3 out.
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0xC000_003A_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x135),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 3);
+    }
+
+    #[test]
+    fn critical_region_nests() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x5F),
+            Some("KeEnterCriticalRegion")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x7D),
+            Some("KeLeaveCriticalRegion")
+        );
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x5F),
+        )
+        .unwrap();
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x5F),
+        )
+        .unwrap();
+        assert_eq!(k.critical_region, 2);
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x7D),
+        )
+        .unwrap();
+        assert_eq!(k.critical_region, 1);
     }
 
     #[test]
@@ -2662,6 +4124,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!((t.gpr[3] as u32), 0);
+    }
+
+    #[test]
+    fn xnotify_listener_queue() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Create with mask bit 3, version 10.
+        t.gpr[3] = 0x08;
+        t.gpr[4] = 10;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x28A)).unwrap();
+        let h = t.gpr[3] as u32;
+        assert_ne!(h, 0);
+        // Broadcast id with mask_index 3, version 2, data 0x77.
+        let id = (3u32 << 25) | (2u32 << 16) | 0x41;
+        t.gpr[3] = id as u64;
+        t.gpr[4] = 0x77;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x28E)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        // GetNext (match 0) dequeues it.
+        let ip = 0x8400_9000;
+        let pp = 0x8400_9004;
+        t.gpr[3] = h as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = ip as u64;
+        t.gpr[6] = pp as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x28B)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 1);
+        assert_eq!(m.read_u32(ip).unwrap(), id);
+        assert_eq!(m.read_u32(pp).unwrap(), 0x77);
+        // Queue now empty: 0 with zeroed words.
+        t.gpr[3] = h as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = ip as u64;
+        t.gpr[6] = pp as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x28B)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u32(ip).unwrap(), 0);
+        // Wrong-area broadcast (mask_index 5) never arrives.
+        let id2 = (5u32 << 25) | (1u32 << 16) | 0x07;
+        t.gpr[3] = id2 as u64;
+        t.gpr[4] = 0x99;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x28E)).unwrap();
+        t.gpr[3] = h as u64;
+        t.gpr[4] = id2 as u64;
+        t.gpr[5] = ip as u64;
+        t.gpr[6] = pp as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x28B)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        // Unknown handle: 0.
+        t.gpr[3] = 0xDEAD_BEEF;
+        t.gpr[4] = 0;
+        t.gpr[5] = ip as u64;
+        t.gpr[6] = pp as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x28B)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn xam_content_license_mask() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let out = 0x8400_A000;
+        t.gpr[3] = out as u64;
+        t.gpr[4] = 0;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x266)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u32(out).unwrap(), 1);
+        // Null mask pointer is INVALID_PARAMETER.
+        t.gpr[3] = 0;
+        t.gpr[4] = 0;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x266)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x57);
     }
 
     #[test]

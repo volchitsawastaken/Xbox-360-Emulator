@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use x360_common::{EmuError, Result};
 
 pub mod stfs;
+pub mod stfs_fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentKind {

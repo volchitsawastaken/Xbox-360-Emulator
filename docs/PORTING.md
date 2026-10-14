@@ -170,6 +170,47 @@ out, and the license note. Workspace license: BSD-3-Clause.
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.
 
+## 8. File I/O / video-init / error-table / MMIO / A-form facts
+
+- Source: `src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc`
+  (`NtCreateFile` root handling, `CreateOptions`,
+  `IsValidPath` call sites), `kernel.h` (`X_OBJECT_ATTRIBUTES`,
+  `X_ANSI_STRING`), `vfs/entry.h` (`FileDisposition`,
+  `FileAction`), `vfs/virtual_file_system.cc` (`OpenFile` decision
+  table, case-insensitive child lookup), `xfile.cc` (`Read`
+  position/EOF semantics), `xbox.h` (NTSTATUS values),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_io_info.cc`
+  (`GetQueryFileInfoMinimumLength` classes, query switch arms for
+  Internal/Position/Alignment/Sector/XCTD/NetworkOpen, default arm
+  INVALID_PARAMETER with zero output),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc`
+  (`VdSetDisplayMode` 0, `VdRetrainEDRAM(Worker)` 0,
+  `VdIsHSIOTrainingSucceeded` TRUE, `kernel_display_gamma_type` 2 /
+  `kernel_display_gamma_power` 2.22222233, `VdQueryVideoMode`
+  1280x720 HDMI + NTSCM defaults, AsicID),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_error.cc`
+  (`xeRtlNtStatusToDosError` algorithm + `error_table_0xC0000001` /
+  `error_table_0x00000103` entries, 317 fallback),
+  `src/xenia/memory.cc` (MMIO `0x7FC80000-0x7FFFFFFF`, GPU
+  writeback `0x7F000000-0x7FC7FFFF`),
+  `src/xenia/cpu/ppc/ppc_opcode_table_gen.cc` (`ldx` 21, `ldux`
+  53, `stdx` 149, `stdux` 181) and the A-form layout (5-bit XO
+  under the FRC field; `fmuls` XO 25).
+- Taken (facts only): path/device/disposition/action numerics,
+  info-class minimums and layout offsets, video default values,
+  mapped NTSTATUS-to-DOS pairs, address-window bounds, XO numbers.
+- Lives here: `crates/kernel/src/fs.rs` + `crates/filesystem/src/stfs_fs.rs`
+  (path model + STFS backend), `crates/kernel/src/dispatch.rs`
+  (file/video/error shims + unit tests),
+  `crates/memory/src/lib.rs` (MMIO/writeback windows),
+  `crates/cpu/src/decode.rs` (dword-indexed + A-form XOs).
+- NOT taken: directory enumeration order guarantees, file
+  timestamps, unmapped error-table ranges (317 fallback, documented),
+  GPU register behavior behind MMIO (backing bytes only).
+- License: reference is BSD (Ben Vanik / Xenia project); our
+  tracking and logic are original under the workspace
+  BSD-3-Clause. Attribution is kept in the module docs.
+
 ## Next candidates
 
 Concrete, data-only port targets. Each names the reference path and

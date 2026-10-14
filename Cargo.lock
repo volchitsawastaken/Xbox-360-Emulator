@@ -4660,6 +4660,7 @@ dependencies = [
  "log",
  "sha1",
  "x360-common",
+ "x360-kernel",
 ]
 
 [[package]]
