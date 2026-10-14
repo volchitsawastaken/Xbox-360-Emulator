@@ -66,6 +66,14 @@ Terminal states only: impossible, done, or something rendering.
       decodes — retail `fmuls` word 0xEC200732); dword shifts
       (`sldx`/`srdx`/`sradx` + CA), `mfmsr`/`mtmsr`/`mtmsrd` (masked EE),
       `stfiwx` (983) / `lfiwax` (855) XO corrections
+- [x] CPU 64-bit arithmetic family (reference `ppc_emit_alu.cc`:
+      full-width GPR ops): `addi`/`addis`/`addic`/`addic.`/`subfic`/
+      `mulli`/`add`/`subf`/`neg`/`addc`/`adde`/`addme`/`addze`/
+      `subfc`/`subfe`/`subfme`/`subfze` with 64-bit CA/OV/CR0;
+      plain `add`/`subf` no longer clobber CA; X-form logicals
+      (`or`/`and`/`xor`/`nor`/`andc`/`orc`/`nand`/`eqv`) 64-bit;
+      `extsh`/`extsb` sign-extend to 64 bits (D-form logicals,
+      shifts, `cntlzw` unchanged — genuinely 32-bit)
 - [x] Guest MMIO window per reference map: `0x7FC80000` (3.5MB real
       backing, game programs GPU ring registers there) + `0x7F000000`
       writeback/XPS window (12.5MB zeroed); EXEC denied in both
@@ -81,10 +89,13 @@ Terminal states only: impossible, done, or something rendering.
 - [ ] Retail frontier (STFS-backed boot): wild virtual call at
       `0x821503A4` (`bctr` to `0x67735C65` = path-tail bytes). Object
       at `0x010338F0` reuses a path-string buffer; ctor zeroes +0..+12
-      but never sets the +16 vtable slot the method reads. Heap-layout
-      divergence under investigation (game-private heap inside the
-      1MB `0x01030000` arena); all ISA/import faults to this point
-      are cleared
+      but never sets the +16 vtable slot the method reads. Proven so
+      far: reproduces with a single catalog entry (N=1) and blanked
+      bodies (value-independent); identical under a shifted heap base
+      (address-independent); file bytes genuine (single sync 37KB
+      read); every import called in the window returns sane values;
+      two spawned worker threads are independent. Still open:
+      divergence point (which hardware-executed +16 writer we skip)
 
 ## Next (retail-driven, in expected order)
 

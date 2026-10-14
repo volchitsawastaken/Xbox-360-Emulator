@@ -304,22 +304,16 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Addi { rt, ra, simm } => {
-            let base = if ra == 0 {
-                0
-            } else {
-                t.gpr[ra as usize] as u32
-            };
-            t.gpr[rt as usize] = (base.wrapping_add(simm as i32 as u32)) as u64;
+            // 64-bit (reference InstrEmit_addi): RT <- (RA) + EXTS(SI).
+            let base = if ra == 0 { 0 } else { t.gpr[ra as usize] };
+            t.gpr[rt as usize] = base.wrapping_add(simm as i64 as u64);
             t.pc = next;
             Ok(None)
         }
         Decoded::Addis { rt, ra, simm } => {
-            let base = if ra == 0 {
-                0
-            } else {
-                t.gpr[ra as usize] as u32
-            };
-            t.gpr[rt as usize] = (base.wrapping_add((simm as u32) << 16)) as u64;
+            // 64-bit (reference InstrEmit_addis).
+            let base = if ra == 0 { 0 } else { t.gpr[ra as usize] };
+            t.gpr[rt as usize] = base.wrapping_add(((simm as i64) << 16) as u64);
             t.pc = next;
             Ok(None)
         }
@@ -353,9 +347,9 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Mulli { rt, ra, simm } => {
-            let a = (t.gpr[ra as usize] as u32) as i32 as i64;
-            let v = a.wrapping_mul(simm as i64) as u32;
-            t.gpr[rt as usize] = (v) as u64;
+            // 64-bit product, low 64 kept (reference InstrEmit_mulli).
+            let v = (t.gpr[ra as usize] as i64).wrapping_mul(simm as i64) as u64;
+            t.gpr[rt as usize] = v;
             t.pc = next;
             Ok(None)
         }
@@ -462,33 +456,34 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Subfic { rt, ra, simm } => {
-            // RT <- EXTS(SI) - (RA); CA set on NOT-borrow, i.e. the
-            // unsigned 32-bit subtrahend covers the minuend. Only CA is
-            // affected (no OV/SO/CR0 update for D-form arithmetic).
-            let b = simm as i32 as u32;
-            let a = t.gpr[ra as usize] as u32;
+            // 64-bit (reference InstrEmit_subficx): RT <- EXTS(SI) - (RA);
+            // CA set on NOT-borrow out of bit 0. Only CA is affected.
+            let b = simm as i64 as u64;
+            let a = t.gpr[ra as usize];
             let (v, borrow) = b.overflowing_sub(a);
             t.xer.set_ca(!borrow);
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             t.pc = next;
             Ok(None)
         }
         Decoded::Addic { rt, ra, simm } => {
-            // RT <- (RA) + EXTS(SI); CA set on carry out of bit 0.
-            // Only CA is affected (no CR0 update without `.`).
-            let a = t.gpr[ra as usize] as u32;
-            let (v, carry) = a.overflowing_add(simm as i32 as u32);
-            t.xer.set_ca(carry);
-            t.gpr[rt as usize] = (v) as u64;
+            // 64-bit (reference InstrEmit_addic): RT <- (RA) + EXTS(SI);
+            // CA set on carry out of bit 0. Only CA is affected.
+            let a = t.gpr[ra as usize];
+            let total = a as u128 + (simm as i64 as u64) as u128;
+            t.xer.set_ca(total > u64::MAX as u128);
+            t.gpr[rt as usize] = total as u64;
             t.pc = next;
             Ok(None)
         }
         Decoded::Addic_ { rt, ra, simm } => {
-            let a = t.gpr[ra as usize] as u32;
-            let (v, carry) = a.overflowing_add(simm as i32 as u32);
-            t.xer.set_ca(carry);
-            t.gpr[rt as usize] = (v) as u64;
-            update_cr0(t, v);
+            // 64-bit + CR0 (reference InstrEmit_addicx).
+            let a = t.gpr[ra as usize];
+            let total = a as u128 + (simm as i64 as u64) as u128;
+            t.xer.set_ca(total > u64::MAX as u128);
+            let v = total as u64;
+            t.gpr[rt as usize] = v;
+            update_cr0_64(t, v);
             t.pc = next;
             Ok(None)
         }
@@ -1254,46 +1249,49 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Add { rt, ra, rb, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let b = t.gpr[rb as usize] as u32;
-            let (v, carry) = a.overflowing_add(b);
-            t.xer.set_ca(carry);
+            // 64-bit (reference InstrEmit_addx). Plain add records
+            // neither CA nor (without OE) OV/SO.
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            let v = a.wrapping_add(b);
             if oe {
-                let ov = (a as i32).checked_add(b as i32).is_none();
+                let ov = (a as i64).checked_add(b as i64).is_none();
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Subf { rt, ra, rb, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let b = t.gpr[rb as usize] as u32;
-            let (v, borrow) = b.overflowing_sub(a);
-            t.xer.set_ca(!borrow);
+            // 64-bit (reference InstrEmit_subfx). Plain subf records
+            // neither CA nor (without OE) OV/SO.
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            let v = b.wrapping_sub(a);
             if oe {
-                let ov = (b as i32).checked_sub(a as i32).is_none();
+                let ov = (b as i64).checked_sub(a as i64).is_none();
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Neg { rt, ra, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let v = (0u32).wrapping_sub(a);
+            // 64-bit (reference InstrEmit_negx): RT <- 0 - (RA).
+            let a = t.gpr[ra as usize];
+            let v = (0u64).wrapping_sub(a);
             if oe {
-                t.xer.set_ov_so(a == 0x8000_0000);
+                t.xer.set_ov_so(a == 0x8000_0000_0000_0000);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
@@ -1451,211 +1449,227 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Addc { rt, ra, rb, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let b = t.gpr[rb as usize] as u32;
-            let total = a as u64 + b as u64;
-            let v = total as u32;
-            t.xer.set_ca(total > u32::MAX as u64);
+            // 64-bit (reference InstrEmit_addcx).
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            let total = a as u128 + b as u128;
+            let v = total as u64;
+            t.xer.set_ca(total > u64::MAX as u128);
             if oe {
-                let ov = (a as i32 as i64) + (b as i32 as i64) != v as i32 as i64;
+                let ov = (a as i64).checked_add(b as i64).is_none();
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Subfc { rt, ra, rb, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let b = t.gpr[rb as usize] as u32;
-            let total = b as u64 + (!a) as u64 + 1;
-            let v = total as u32;
-            t.xer.set_ca(total > u32::MAX as u64);
+            // 64-bit (reference InstrEmit_subfcx).
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            let total = b as u128 + (!a) as u128 + 1;
+            let v = total as u64;
+            t.xer.set_ca(total > u64::MAX as u128);
             if oe {
-                let ov = (b as i32 as i64) - (a as i32 as i64) != v as i32 as i64;
+                let ov = (b as i64).checked_sub(a as i64).is_none();
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Adde { rt, ra, rb, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let b = t.gpr[rb as usize] as u32;
-            let ca = u64::from(t.xer.ca());
-            let total = a as u64 + b as u64 + ca;
-            let v = total as u32;
-            t.xer.set_ca(total > u32::MAX as u64);
+            // 64-bit (reference InstrEmit_addex).
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            let ca = u128::from(t.xer.ca());
+            let total = a as u128 + b as u128 + ca;
+            let v = total as u64;
+            t.xer.set_ca(total > u64::MAX as u128);
             if oe {
-                let ov = (a as i32 as i64) + (b as i32 as i64) + ca as i64 != v as i32 as i64;
+                let ov = (a as i128) + (b as i128) + (ca as i128) != v as i64 as i128;
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Subfe { rt, ra, rb, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let b = t.gpr[rb as usize] as u32;
-            let ca = u64::from(t.xer.ca());
-            let total = b as u64 + (!a) as u64 + ca;
-            let v = total as u32;
-            t.xer.set_ca(total > u32::MAX as u64);
+            // 64-bit: RT <- ~RA + RB + CA.
+            let a = t.gpr[ra as usize];
+            let b = t.gpr[rb as usize];
+            let ca = u128::from(t.xer.ca());
+            let total = b as u128 + (!a) as u128 + ca;
+            let v = total as u64;
+            t.xer.set_ca(total > u64::MAX as u128);
             if oe {
-                let ov = (b as i32 as i64) - (a as i32 as i64) + ca as i64 - 1 != v as i32 as i64;
+                let ov = (b as i128) - (a as i128) + (ca as i128) - 1 != v as i64 as i128;
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Addme { rt, ra, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let ca = u64::from(t.xer.ca());
-            let total = a as u64 + u32::MAX as u64 + ca;
-            let v = total as u32;
-            t.xer.set_ca(total > u32::MAX as u64);
+            // 64-bit (reference InstrEmit_addmex): RT <- (RA) + CA - 1.
+            let a = t.gpr[ra as usize];
+            let ca = u128::from(t.xer.ca());
+            let total = a as u128 + (u64::MAX as u128) + ca;
+            let v = total as u64;
+            t.xer.set_ca(total > u64::MAX as u128);
             if oe {
-                let ov = (a as i32 as i64) - 1 + ca as i64 != v as i32 as i64;
+                let ov = (a as i128) + (ca as i128) - 1 != v as i64 as i128;
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Subfme { rt, ra, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let ca = u64::from(t.xer.ca());
-            let total = u32::MAX as u64 + (!a) as u64 + ca;
-            let v = total as u32;
-            t.xer.set_ca(total > u32::MAX as u64);
+            // 64-bit: RT <- ~RA + CA - 1.
+            let a = t.gpr[ra as usize];
+            let ca = u128::from(t.xer.ca());
+            let total = (!a) as u128 + (u64::MAX as u128) + ca;
+            let v = total as u64;
+            t.xer.set_ca(total > u64::MAX as u128);
             if oe {
-                let ov = -1 + ((!a) as i32 as i64) + ca as i64 != v as i32 as i64;
+                let ov = (!(a as i64)) as i128 + (ca as i128) - 1 != v as i64 as i128;
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Addze { rt, ra, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let ca = u64::from(t.xer.ca());
-            let total = a as u64 + ca;
-            let v = total as u32;
-            t.xer.set_ca(total > u32::MAX as u64);
+            // 64-bit (reference InstrEmit_addzex): RT <- (RA) + CA.
+            let a = t.gpr[ra as usize];
+            let ca = u128::from(t.xer.ca());
+            let total = a as u128 + ca;
+            let v = total as u64;
+            t.xer.set_ca(total > u64::MAX as u128);
             if oe {
-                let ov = (a as i32 as i64) + ca as i64 != v as i32 as i64;
+                let ov = (a as i128) + (ca as i128) != v as i64 as i128;
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Subfze { rt, ra, rc, oe } => {
-            let a = t.gpr[ra as usize] as u32;
-            let ca = u64::from(t.xer.ca());
-            let total = (!a) as u64 + ca;
-            let v = total as u32;
-            t.xer.set_ca(total > u32::MAX as u64);
+            // 64-bit: RT <- ~RA + CA.
+            let a = t.gpr[ra as usize];
+            let ca = u128::from(t.xer.ca());
+            let total = (!a) as u128 + ca;
+            let v = total as u64;
+            t.xer.set_ca(total > u64::MAX as u128);
             if oe {
-                let ov = -((a as i32 as i64) + 1) + ca as i64 != v as i32 as i64;
+                let ov = (!(a as i64)) as i128 + (ca as i128) != v as i64 as i128;
                 t.xer.set_ov_so(ov);
             }
-            t.gpr[rt as usize] = (v) as u64;
+            t.gpr[rt as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::And { rs, ra, rb, rc } => {
-            let v = (t.gpr[rs as usize] as u32) & (t.gpr[rb as usize] as u32);
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit (reference InstrEmit_andx).
+            let v = t.gpr[rs as usize] & t.gpr[rb as usize];
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Or { rs, ra, rb, rc } => {
-            let v = (t.gpr[rs as usize] as u32) | (t.gpr[rb as usize] as u32);
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit (reference InstrEmit_orx).
+            let v = t.gpr[rs as usize] | t.gpr[rb as usize];
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Xor { rs, ra, rb, rc } => {
-            let v = (t.gpr[rs as usize] as u32) ^ (t.gpr[rb as usize] as u32);
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit (reference InstrEmit_xorx).
+            let v = t.gpr[rs as usize] ^ t.gpr[rb as usize];
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Nor { rs, ra, rb, rc } => {
-            let v = !((t.gpr[rs as usize] as u32) | (t.gpr[rb as usize] as u32));
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit (reference InstrEmit_norx).
+            let v = !(t.gpr[rs as usize] | t.gpr[rb as usize]);
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Andc { rs, ra, rb, rc } => {
-            let v = (t.gpr[rs as usize] as u32) & !(t.gpr[rb as usize] as u32);
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit (reference InstrEmit_andcx).
+            let v = t.gpr[rs as usize] & !t.gpr[rb as usize];
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Orc { rs, ra, rb, rc } => {
-            let v = (t.gpr[rs as usize] as u32) | !(t.gpr[rb as usize] as u32);
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit.
+            let v = t.gpr[rs as usize] | !t.gpr[rb as usize];
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Nand { rs, ra, rb, rc } => {
-            let v = !((t.gpr[rs as usize] as u32) & (t.gpr[rb as usize] as u32));
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit (reference InstrEmit_nandx).
+            let v = !(t.gpr[rs as usize] & t.gpr[rb as usize]);
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Eqv { rs, ra, rb, rc } => {
-            let v = !((t.gpr[rs as usize] as u32) ^ (t.gpr[rb as usize] as u32));
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit.
+            let v = !(t.gpr[rs as usize] ^ t.gpr[rb as usize]);
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
@@ -1689,19 +1703,21 @@ pub fn execute(
             Ok(None)
         }
         Decoded::Extsh { rs, ra, rc } => {
-            let v = ((t.gpr[rs as usize] as u32) as u16 as i16) as u32;
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit sign extend (reference InstrEmit_extshx).
+            let v = ((t.gpr[rs as usize] as u16) as i16) as i64 as u64;
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
         }
         Decoded::Extsb { rs, ra, rc } => {
-            let v = ((t.gpr[rs as usize] as u32) as u8 as i8) as u32;
-            t.gpr[ra as usize] = (v) as u64;
+            // 64-bit sign extend (reference InstrEmit_extsbx).
+            let v = ((t.gpr[rs as usize] as u8) as i8) as i64 as u64;
+            t.gpr[ra as usize] = v;
             if rc {
-                update_cr0(t, v);
+                update_cr0_64(t, v);
             }
             t.pc = next;
             Ok(None)
@@ -2614,12 +2630,28 @@ mod tests {
 
     #[test]
     fn word_ops_zero_extend() {
-        // High bits set by a dword load are cleared by the next word op,
-        // matching recompiled-code observable behavior.
+        // True word ops (loads, D-form logicals, word shifts) clear the
+        // high half; arithmetic and X-form logicals are full 64-bit.
         let (mut t, mut m) = setup();
+        // addi preserves high halves (64-bit add).
         t.gpr[3] = 0xFFFF_FFFF_0000_0000;
         run_word(0x3863_0001, &mut t, &mut m); // addi r3,r3,1
-        assert_eq!(t.gpr[3], 1);
+        assert_eq!(t.gpr[3], 0xFFFF_FFFF_0000_0001);
+        // ori clears the high half (D-form logicals are 32-bit).
+        t.gpr[3] = 0xFFFF_FFFF_0000_0000;
+        run_word(0x6063_00FF, &mut t, &mut m); // ori r3,r3,0xFF
+        assert_eq!(t.gpr[3], 0xFF);
+        // X-form or keeps the high half (64-bit logical).
+        t.gpr[4] = 0xFFFF_0000_0000_0000;
+        t.gpr[5] = 0x0000_0000_0000_00FF;
+        let or = (31u32 << 26) | (4 << 21) | (6 << 16) | (5 << 11) | (444 << 1);
+        run_word(or, &mut t, &mut m); // or r6,r4,r5
+        assert_eq!(t.gpr[6], 0xFFFF_0000_0000_00FF);
+        // extsh sign-extends to 64 bits.
+        t.gpr[7] = 0x0000_0000_0000_80FF;
+        let extsh = (31u32 << 26) | (7 << 21) | (8 << 16) | (922 << 1);
+        run_word(extsh, &mut t, &mut m); // extsh r8,r7
+        assert_eq!(t.gpr[8], 0xFFFF_FFFF_FFFF_80FF);
     }
 
     #[test]
@@ -2677,44 +2709,57 @@ mod tests {
     #[test]
     fn neg_word_retail() {
         let (mut t, mut m) = setup();
-        // Retail word: neg r3,r11 -> 0x7C6B00D0.
+        // Retail word: neg r3,r11 -> 0x7C6B00D0. 64-bit negate
+        // (reference InstrEmit_negx): low word matches the old
+        // word-oriented expectation, high half is the true 64-bit sign.
         t.gpr[11] = 1_u64;
         run_word(0x7C6B_00D0, &mut t, &mut m);
         assert_eq!((t.gpr[3] as u32), 0xFFFF_FFFF);
-        assert_eq!(t.gpr[3], 0xFFFF_FFFF);
+        assert_eq!(t.gpr[3], 0xFFFF_FFFF_FFFF_FFFF);
         // Zero stays zero.
         t.gpr[11] = 0_u64;
         run_word(0x7C6B_00D0, &mut t, &mut m);
         assert_eq!((t.gpr[3] as u32), 0);
-        // INT_MIN negates to itself; OE reports overflow.
+        // 0x80000000 negates without overflow (fits in 64 bits).
         t.gpr[11] = 0x8000_0000_u64;
+        run_word(0x7C6B_00D0, &mut t, &mut m);
+        assert_eq!(t.gpr[3], 0xFFFF_FFFF_8000_0000);
+        // Only INT64_MIN overflows with OE.
+        t.gpr[11] = 0x8000_0000_0000_0000_u64;
         let nego = 0x7C6B_00D0 | (1 << 10);
         run_word(nego, &mut t, &mut m);
-        assert_eq!((t.gpr[3] as u32), 0x8000_0000);
+        assert_eq!(t.gpr[3], 0x8000_0000_0000_0000);
         assert!(t.xer.so());
     }
 
     #[test]
     fn carry_chain_addc_adde_addze() {
         let (mut t, mut m) = setup();
-        // Low word: 0xFFFFFFFF + 1 -> 0 with carry.
+        // 64-bit addc (reference InstrEmit_addcx): low-word overflow
+        // alone does NOT carry (carry is out of bit 0, 64-bit).
         t.gpr[10] = 0xFFFF_FFFF_u64;
         t.gpr[11] = 1_u64;
         let addc = (31u32 << 26) | (12 << 21) | (10 << 16) | (11 << 11) | (10 << 1);
         run_word(addc, &mut t, &mut m);
-        assert_eq!((t.gpr[12] as u32), 0);
+        assert_eq!(t.gpr[12], 0x1_0000_0000);
+        assert!(!t.xer.ca());
+        // True 64-bit carry: MAX + 1 -> 0 with carry.
+        t.gpr[10] = 0xFFFF_FFFF_FFFF_FFFF_u64;
+        t.gpr[11] = 1_u64;
+        run_word(addc, &mut t, &mut m);
+        assert_eq!(t.gpr[12], 0);
         assert!(t.xer.ca());
         // High word: 0 + 0 + CA -> 1 (retail addze pattern).
         t.gpr[13] = 0_u64;
         t.gpr[14] = 0_u64;
         let adde = (31u32 << 26) | (15 << 21) | (13 << 16) | (14 << 11) | (138 << 1);
         run_word(adde, &mut t, &mut m);
-        assert_eq!((t.gpr[15] as u32), 1);
+        assert_eq!(t.gpr[15], 1);
         // Retail pattern: addze r10,r10 with CA set wraps to 0, CA stays set.
         t.xer.set_ca(true);
-        t.gpr[10] = 0xFFFF_FFFF_u64;
+        t.gpr[10] = 0xFFFF_FFFF_FFFF_FFFF_u64;
         run_word(0x7D4A_0194, &mut t, &mut m); // addze r10,r10 (202<<1=0x194)
-        assert_eq!((t.gpr[10] as u32), 0);
+        assert_eq!(t.gpr[10], 0);
         assert!(t.xer.ca());
     }
 
@@ -2851,10 +2896,17 @@ mod tests {
     #[test]
     fn addic_carry_and_cr0() {
         let (mut t, mut m) = setup();
-        // 0xFFFFFFFF + 1 wraps with carry, result zero sets CR0 EQ.
+        // 64-bit addic.: 0xFFFFFFFF + 1 = 0x100000000, no 64-bit
+        // carry; CR0 GT (nonzero).
         t.gpr[8] = 0xFFFF_FFFF_u64;
         run_word(0x3508_0001, &mut t, &mut m); // addic. r8,r8,1
-        assert_eq!((t.gpr[8] as u32), 0);
+        assert_eq!(t.gpr[8], 0x1_0000_0000);
+        assert!(!t.xer.ca());
+        assert_eq!(t.cr.field(0) & 0b0100, 0b0100); // GT
+                                                    // True 64-bit carry sets CA and CR0 EQ on zero.
+        t.gpr[8] = 0xFFFF_FFFF_FFFF_FFFF_u64;
+        run_word(0x3508_0001, &mut t, &mut m);
+        assert_eq!(t.gpr[8], 0);
         assert!(t.xer.ca());
         assert_eq!(t.cr.field(0) & 0b0010, 0b0010); // EQ
                                                     // No carry, nonzero result: CA clear, CR0 GT.
@@ -2863,7 +2915,7 @@ mod tests {
         assert_eq!((t.gpr[8] as u32), 5);
         assert!(!t.xer.ca());
         assert_eq!(t.cr.field(0) & 0b0100, 0b0100); // GT
-                                                    // Borrow-style: 5 + (-1) wraps upward, CA set, result 4.
+                                                    // 5 + (-1) = 4 with 64-bit carry out: CA set.
         t.gpr[8] = 5_u64;
         run_word(0x3508_FFFF, &mut t, &mut m); // addic. r8,r8,-1
         assert_eq!((t.gpr[8] as u32), 4);
@@ -2921,14 +2973,57 @@ mod tests {
         use x360_memory::Memory;
         let mut t = ThreadState::new(0, 0x1000);
         let mut m = Memory::new();
-        t.gpr[3] = 0x7FFF_FFFF_u64;
+        // 64-bit overflow only: INT64_MAX + 1 wraps with OE.
+        t.gpr[3] = 0x7FFF_FFFF_FFFF_FFFF_u64;
         t.gpr[4] = 1_u64;
         // add r5,r3,r4 with OE=1, Rc=0: XO=266, OE bit10=1
         let word = (31u32 << 26) | (5 << 21) | (3 << 16) | (4 << 11) | (1 << 10) | (266 << 1);
         let d = decode(word).unwrap();
         execute(d, word, &mut t, &mut m).unwrap();
-        assert_eq!((t.gpr[5] as u32), 0x8000_0000);
+        assert_eq!(t.gpr[5], 0x8000_0000_0000_0000);
         assert!(t.xer.so());
+        // 0x7FFFFFFF + 1 fits in 64 bits: value lands, no overflow.
+        t.gpr[3] = 0x7FFF_FFFF_u64;
+        t.gpr[4] = 1_u64;
+        t.xer.0 &= !(1 << 31); // clear sticky SO for the negative check
+        execute(d, word, &mut t, &mut m).unwrap();
+        assert_eq!(t.gpr[5], 0x8000_0000);
+        assert!(!t.xer.so());
+    }
+
+    #[test]
+    fn add_family_is_64bit() {
+        let (mut t, mut m) = setup();
+        // addi preserves high halves: (1<<32) + 1.
+        t.gpr[6] = 0x1_0000_0000_u64;
+        run_word(0x38C6_0001, &mut t, &mut m); // addi r6,r6,1
+        assert_eq!(t.gpr[6], 0x1_0000_0001);
+        // Plain add records no CA (ISA: only addc/adde/... record CA).
+        t.xer.set_ca(true);
+        t.gpr[7] = 5_u64;
+        t.gpr[8] = 7_u64;
+        let add = (31u32 << 26) | (9 << 21) | (7 << 16) | (8 << 11) | (266 << 1);
+        run_word(add, &mut t, &mut m);
+        assert_eq!(t.gpr[9], 12);
+        assert!(t.xer.ca()); // untouched (was set)
+        t.xer.set_ca(false);
+        t.gpr[7] = 0xFFFF_FFFF_FFFF_FFFF_u64;
+        t.gpr[8] = 1_u64;
+        run_word(add, &mut t, &mut m);
+        assert_eq!(t.gpr[9], 0);
+        assert!(!t.xer.ca()); // still untouched (was clear)
+                              // addis with negative simm sign-extends into the high half
+                              // (retail global-address idiom: addis r11,0,-32248).
+        t.gpr[11] = 0_u64;
+        run_word(0x3D60_8208, &mut t, &mut m); // addis r11,0,0x8208
+        assert_eq!(t.gpr[11], 0xFFFF_FFFF_8208_0000);
+        // mulli keeps the full 64-bit product.
+        t.gpr[12] = 0x1_0000_u64;
+        run_word(0x1DAC_0001, &mut t, &mut m); // mulli r13,r12,1
+        assert_eq!(t.gpr[13], 0x1_0000);
+        t.gpr[12] = 0x1_0000_0000_u64;
+        run_word(0x1DAC_FFFF, &mut t, &mut m); // mulli r13,r12,-1
+        assert_eq!(t.gpr[13], 0xFFFF_FFFF_0000_0000);
     }
 
     // --- Rotate-and-mask + compares (retail prologue staples) ---
@@ -3376,11 +3471,12 @@ mod tests {
         run_word(dform(8, 4, 3, 3), &mut t, &mut m);
         assert_eq!((t.gpr[4] as u32), 0xFFFF_FFF9);
         assert!(!t.xer.ca());
-        // Negative-immediate regression: -5 - 0xFFFFFFFE borrows (CA=0).
+        // Negative immediate, 64-bit compare: -5 (huge unsigned) minus
+        // 0xFFFFFFFE does not borrow (CA=1).
         t.gpr[3] = 0xFFFF_FFFE_u64;
         run_word(dform(8, 4, 3, -5), &mut t, &mut m);
         assert_eq!((t.gpr[4] as u32), 0xFFFF_FFFD);
-        assert!(!t.xer.ca());
+        assert!(t.xer.ca());
         // D-form arithmetic leaves CR0 alone.
         t.cr.set_field(0, 0b0100);
         t.gpr[3] = 1_u64;

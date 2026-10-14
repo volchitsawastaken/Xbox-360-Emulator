@@ -204,6 +204,14 @@ out, and the license note. Workspace license: BSD-3-Clause.
   (file/video/error shims + unit tests),
   `crates/memory/src/lib.rs` (MMIO/writeback windows),
   `crates/cpu/src/decode.rs` (dword-indexed + A-form XOs).
+- Source: `src/xenia/cpu/ppc/ppc_emit_alu.cc` (`InstrEmit_addx/
+  addcx/addex/addi/addic/addicx/addis/addmex/addzex/negx/subfx/
+  subfcx/andx/andcx/andix/orx/nandx/extsbx/extshx/extswx/slwx`:
+  full-width GPR arithmetic/logical/extend ops; D-form logicals
+  and word shifts/rotates stay 32-bit; plain `add`/`subf` record
+  no CA).
+- Taken (facts only): 64-bit op widths, CA/OV/CR0 recording rules.
+- Lives here: `crates/cpu/src/exec.rs` (widened arms + unit tests).
 - NOT taken: directory enumeration order guarantees, file
   timestamps, unmapped error-table ranges (317 fallback, documented),
   GPU register behavior behind MMIO (backing bytes only).

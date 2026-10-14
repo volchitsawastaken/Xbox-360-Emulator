@@ -7,7 +7,7 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 
 | Area | Status | Notes |
 |---|---|---|
-| Integer ALU (addi, addis, ori, oris, xori, andi, extsh/extsb, shifts) | partial | Covered by unit vectors; OE/OV/SO honored for add/subf; X-form + D-form logicals use RS-in-RT/dest-in-RA layout (reference RS()=RT()); `neg` word with OE on 0x80000000 |
+| Integer ALU (addi, addis, ori, oris, xori, andi, extsh/extsb, shifts) | partial | Full 64-bit add/sub family per reference (`addi`/`addis`/`addic`/`subfic`/`mulli`/`add`/`subf`/`neg`/`addc`/`adde`/`addme`/`addze`/`subfc`/`subfe`/`subfme`/`subfze` with 64-bit CA/OV/CR0; plain add/subf record no CA); X-form logicals (`or`/`and`/`xor`/`nor`/`andc`/`orc`/`nand`/`eqv`) 64-bit; `extsh`/`extsb` sign-extend to 64; D-form logicals, word shifts, `cntlzw` stay 32-bit; OE/OV/SO honored; X-form + D-form logicals use RS-in-RT/dest-in-RA layout (reference RS()=RT()); tested |
 | Branches (b, bc, bclr + LK) | partial | CR/BI/BO honored, LK writes LR; bcctr does not decrement CTR |
 | bcctr | partial | Target from CTR, no decrement; tested |
 | Loads/stores (lwz/stw/lbz/stb/lhz/sth/lmw/stmw/multiple) | partial | Alignment + bounds checked (u32/u16/u8); u64 permissive on 4-aligned (retail `std` to 4-aligned tolerated like reference memory); X-form dword-indexed `ldx`/`ldux`/`stdx`/`stdux` (XOs 21/53/149/181) with update forms; EXEC required for fetch; MMIO window `0x7FC80000` (3.5MB backing) + `0x7F000000` writeback window (12.5MB zeroed) per reference map, EXEC denied in both |
