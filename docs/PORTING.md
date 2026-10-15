@@ -300,16 +300,24 @@ out, and the license note. Workspace license: BSD-3-Clause.
   INTERRUPT payload layouts, `MatchValueAndRef`),
   `src/xenia/gpu/register_table.inc` (`WRITEBACK_START 0x0A04`,
   `WRITEBACK_SIZE 0x0A05`, `VGT_EVENT_INITIATOR 0x21F9`,
-  `RB_SAMPLE_COUNT_ADDR 0x2325`).
+  `RB_SAMPLE_COUNT_ADDR 0x2325`),
+  `src/xenia/gpu/graphics_system.cc` (`SetInterruptCallback`,
+  `DispatchInterruptCallback(source=1, cpu=bit)`),
+  `src/xenia/kernel/kernel_state.cc` (`EmulateCPInterruptDPC`:
+  early-return when null, args `{source, data}`),
+  `src/xenia/cpu/processor.cc` (`Execute`: stack pad `64+112`,
+  LR sentinel `0xBCBCBCBC`, args in r3+).
 - Taken (facts only): register index + framing/field maps, zero
   size, swap table, match function, writeback remap rule.
 - Lives here: `crates/kernel/src/gpu.rs` (executor + unit tests),
   `crates/kernel/src/lib.rs` (`pump_gpu`, `vd_regs`,
-  `vd_irq_pending`), `crates/kernel/src/boot.rs` (per-step pump),
-  `crates/kernel/src/dispatch.rs` (ring-zero shim + test).
+  `vd_irq_pending` queue, `vd_callback_active`, `vd_delivered`),
+  `crates/kernel/src/boot.rs` (per-step pump + sentinel hijack
+  delivery/return), `crates/kernel/src/dispatch.rs` (ring-zero shim
+  + test).
 - NOT taken: draw/state packet semantics (length-skipped), shader
-  upload, EDRAM/resolve, interrupt delivery, worker-thread
-  scheduling of the GPU completion path.
+  upload, EDRAM/resolve, DPC IRQL impersonation (no guest KPCR yet;
+  delivery restores full state instead of clobbering volatiles).
 - License: reference is BSD (Ben Vanik / Xenia project); our
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.
@@ -337,8 +345,8 @@ out, and the license note. Workspace license: BSD-3-Clause.
   `KeResetEvent`, `XamShowMessageBoxUI(Ex)` + unit tests),
   `crates/common/src/lib.rs` (`EmuError::Blocked`).
 - NOT taken: time-based finite waits (immediate TIMEOUT),
-  overlapped-async UI completion (sync completion), APC delivery,
-  interrupt-callback delivery.
+  overlapped-async UI completion (sync completion), APC delivery.
+  (Interrupt-callback delivery is now implemented — see §10.)
 - License: reference is BSD (Ben Vanik / Xenia project); our
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.

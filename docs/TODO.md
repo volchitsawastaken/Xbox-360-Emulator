@@ -200,9 +200,21 @@ Terminal states only: impossible, done, or something rendering.
       trace-diffing both table-walk frontiers without TEMP cycles
       (`TraceEvent.thread`, `render`/`write_trace_file`, boot wires
       slot ids, gate failure dump uses the sink)
-- [ ] GPU interrupt-callback delivery (safe guest reentry) once the
-      scheduler exists; then draw backend
-- [ ] VMX128 FP arithmetic (`vaddfp`, `vmulfp`, float permutes)
+- [x] GPU interrupt-callback delivery (reference
+      `graphics_system.cc` `DispatchInterruptCallback` +
+      `kernel_state.cc` `EmulateCPInterruptDPC` + `processor.cc`
+      `Execute`: LR sentinel `0xBCBCBCBC`, stack pad 176B, args
+      `r3=source, r4=user_data`): per-bit queue from INTERRUPT packets
+      (`(source=1, cpu=bit)`), boot-runner hijack on thread 0 with full
+      context save/restore (strictly safer than the reference's
+      volatile clobber), Blocked-safe under round-robin, unregistered
+      callbacks drain; unit-tested (delivery/restore, drain, per-bit
+      queue). Retail Braid result: queue stays EMPTY (`delivered=0`) —
+      its stream contains zero INTERRUPT packets, so this is not the
+      missing queueing trigger (documented, not reverted: genuine OS
+      feature)
+- [ ] Draw backend (next GPU step) OR VMX128 FP arithmetic (`vaddfp`,
+      `vmulfp`, float permutes) — pick by retail demand
 - [ ] Kernel shims on demand (file data, content)
 - [ ] Commit + push; update PORTING.md / COMPATIBILITY.md
 

@@ -27,8 +27,7 @@
 //! pipeline-state packets are length-skipped and counted (there is no
 //! draw backend yet); unmatched waits, malformed framing, and exotic
 //! endianness are explicit errors, never silent mis-execution.
-//! Interrupts are recorded pending; delivery needs a safe
-//! guest-reentry point and is still pending.
+//! Interrupts queue per set mask bit for boot-runner delivery.
 
 use std::collections::HashSet;
 use x360_common::{EmuError, Result};
@@ -467,12 +466,29 @@ impl Kernel {
                 if cnt < 1 {
                     return Err(EmuError::Other("PM4 short INTERRUPT".into()));
                 }
-                if p(0) != 0 {
-                    // Reference dispatches the guest graphics-interrupt
-                    // callback per set bit; delivery needs a safe
-                    // reentry point, so record it explicitly pending.
-                    self.vd_irq_pending += 1;
-                    st.interrupts += 1;
+                let mask = p(0);
+                if mask != 0 {
+                    // Reference `ExecutePacketType3_INTERRUPT` dispatches
+                    // per set bit: `DispatchInterruptCallback(1, n)`.
+                    // Queue (source=1, cpu=n) for boot-runner delivery;
+                    // the packet itself consumes exactly the mask word.
+                    for n in 0..6u32 {
+                        if mask & (1 << n) != 0 {
+                            self.vd_irq_pending.push_back((1, n));
+                            st.interrupts += 1;
+                        }
+                    }
+                    // Non-low-6 bits (if any) are still genuine
+                    // interrupts; queue them too rather than dropping.
+                    let extra = mask & !0x3F;
+                    if extra != 0 {
+                        for n in 6..32u32 {
+                            if mask & (1 << n) != 0 {
+                                self.vd_irq_pending.push_back((1, n));
+                                st.interrupts += 1;
+                            }
+                        }
+                    }
                 }
                 // Reference consumes exactly the mask word.
                 Ok(c + 2)
@@ -607,5 +623,29 @@ mod tests {
             .unwrap();
         assert_eq!(st.skipped_packets, 1);
         assert_eq!(k.vd_regs.get(&0xA31), Some(&0x42));
+    }
+
+    #[test]
+    fn interrupt_queues_per_set_bit() {
+        let mut k = kernel();
+        let mut m = Memory::new();
+        // INTERRUPT cnt 1, mask bits 0 and 2.
+        let words = vec![0xC000_5400, 0x0000_0005];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .unwrap();
+        assert_eq!(st.interrupts, 2);
+        assert_eq!(k.vd_irq_pending.len(), 2);
+        assert_eq!(k.vd_irq_pending[0], (1, 0));
+        assert_eq!(k.vd_irq_pending[1], (1, 2));
+        // Zero mask queues nothing.
+        let words = vec![0xC000_5400, 0x0000_0000];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .unwrap();
+        assert_eq!(st.interrupts, 0);
+        assert_eq!(k.vd_irq_pending.len(), 2);
     }
 }

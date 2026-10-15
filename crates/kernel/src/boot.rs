@@ -98,6 +98,109 @@ pub fn run_until_exit_traced(
     run_until_exit_traced_imports(mem, xenon, kernel, None, max_steps, trace)
 }
 
+/// GPU-interrupt callback return sentinel (reference
+/// `Processor::Execute`: LR = `0xBCBCBCBC`, stack padded 176B).
+pub const VD_CALLBACK_RETURN: u32 = 0xBCBC_BCBC;
+/// Stack padding for callback delivery (reference `64 + 112`).
+pub const VD_CALLBACK_STACK_PAD: u32 = 176;
+
+/// Deliver one queued GPU interrupt, if any, by hijacking thread 0
+/// (reference `EmulateCPInterruptDPC` + `Processor::Execute`: args
+/// `r3=source, r4=user_data`, `r1-=176`, `lr=sentinel`). Full thread
+/// state is saved and restored on sentinel return, so interrupted
+/// code resumes exactly. Safe under round-robin: a blocking wait
+/// inside the callback rewinds to its thunk and retries on later
+/// turns while other threads run. No delivery while one is active;
+/// unregistered callbacks drain the queue (reference early-return).
+fn maybe_deliver_gpu_interrupt(mem: &mut Memory, xenon: &mut Xenon, kernel: &mut Kernel) {
+    // Return path is handled separately (needs no mem); see
+    // `maybe_return_from_gpu_interrupt`.
+    if kernel.vd_callback_active.is_some() {
+        return;
+    }
+    if kernel.vd_irq_pending.is_empty() {
+        return;
+    }
+    let (callback, user_data) = match kernel.vd_interrupt {
+        Some((cb, ud)) if cb != 0 => (cb, ud),
+        _ => {
+            // No guest callback: drop queued interrupts (reference
+            // `if (!interrupt_callback) return;`).
+            kernel.vd_irq_pending.clear();
+            return;
+        }
+    };
+    // Deliver on thread 0 (main): it owns graphics init and is
+    // always runnable. Other threads keep their waits/progress.
+    if xenon.threads.is_empty() {
+        return;
+    }
+    // Don't hijack a thread sitting on the sentinel (shouldn't
+    // happen without an active frame, but never corrupt it).
+    if xenon.threads[0].t.pc == VD_CALLBACK_RETURN {
+        return;
+    }
+    let Some((source, cpu)) = kernel.vd_irq_pending.pop_front() else {
+        return;
+    };
+    let saved = xenon.threads[0].t.clone();
+    // Stack pad (checked; skip delivery this turn if underflow or
+    // outside mapped memory — a real stack fault surfaces on normal
+    // stepping, never from the hijack itself).
+    let r1 = saved.gpr[1] as u32;
+    let Some(nr1) = r1.checked_sub(VD_CALLBACK_STACK_PAD) else {
+        kernel.vd_irq_pending.push_front((source, cpu));
+        return;
+    };
+    if mem.read_u32(nr1).is_err() {
+        kernel.vd_irq_pending.push_front((source, cpu));
+        return;
+    }
+    xenon.threads[0].t.gpr[1] = nr1 as u64;
+    xenon.threads[0].t.gpr[3] = source as u64;
+    xenon.threads[0].t.gpr[4] = user_data as u64;
+    xenon.threads[0].t.pc = callback;
+    xenon.threads[0].t.lr = VD_CALLBACK_RETURN;
+    kernel.vd_callback_active = Some(crate::VdCallbackFrame {
+        slot: 0,
+        saved,
+        source,
+        cpu,
+    });
+    kernel.vd_delivered += 1;
+    log::info!(
+        "kernel: GPU interrupt delivered src={} cpu={} cb={:08x}",
+        source,
+        cpu,
+        callback
+    );
+}
+
+/// Restore the hijacked thread when its callback returns (pc hits
+/// the sentinel). Returns true when a return was consumed.
+fn maybe_return_from_gpu_interrupt(xenon: &mut Xenon, kernel: &mut Kernel) -> bool {
+    let slot = match &kernel.vd_callback_active {
+        Some(f) => f.slot as usize,
+        None => return false,
+    };
+    if slot >= xenon.threads.len() {
+        return false;
+    }
+    if xenon.threads[slot].t.pc != VD_CALLBACK_RETURN {
+        return false;
+    }
+    if let Some(frame) = kernel.vd_callback_active.take() {
+        // Restore full interrupted state (pc/lr/regs); memory effects
+        // from the callback persist (separate backing).
+        xenon.threads[slot].t = frame.saved;
+        log::info!(
+            "kernel: GPU interrupt returned src={} cpu={}",
+            frame.source,
+            frame.cpu
+        );
+    }
+    true
+}
 /// Import-aware run: `table` maps rewritten thunk addresses to their
 /// resolved imports. See [`run_until_exit_traced`] for the fallback.
 /// Threads run cooperatively round-robin (one step each): slot 0 is the
@@ -137,6 +240,11 @@ pub fn run_until_exit_traced_imports(
                 }
             }
         }
+        // Callback return: a hijacked thread whose pc hit the
+        // sentinel resumes its saved state (no step consumed).
+        if maybe_return_from_gpu_interrupt(xenon, kernel) {
+            continue;
+        }
         // Next runnable slot, round-robin.
         let n = xenon.threads.len();
         let mut pick: Option<usize> = None;
@@ -164,6 +272,7 @@ pub fn run_until_exit_traced_imports(
                 kernel.exit_cpu_thread(i as u32);
                 steps += 1;
                 kernel.pump_gpu(mem)?;
+                maybe_deliver_gpu_interrupt(mem, xenon, kernel);
                 continue;
             }
             Err(e) => return Err(e),
@@ -171,8 +280,9 @@ pub fn run_until_exit_traced_imports(
         };
         steps += 1;
         // Retire kicked GPU ring batches (PM4 executor); guest fences
-        // observe real progress.
+        // observe real progress. Queued interrupts deliver on thread 0.
         kernel.pump_gpu(mem)?;
+        maybe_deliver_gpu_interrupt(mem, xenon, kernel);
         let Some(t) = trap else { continue };
         // Thunk trap? The rewriter leaves `sc` at the thunk address,
         // so the post-`sc` pc minus 4 names the import.
@@ -417,5 +527,57 @@ mod tests {
         let threads: std::collections::HashSet<u32> = trace.iter().map(|e| e.thread).collect();
         assert!(threads.contains(&0));
         assert!(threads.contains(&1));
+    }
+
+    #[test]
+    fn gpu_interrupt_delivers_and_restores() {
+        let mut mem = Memory::new();
+        // Callback at 0x90000000: [user_data] = source (r3), then return.
+        // stw r3,0(r4) = 0x90640000; blr = 0x4E800020.
+        let cb = 0x9000_0000u32;
+        mem.write_u32(cb, 0x9064_0000).unwrap();
+        mem.write_u32(cb + 4, 0x4E80_0020).unwrap();
+        // Main: 20 nops then exit 0 (long enough for hijack+return).
+        let entry = 0x8200_0000u32;
+        for i in 0..20u32 {
+            mem.write_u32(entry + i * 4, 0x6000_0000).unwrap();
+        }
+        mem.write_u32(entry + 80, 0x3860_0000).unwrap();
+        mem.write_u32(entry + 84, 0x3800_0001).unwrap();
+        mem.write_u32(entry + 88, 0x4400_0002).unwrap();
+        let mut xenon = Xenon::new(entry);
+        // Writable stack for the 176B pad.
+        xenon.threads[0].t.gpr[1] = 0x0100_1000;
+        let mut kernel = Kernel::new();
+        kernel.vd_interrupt = Some((cb, 0x0100_0200));
+        kernel.vd_irq_pending.push_back((1, 2));
+        let exit = run_until_exit(&mut mem, &mut xenon, &mut kernel, 200).unwrap();
+        assert_eq!(exit.code, 0);
+        // Callback ran with source=1, state restored afterwards.
+        assert_eq!(mem.read_u32(0x0100_0200).unwrap(), 1);
+        assert_eq!(kernel.vd_delivered, 1);
+        assert!(kernel.vd_callback_active.is_none());
+        assert!(kernel.vd_irq_pending.is_empty());
+        // Interrupted main resumed and exited normally (stack restored).
+        assert_eq!(xenon.threads[0].t.gpr[1] as u32, 0x0100_1000);
+    }
+
+    #[test]
+    fn gpu_interrupt_without_callback_drains() {
+        let mut mem = Memory::new();
+        let entry = 0x8200_0000u32;
+        mem.write_u32(entry, 0x3860_0000).unwrap();
+        mem.write_u32(entry + 4, 0x3800_0001).unwrap();
+        mem.write_u32(entry + 8, 0x4400_0002).unwrap();
+        let mut xenon = Xenon::new(entry);
+        xenon.threads[0].t.gpr[1] = 0x0100_1000;
+        let mut kernel = Kernel::new();
+        kernel.vd_interrupt = None;
+        kernel.vd_irq_pending.push_back((1, 0));
+        kernel.vd_irq_pending.push_back((1, 1));
+        let exit = run_until_exit(&mut mem, &mut xenon, &mut kernel, 50).unwrap();
+        assert_eq!(exit.code, 0);
+        assert!(kernel.vd_irq_pending.is_empty());
+        assert_eq!(kernel.vd_delivered, 0);
     }
 }

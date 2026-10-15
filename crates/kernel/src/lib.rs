@@ -117,10 +117,18 @@ pub struct Kernel {
     /// type-0/1 writes + REG_RMW land here, REG_TO_MEM reads back).
     /// Starts zeroed like the reference file.
     pub vd_regs: HashMap<u32, u32>,
-    /// Command-stream interrupts seen but not yet delivered
-    /// (reference `DispatchInterruptCallback`; delivery needs a
-    /// safe guest-reentry point, still pending).
-    pub vd_irq_pending: u32,
+    /// Command-stream interrupts queued but not yet delivered
+    /// (reference `graphics_system.cc` `DispatchInterruptCallback` ->
+    /// `EmulateCPInterruptDPC`: per set bit of the INTERRUPT packet
+    /// mask, `(source=1, cpu=bit)`). The boot runner delivers them by
+    /// hijacking a runnable thread (full context save/restore, LR
+    /// sentinel `0xBCBCBCBC` like `Processor::Execute`).
+    pub vd_irq_pending: VecDeque<(u32, u32)>,
+    /// Active GPU-interrupt callback hijack, if any (slot + saved
+    /// thread state to restore on sentinel return).
+    pub vd_callback_active: Option<VdCallbackFrame>,
+    /// Graphics-interrupt callbacks delivered (for tests/forensics).
+    pub vd_delivered: u64,
     /// System command-buffer GPU identifier address (reference
     /// `VdSetSystemCommandBufferGpuIdentifierAddress`).
     pub vd_gpu_identifier: Option<u32>,
@@ -235,6 +243,19 @@ struct CritSec {
     spin: u32,
 }
 
+/// Saved thread state for an active GPU-interrupt callback hijack
+/// (reference `Processor::Execute`: stack padded 176B, LR sentinel,
+/// args in r3/r4; we save the full state and restore it on return so
+/// interrupted code resumes exactly — strictly safer than the
+/// reference's volatile clobber).
+#[derive(Debug, Clone)]
+pub struct VdCallbackFrame {
+    pub slot: u32,
+    pub saved: ThreadState,
+    pub source: u32,
+    pub cpu: u32,
+}
+
 /// Guest heap window for emulated allocations. Starts low (above the
 /// null page), mirroring the reference/Xenon convention where normal
 /// user allocations come from low virtual address ranges — game logic
@@ -279,7 +300,9 @@ impl Kernel {
             vd_wptr_seen: 0,
             vd_rptr: 0,
             vd_regs: HashMap::new(),
-            vd_irq_pending: 0,
+            vd_irq_pending: VecDeque::new(),
+            vd_callback_active: None,
+            vd_delivered: 0,
             vd_gpu_identifier: None,
             vd_studio_rgb: None,
             image_base: 0,
