@@ -6,7 +6,7 @@ Terminal states only: impossible, done, or something rendering.
 ## Entire Xbox 360 emulation total: ~5 out of 100%
 
 100% = running ANY game released for the Xbox 360. Honest breakdown:
-- CPU interpreter (integer+FPU, no JIT) 40% · VMX128 integer done + FP classic (128-bit FP 0%) · MMU/paging 0%
+- CPU interpreter (integer+FPU, no JIT) 40% · VMX128 integer + FP add/sub/max/min/mul (fused/cmp/convert pending) · MMU/paging 0%
 - Kernel (of ~300+ used imports across xboxkrnl/xam) ~15%
 - GPU (shaders/eDRAM/draw path) 3% · audio 5% · input 0% · storage/saves 40%
 - Scheduler 15% · networking 10% · frontend 35% · per-game compat work 2%
@@ -94,12 +94,12 @@ Terminal states only: impossible, done, or something rendering.
       `stvrx` (zero-fill/no-op edges per backend TBL notes) +
       `lvebx`/`lvehx`/`lvewx`/`stvebx`/`stvehx`/`stvewx` element ops +
       128-bit forms, `vperm`/`vperm128`/`vsel`
-- [x] CPU VMX128 FP arithmetic, classic subset (reference
-      `ppc_emit_altivec.cc` `InstrEmit_vaddfp_/vsubfp_/vmaxfp_/vminfp_`):
-      `vaddfp` (0x00A) / `vsubfp` (0x04A) / `vmaxfp` (0x40A) /
-      `vminfp` (0x44A), 4 x f32 lane ops in PPC byte order;
-      unit-tested (add/sub/max/min incl. negatives); 128-bit FP
-      (`vaddfp128`/`vsubfp128`/`vmulfp128`/madd/msum) stays tracked
+- [x] CPU VMX128 FP arithmetic, classic + 128-bit subset (reference
+      `ppc_emit_altivec.cc`): `vaddfp` (0x00A) / `vsubfp` (0x04A) /
+      `vmaxfp` (0x40A) / `vminfp` (0x44A) + `vaddfp128` (0x14000010) /
+      `vsubfp128` (0x14000050) / `vmulfp128` (0x14000090), 4 x f32
+      lane ops in PPC byte order, 128-entry file incl. high regs;
+      unit-tested; madd/msum fused + compare/convert FP stays tracked
       `Unsupported`
 - [x] Filesystem `HostDirFs`: read-only host-directory backend
       (recursive index, lazy Arc cache, dir listings) for extracted
@@ -230,9 +230,8 @@ Terminal states only: impossible, done, or something rendering.
       waits keep NULL-block semantics; unit-tested (roundtrip +
       adoption). Retail still faults at the same `bctr` (polls;
       signalers missing) — documented, not reverted
-- [ ] Draw backend (next GPU step) OR VMX128 128-bit FP
-      (`vaddfp128`/`vsubfp128`/`vmulfp128`/madd/msum) — pick by retail
-      demand
+- [ ] Draw backend (next GPU step) OR VMX128 fused FP
+      (madd/msum/cmp/convert) — pick by retail demand
 - [ ] Kernel shims on demand (file data, content)
 - [ ] Commit + push; update PORTING.md / COMPATIBILITY.md
 

@@ -2649,6 +2649,49 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Vaddfp128 { vd, va, vb } => {
+            // 4 x f32 add, 128-entry file (reference
+            // `InstrEmit_vaddfp128`).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&(x + y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vsubfp128 { vd, va, vb } => {
+            // 4 x f32 sub (reference `InstrEmit_vsubfp128`).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&(x - y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vmulfp128 { vd, va, vb } => {
+            // 4 x f32 mul (reference `InstrEmit_vmulfp128`).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&(x * y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Vmx { word } => Err(EmuError::Unsupported(format!(
             "VMX128 word={:08x} pc={:08x}",
             word, t.pc
@@ -3206,8 +3249,15 @@ mod tests {
                 vc: 0
             }
         ));
-        // Other primary-5 arithmetic (e.g. vaddfp128) stays tracked.
-        assert!(matches!(decode(0x1400_0010).unwrap(), Decoded::Vmx { .. }));
+        // vaddfp128 now decodes (was tracked before FP landing).
+        assert!(matches!(
+            decode(0x1400_0010).unwrap(),
+            Decoded::Vaddfp128 {
+                vd: 0,
+                va: 0,
+                vb: 0
+            }
+        ));
         // Classic vperm/vsel share the select core on v0-v31.
         assert!(matches!(
             decode(0x1021_102B).unwrap(),
@@ -3343,6 +3393,96 @@ mod tests {
         assert_eq!(get(&t, 3), [1.0, 2.0, 4.0, 4.5]);
         run_word(0x1061_144A, &mut t, &mut m);
         assert_eq!(get(&t, 3), [0.5, -1.0, -3.0, 1.5]);
+    }
+
+    #[test]
+    fn vfp128_arithmetic_high_regs() {
+        let (mut t, mut m) = setup();
+        // vaddfp128 v63,v63,v62,v0 shape is vperm128; arithmetic uses
+        // the same highs: build vaddfp128 v65,v66,v67 by hand.
+        // VD=65: low 1, high 2 (bits2-3). VA=66: low 2, high bit5 + bit10?
+        // Simpler: verify bases decode with zero regs + execute.
+        assert!(matches!(
+            decode(0x1400_0010).unwrap(),
+            Decoded::Vaddfp128 {
+                vd: 0,
+                va: 0,
+                vb: 0
+            }
+        ));
+        assert!(matches!(
+            decode(0x1400_0050).unwrap(),
+            Decoded::Vsubfp128 {
+                vd: 0,
+                va: 0,
+                vb: 0
+            }
+        ));
+        assert!(matches!(
+            decode(0x1400_0090).unwrap(),
+            Decoded::Vmulfp128 {
+                vd: 0,
+                va: 0,
+                vb: 0
+            }
+        ));
+        fn put(t: &mut ThreadState, i: usize, xs: [f32; 4]) {
+            let mut v = [0u8; 16];
+            for (j, x) in xs.iter().enumerate() {
+                v[4 * j..4 * j + 4].copy_from_slice(&x.to_be_bytes());
+            }
+            t.vr[i] = v;
+        }
+        fn get(t: &ThreadState, i: usize) -> [f32; 4] {
+            let mut out = [0.0; 4];
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = f32::from_be_bytes([
+                    t.vr[i][4 * j],
+                    t.vr[i][4 * j + 1],
+                    t.vr[i][4 * j + 2],
+                    t.vr[i][4 * j + 3],
+                ]);
+            }
+            out
+        }
+        // High registers (64+) exercise the 7-bit file.
+        put(&mut t, 65, [1.0, 2.0, 3.0, 4.0]);
+        put(&mut t, 66, [0.5, 0.5, 0.5, 0.5]);
+        // Encode vaddfp128 v67,v65,v66: VD=67 (low 3, high 2),
+        // VA=65 (low 1, VA128h=0, VA128H=1), VB=66 (low 2, high 2).
+        // Opcode vaddfp128 = 0x10 (bit4). Assemble:
+        let vd_low = 67 & 0x1F;
+        let va_low = 65 & 0x1F;
+        let vb_low = 66 & 0x1F;
+        let word = (5u32 << 26)
+            | (vd_low << 21)
+            | (va_low << 16)
+            | (vb_low << 11)
+            | (2 << 2) // VDhigh=2
+            | (1 << 10) // VA128H (VA=65 needs bit6, not bit5)
+            | (2) // VBhigh=2
+            | 0x10; // vaddfp128 opcode low
+        let d = decode(word).unwrap();
+        assert!(
+            matches!(
+                d,
+                Decoded::Vaddfp128 {
+                    vd: 67,
+                    va: 65,
+                    vb: 66
+                }
+            ),
+            "got {:?}",
+            d
+        );
+        run_word(word, &mut t, &mut m);
+        assert_eq!(get(&t, 67), [1.5, 2.5, 3.5, 4.5]);
+        // vmulfp128 v3,v1,v2.
+        put(&mut t, 1, [2.0, 3.0, 4.0, 5.0]);
+        put(&mut t, 2, [3.0, 4.0, 5.0, 6.0]);
+        let wmul = (5u32 << 26) | (3 << 21) | (1 << 16) | (2 << 11) | 0x90;
+        run_word(wmul, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [6.0, 12.0, 20.0, 30.0]);
     }
 
     #[test]

@@ -1184,6 +1184,24 @@ pub enum Decoded {
         va: u32,
         vb: u32,
     },
+    // Vector FP add/sub/mul, 128-bit forms (primary 5, kVX128;
+    // reference `InstrEmit_vaddfp128/vsubfp128/vmulfp128`: 4 x f32).
+    // Field map matches `FormatVX128` (same highs as `Vperm128`).
+    Vaddfp128 {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
+    Vsubfp128 {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
+    Vmulfp128 {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
     // Vector load/store indexed, 128-bit forms (primary 4, kVX128_1;
     // reference `InstrEmit_lvx128`/`stvx128`). VD is 7-bit
     // (low 5 + bits 0-1); EA aligns down to 16; bytes transfer raw
@@ -1441,8 +1459,9 @@ pub fn decode(word: u32) -> Result<Decoded> {
         5 => {
             // kVX128_2 vperm128 (base 0x14000000): match with every
             // register field masked (VD/VA/VB lows+highs, VC);
-            // reserved bits 4/9 must be clear. Anything else stays
-            // tracked. Field map: reference `FormatVX128_2`.
+            // reserved bits 4/9 must be clear. Anything else falls
+            // through to arithmetic below. Field map: reference
+            // `FormatVX128_2`.
             if word & 0xFC00_0210 == 0x1400_0000 {
                 Ok(Decoded::Vperm128 {
                     vd: rt | (((word >> 2) & 0x3) << 5),
@@ -1451,7 +1470,29 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     vc: (word >> 6) & 0x7,
                 })
             } else {
-                Ok(Decoded::Vmx { word })
+                // kVX128 FP arithmetic (reference `FormatVX128` highs,
+                // opcode in bits 4/6-9): vaddfp128 0x14000010,
+                // vsubfp128 0x14000050, vmulfp128 0x14000090.
+                // Mask keeps the primary + opcode bits, ignoring all
+                // register fields.
+                match word & 0xFC00_03D0 {
+                    0x1400_0010 => Ok(Decoded::Vaddfp128 {
+                        vd: rt | (((word >> 2) & 0x3) << 5),
+                        va: ra | (((word >> 5) & 0x1) << 5) | (((word >> 10) & 0x1) << 6),
+                        vb: rb | ((word & 0x3) << 5),
+                    }),
+                    0x1400_0050 => Ok(Decoded::Vsubfp128 {
+                        vd: rt | (((word >> 2) & 0x3) << 5),
+                        va: ra | (((word >> 5) & 0x1) << 5) | (((word >> 10) & 0x1) << 6),
+                        vb: rb | ((word & 0x3) << 5),
+                    }),
+                    0x1400_0090 => Ok(Decoded::Vmulfp128 {
+                        vd: rt | (((word >> 2) & 0x3) << 5),
+                        va: ra | (((word >> 5) & 0x1) << 5) | (((word >> 10) & 0x1) << 6),
+                        vb: rb | ((word & 0x3) << 5),
+                    }),
+                    _ => Ok(Decoded::Vmx { word }),
+                }
             }
         }
         7 => Ok(Decoded::Mulli {
