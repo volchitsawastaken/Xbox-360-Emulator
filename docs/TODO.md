@@ -234,8 +234,13 @@ Terminal states only: impossible, done, or something rendering.
 - [x] VMX128 FP estimates `vrefp` (0x10A) / `vrsqrtefp` (0x14A):
       precise 4x f32 reciprocal/reciprocal-sqrt (ISA specifies
       estimates; precise exceeds the accuracy bounds — documented);
-      unit-tested incl. 0→inf/inf→0 specials. FP compare/convert
-      remains (no retail demand: zero VMX `Unsupported` in any run).
+      unit-tested incl. 0→inf/inf→0 specials.
+- [x] VMX128 FP compares (reference `InstrEmit_vcmpxxfp_`/`vcmpbfp_`
+      + `UpdateCR6`): `vcmpeqfp`/`vcmpgefp`/`vcmpgtfp`/`vcmpbfp`
+      (kVXR low-10 XOs + Rc bit 10), per-lane masks, NaN lanes 0,
+      CR6 `all_equal|0|none_equal|0`; unit-tested incl. Rc paths.
+      FP converts remain (no retail demand: zero VMX `Unsupported`
+      in any run).
 - [x] Draw-backend slicing (reference
       `pm4_command_processor_implement.h` + `xenos.h` `ShaderType`):
       `IM_LOAD_IMMEDIATE` (0x2B) stores sequencer ucode per type

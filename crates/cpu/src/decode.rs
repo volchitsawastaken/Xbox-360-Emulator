@@ -1229,6 +1229,35 @@ pub enum Decoded {
         vd: u32,
         vb: u32,
     },
+    // Vector FP compares (primary 4, kVXR; reference
+    // `InstrEmit_vcmpxxfp_`/`vcmpbfp_`): per-lane 0xFFFFFFFF/0 masks,
+    // NaN lanes always 0; Rc updates CR6 as
+    // `all_equal|0|none_equal|0` (reference `UpdateCR6`). Low-10 XOs:
+    // eq 0x0C6, ge 0x1C6, gt 0x2C6, bf 0x3C6; Rc is bit 10.
+    Vcmpeqfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        rc: bool,
+    },
+    Vcmpgefp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        rc: bool,
+    },
+    Vcmpgtfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        rc: bool,
+    },
+    Vcmpbfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        rc: bool,
+    },
     // Vector load/store indexed, 128-bit forms (primary 4, kVX128_1;
     // reference `InstrEmit_lvx128`/`stvx128`). VD is 7-bit
     // (low 5 + bits 0-1); EA aligns down to 16; bytes transfer raw
@@ -1420,6 +1449,31 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     va: ra,
                     vb: rb,
                     vc: (word >> 6) & 0x1F,
+                }),
+                // kVXR FP compares: low-10 XO + Rc at bit 10.
+                _ if word & 0x3FF == 0x0C6 => Ok(Decoded::Vcmpeqfp {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                    rc: word & 0x400 != 0,
+                }),
+                _ if word & 0x3FF == 0x1C6 => Ok(Decoded::Vcmpgefp {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                    rc: word & 0x400 != 0,
+                }),
+                _ if word & 0x3FF == 0x2C6 => Ok(Decoded::Vcmpgtfp {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                    rc: word & 0x400 != 0,
+                }),
+                _ if word & 0x3FF == 0x3C6 => Ok(Decoded::Vcmpbfp {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                    rc: word & 0x400 != 0,
                 }),
                 0x34C => Ok(Decoded::Vspltish { vd: rt, simm: ra }),
                 0x38C => Ok(Decoded::Vspltisw { vd: rt, simm: ra }),

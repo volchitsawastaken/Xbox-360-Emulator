@@ -299,6 +299,14 @@ fn write_half_be(mem: &mut Memory, ea: u32, v: u16) -> Result<()> {
 }
 
 /// Execute one decoded instruction. Updates PC. Returns optional syscall.
+/// Reference `PPCHIRBuilder::UpdateCR6`: CR6 = `all_equal|0|none_equal|0`
+/// where all_equal = result is all 1-bits and none_equal = all 0-bits.
+fn update_cr6(t: &mut ThreadState, v: &[u8; 16]) {
+    let all_eq = v.iter().all(|b| *b == 0xFF);
+    let none_eq = v.iter().all(|b| *b == 0x00);
+    t.cr.set_field(6, ((all_eq as u8) << 3) | ((none_eq as u8) << 1));
+}
+
 pub fn execute(
     d: Decoded,
     word: u32,
@@ -2752,6 +2760,90 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Vcmpeqfp { vd, va, vb, rc } => {
+            // Per-lane equality mask, NaN lanes 0 (reference
+            // `InstrEmit_vcmpxxfp_` eq + `UpdateCR6` on Rc).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                let w = if x == y { 0xFFFF_FFFFu32 } else { 0u32 };
+                v[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            if rc {
+                update_cr6(t, &v);
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vcmpgefp { vd, va, vb, rc } => {
+            // Per-lane greater-or-equal mask (reference ge).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                let w = if x >= y { 0xFFFF_FFFFu32 } else { 0u32 };
+                v[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            if rc {
+                update_cr6(t, &v);
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vcmpgtfp { vd, va, vb, rc } => {
+            // Per-lane greater-than mask (reference gt).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                let w = if x > y { 0xFFFF_FFFFu32 } else { 0u32 };
+                v[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            if rc {
+                update_cr6(t, &v);
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vcmpbfp { vd, va, vb, rc } => {
+            // Bounds mask (reference `InstrEmit_vcmpbfp_`): 0x80000000
+            // where VA > VB, 0x40000000 where VA < -VB, else 0.
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            let mut cond = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                let gt = x > y;
+                // Reference `Not(SGE(VA, -VB))`: true unless ordered->=.
+                let lt = !matches!(
+                    x.partial_cmp(&-y),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                );
+                let w = ((gt as u32) << 31) | ((lt as u32) << 30);
+                v[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+                if gt || lt {
+                    cond[4 * i..4 * i + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+                }
+            }
+            if rc {
+                update_cr6(t, &cond);
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Vmx { word } => Err(EmuError::Unsupported(format!(
             "VMX128 word={:08x} pc={:08x}",
             word, t.pc
@@ -3639,6 +3731,82 @@ mod tests {
         run_word(base | 0x10A, &mut t, &mut m);
         assert_eq!(get(&t, 3)[0], f32::INFINITY);
         assert_eq!(get(&t, 3)[1], 0.0);
+    }
+
+    #[test]
+    fn vcmpfp_masks_and_cr6() {
+        let (mut t, mut m) = setup();
+        // vcmpeqfp v3,v1,v2 = base | 0x0C6; Rc=1 adds bit 10 (0x400).
+        let base = (4u32 << 26) | (3 << 21) | (1 << 16) | (2 << 11);
+        assert!(matches!(
+            decode(base | 0x0C6).unwrap(),
+            Decoded::Vcmpeqfp {
+                vd: 3,
+                va: 1,
+                vb: 2,
+                rc: false
+            }
+        ));
+        assert!(matches!(
+            decode(base | 0x4C6).unwrap(),
+            Decoded::Vcmpeqfp {
+                vd: 3,
+                va: 1,
+                vb: 2,
+                rc: true
+            }
+        ));
+        fn put(t: &mut ThreadState, i: usize, xs: [f32; 4]) {
+            let mut v = [0u8; 16];
+            for (j, x) in xs.iter().enumerate() {
+                v[4 * j..4 * j + 4].copy_from_slice(&x.to_be_bytes());
+            }
+            t.vr[i] = v;
+        }
+        fn words(t: &ThreadState, i: usize) -> [u32; 4] {
+            let mut out = [0u32; 4];
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = u32::from_be_bytes([
+                    t.vr[i][4 * j],
+                    t.vr[i][4 * j + 1],
+                    t.vr[i][4 * j + 2],
+                    t.vr[i][4 * j + 3],
+                ]);
+            }
+            out
+        }
+        put(&mut t, 1, [1.0, 2.0, 3.0, f32::NAN]);
+        put(&mut t, 2, [1.0, 1.0, 4.0, 1.0]);
+        // eq without Rc: NaN lane masks 0, CR untouched.
+        t.cr.set_field(6, 0xF);
+        run_word(base | 0x0C6, &mut t, &mut m);
+        assert_eq!(
+            words(&t, 3),
+            [0xFFFF_FFFF, 0x0000_0000, 0x0000_0000, 0x0000_0000]
+        );
+        assert_eq!(t.cr.field(6), 0xF);
+        // eq with Rc: mixed -> CR6 0.
+        run_word(base | 0x4C6, &mut t, &mut m);
+        assert_eq!(t.cr.field(6), 0x0);
+        // gt all-true -> CR6 all_equal (0x8).
+        put(&mut t, 1, [2.0, 3.0, 4.0, 5.0]);
+        put(&mut t, 2, [1.0, 1.0, 1.0, 1.0]);
+        run_word(base | 0x2C6 | 0x400, &mut t, &mut m); // vcmpgtfp.
+        assert_eq!(words(&t, 3), [0xFFFF_FFFF; 4]);
+        assert_eq!(t.cr.field(6), 0x8);
+        // ge all-false -> CR6 none_equal (0x2).
+        put(&mut t, 1, [0.0, 0.0, 0.0, 0.0]);
+        run_word(base | 0x1C6 | 0x400, &mut t, &mut m); // vcmpgefp.
+        assert_eq!(words(&t, 3), [0x0000_0000; 4]);
+        assert_eq!(t.cr.field(6), 0x2);
+        // bf: bounds 0x80000000 (above) / 0x40000000 (below) / 0.
+        put(&mut t, 1, [5.0, -5.0, 0.0, 1.0]);
+        put(&mut t, 2, [1.0, 1.0, 1.0, 5.0]);
+        run_word(base | 0x3C6, &mut t, &mut m);
+        assert_eq!(
+            words(&t, 3),
+            [0x8000_0000, 0x4000_0000, 0x0000_0000, 0x0000_0000]
+        );
     }
 
     #[test]

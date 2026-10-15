@@ -376,19 +376,20 @@ out, and the license note. Workspace license: BSD-3-Clause.
   `vsubfp128 0x14000050`, `vmulfp128 0x14000090`, kVX128;
   `vmaddfp 0x1000002E`, `vnmsubfp 0x1000002F`, kVA),
   `src/xenia/cpu/ppc/ppc_decode_data.h` (`FormatVX128` highs,
-  `VXA` 4-reg layout),
+  `VXA` 4-reg layout, `FormatVC`/`VXR` + Rc bit 10),
   `src/xenia/cpu/ppc/ppc_emit_altivec.cc` (`InstrEmit_vaddfp_` /
   `vsubfp_` / `vmaxfp_` / `vminfp_` / `vmulfp128` / `vmaddfp_` /
-  `vnmsubfp_` / `vrefp_` / `vrsqrtefp_`: 4 x f32 lane ops, fused
+  `vnmsubfp_` / `vrefp_` / `vrsqrtefp_` / `vcmpxxfp_` / `vcmpbfp_`:
+  4 x f32 lane ops, fused
   `mul_add`; estimates precise-beyond-bounds — documented).
-- Taken (facts only): XO numbers, `FormatVX128`/`VXA` field maps,
-  lane width/count, max/min/mul/fused/estimate shape.
+- Taken (facts only): XO numbers, `FormatVX128`/`VXA`/`VXR` field
+  maps, lane width/count, max/min/mul/fused/estimate/compare shape.
 - Lives here: `crates/cpu/src/decode.rs` (kVX XO + kVX128 masked +
-  kVA fused + estimate arms) + `crates/cpu/src/exec.rs` (BE f32
-  lane ops + unit tests).
-- NOT taken: FP compares/converts (cmpb/cmpeq/cmpge/cmpgt,
-  csxwfp/cuxwfp, expte/loge), FP exception/FPSCR control,
-  denormal-input flushing.
+  kVA fused + estimate + kVXR compare arms) +
+  `crates/cpu/src/exec.rs` (BE f32 lane ops + `update_cr6` + unit
+  tests).
+- NOT taken: FP converts (csxwfp/cuxwfp, expte/loge), FP
+  exception/FPSCR control, denormal-input flushing.
 - License: reference is BSD (Ben Vanik / Xenia project); our
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.
