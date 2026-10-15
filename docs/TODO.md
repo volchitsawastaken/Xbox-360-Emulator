@@ -158,16 +158,25 @@ Terminal states only: impossible, done, or something rendering.
       undelivered graphics-interrupt callback or adapter state the
       NOP pump doesn't produce. NEXT: GPU interrupt-callback delivery
       (safe guest reentry), then draw backend
-- [ ] Dash frontier (HostDirFs boot): 63 imports to an entry-table
-      walk at `0x921B86BC` (`lwz r8,896(r11)`, r11=0x603400A2 from
-      version-string bytes). Walk runs 65537 iterations by
-      construction (r24=0x10002 from flag code, verified correct);
-      table copies verified faithful (vector memcpy, coherent
-      "vs_3_0.2.0.9407.0"); zero entries are safe, string bytes fault.
-      Skip-fault run proves the walk is structurally lost (spins into
-      wild space). Same shape as Braid: walk overruns valid entries
-      into string data — shared COUNT-vs-DATA class. Still open:
-      which bound/source differs (copy length vs walk count)
+- [ ] Dash frontier (HostDirFs boot): 63 imports to a table walk at
+      `0x921B86BC` (`lwz r8,896(r11)`), fully decoded this session:
+      prologue sets r27=r31+896 (table = object itself +896),
+      r24=bound from the `[r31+872]` flag word via cntlzw/xoris/addic
+      (0x102A1101 -> 0x10002; the EQ-skip branch is dead — the walk
+      always runs), r25=r31+40 expansion cursor (+416/iter). Each
+      slot is read as a struct pointer (entry+r31, fields
+      +872/+896/+900); zero/small entries are safe, slot 6 holds
+      version-string bytes ("vs_3_0.2.0.9407.0" → r11=0x603400A2).
+      The 148B header (flag+ints+version) is one faithful static
+      memcpy (dst=obj+872, src=0x920376A8, len 0x94); the 1028B
+      object comes from H (0x921B8740, called from E70 via
+      0x92370E9C, backtraced) with static-derived size. The dash
+      opens ZERO files (no NtCreateFile/NtOpenFile traffic at all),
+      so the table is static+import driven; every link in the
+      H→copy→walk chain is statically determined, yet the walk
+      faults on static string bytes — same COUNT-vs-DATA class as
+      Braid, root cause still open (needs trace-diff harness or a
+      verified-good image hash to exclude loader/data drift)
 
 ## Next (retail-driven, in expected order)
 
