@@ -161,18 +161,19 @@ Terminal states only: impossible, done, or something rendering.
       the original `bctr` to `0x67735C65` (+16 stale) — worker
       starvation eliminated as a cause (workers run, signal, contend;
       KeWait succeeds via worker signaling). +120/+16 and the
-      post-kick callbacks stay virgin: device creation needs the
-      undelivered graphics-interrupt callback or adapter state the
-      NOP pump doesn't produce. NOTE (verified by full method
-      disasm): the lazy block formats on BOTH sides of its
-      null-checks and stores +16 on NEITHER — so +16's writer is a
-      function that never executes here at all (not a skipped store
-      in executed code); the error path reading it is latently buggy
-      code that only runs without a GPU. Workers sit idle-blocked in
-      job-queue waits (empty queue — main never queues device work),
-      so the queueing trigger itself is the missing link. NEXT: GPU
-      interrupt-callback delivery (safe guest reentry), then draw
-      backend
+      post-kick callbacks stay virgin. Deadlock refined this session
+      (polling watch + timeout logging): game-heap `X_KEVENT`s
+      `0x010462FC` (finite timeout `0xFFFB6C20`, main polls → immediate
+      TIMEOUT, spins ~2425x) vs `0x0104634C` (NULL/infinite, workers
+      Block forever); ZERO `KeSetEvent` calls in the whole run and
+      zero post-init writes to either header — signalers do not exist
+      in executed code, and the ring carries zero INTERRUPT packets,
+      so the GPU callback (registered `0x82181718`) never runs either.
+      Main gives up polling and takes the graphics-failure path whose
+      lazy block reads never-written +16 on BOTH null-check sides
+      (verified: no writer in executed code). NEXT: draw backend /
+      device state substantial enough for init to succeed (or find the
+      queueing trigger that precedes the waits)
 - [ ] Dash frontier (HostDirFs boot): 63 imports to a table walk at
       `0x921B86BC` (`lwz r8,896(r11)`), fully decoded this session:
       prologue sets r27=r31+896 (table = object itself +896),
