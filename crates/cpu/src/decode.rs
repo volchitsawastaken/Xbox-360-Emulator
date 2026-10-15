@@ -1202,6 +1202,21 @@ pub enum Decoded {
         va: u32,
         vb: u32,
     },
+    // Vector fused multiply-add/sub (primary 4, kVA; reference
+    // `InstrEmit_vmaddfp_`/`vnmsubfp_`): vmaddfp VD <- VA*VC+VB,
+    // vnmsubfp VD <- -((VA*VC)-VB), 4 x f32. XOs 0x2E/0x2F.
+    Vmaddfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        vc: u32,
+    },
+    Vnmsubfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+        vc: u32,
+    },
     // Vector load/store indexed, 128-bit forms (primary 4, kVX128_1;
     // reference `InstrEmit_lvx128`/`stvx128`). VD is 7-bit
     // (low 5 + bits 0-1); EA aligns down to 16; bytes transfer raw
@@ -1377,6 +1392,18 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     vc: (word >> 6) & 0x1F,
                 }),
                 _ if word & 0x3F == 0x2A => Ok(Decoded::Vsel {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                    vc: (word >> 6) & 0x1F,
+                }),
+                _ if word & 0x3F == 0x2E => Ok(Decoded::Vmaddfp {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                    vc: (word >> 6) & 0x1F,
+                }),
+                _ if word & 0x3F == 0x2F => Ok(Decoded::Vnmsubfp {
                     vd: rt,
                     va: ra,
                     vb: rb,

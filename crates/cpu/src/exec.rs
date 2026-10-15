@@ -2692,6 +2692,39 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Vmaddfp { vd, va, vb, vc } => {
+            // 4 x fused VA*VC+VB (reference `InstrEmit_vmaddfp_`;
+            // denormal-input flushing pending — host behavior used).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let c = t.vr[vc as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                let z = f32::from_be_bytes([c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&x.mul_add(z, y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vnmsubfp { vd, va, vb, vc } => {
+            // 4 x fused -((VA*VC)-VB) (reference `InstrEmit_vnmsubfp_`).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let c = t.vr[vc as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                let z = f32::from_be_bytes([c[4 * i], c[4 * i + 1], c[4 * i + 2], c[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&(-x.mul_add(z, -y)).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Vmx { word } => Err(EmuError::Unsupported(format!(
             "VMX128 word={:08x} pc={:08x}",
             word, t.pc
@@ -3483,6 +3516,56 @@ mod tests {
         let wmul = (5u32 << 26) | (3 << 21) | (1 << 16) | (2 << 11) | 0x90;
         run_word(wmul, &mut t, &mut m);
         assert_eq!(get(&t, 3), [6.0, 12.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn vmaddfp_fused() {
+        let (mut t, mut m) = setup();
+        // vmaddfp v3,v1,v2,v4 = 0x1061112E; vnmsubfp = 0x1061112F.
+        assert!(matches!(
+            decode(0x1061_112E).unwrap(),
+            Decoded::Vmaddfp {
+                vd: 3,
+                va: 1,
+                vb: 2,
+                vc: 4
+            }
+        ));
+        assert!(matches!(
+            decode(0x1061_112F).unwrap(),
+            Decoded::Vnmsubfp {
+                vd: 3,
+                va: 1,
+                vb: 2,
+                vc: 4
+            }
+        ));
+        fn put(t: &mut ThreadState, i: usize, xs: [f32; 4]) {
+            let mut v = [0u8; 16];
+            for (j, x) in xs.iter().enumerate() {
+                v[4 * j..4 * j + 4].copy_from_slice(&x.to_be_bytes());
+            }
+            t.vr[i] = v;
+        }
+        fn get(t: &ThreadState, i: usize) -> [f32; 4] {
+            let mut out = [0.0; 4];
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = f32::from_be_bytes([
+                    t.vr[i][4 * j],
+                    t.vr[i][4 * j + 1],
+                    t.vr[i][4 * j + 2],
+                    t.vr[i][4 * j + 3],
+                ]);
+            }
+            out
+        }
+        put(&mut t, 1, [1.0, 2.0, 3.0, 4.0]);
+        put(&mut t, 2, [10.0, 20.0, 30.0, 40.0]);
+        put(&mut t, 4, [2.0, 2.0, 2.0, 2.0]);
+        run_word(0x1061_112E, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [12.0, 24.0, 36.0, 48.0]);
+        run_word(0x1061_112F, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [8.0, 16.0, 24.0, 32.0]);
     }
 
     #[test]
