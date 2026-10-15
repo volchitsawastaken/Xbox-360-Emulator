@@ -161,8 +161,11 @@ Terminal states only: impossible, done, or something rendering.
       null-checks and stores +16 on NEITHER — so +16's writer is a
       function that never executes here at all (not a skipped store
       in executed code); the error path reading it is latently buggy
-      code that only runs without a GPU. NEXT: GPU interrupt-callback
-      delivery (safe guest reentry), then draw backend
+      code that only runs without a GPU. Workers sit idle-blocked in
+      job-queue waits (empty queue — main never queues device work),
+      so the queueing trigger itself is the missing link. NEXT: GPU
+      interrupt-callback delivery (safe guest reentry), then draw
+      backend
 - [ ] Dash frontier (HostDirFs boot): 63 imports to a table walk at
       `0x921B86BC` (`lwz r8,896(r11)`), fully decoded this session:
       prologue sets r27=r31+896 (table = object itself +896),
