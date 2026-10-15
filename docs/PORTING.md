@@ -297,7 +297,10 @@ out, and the license note. Workspace license: BSD-3-Clause.
   (`ExecutePacket` skips, type-0 `base/count + 1` + bit-15
   write-one, type-1 pairs, IB `[ptr, len & 0xFFFFF]` in dwords,
   MEM_WRITE/EVENT_WRITE_SHD/EXT/REG_RMW/REG_TO_MEM/WAIT/COND/
-  INTERRUPT payload layouts, `MatchValueAndRef`),
+  INTERRUPT payload layouts, `MatchValueAndRef`,
+  `IM_LOAD_IMMEDIATE` (`[type, start_size, ucode...]`, start==0,
+  per-type store), `INVALIDATE_STATE` (mask no-op), `DRAW_INDX_2`
+  (count-and-skip without backend),
   `src/xenia/gpu/register_table.inc` (`WRITEBACK_START 0x0A04`,
   `WRITEBACK_SIZE 0x0A05`, `VGT_EVENT_INITIATOR 0x21F9`,
   `RB_SAMPLE_COUNT_ADDR 0x2325`),

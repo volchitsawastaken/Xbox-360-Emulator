@@ -236,9 +236,16 @@ Terminal states only: impossible, done, or something rendering.
       estimates; precise exceeds the accuracy bounds — documented);
       unit-tested incl. 0→inf/inf→0 specials. FP compare/convert
       remains (no retail demand: zero VMX `Unsupported` in any run).
-- [ ] Draw backend (next GPU step once a callback/swap fires it —
-      retail Braid never swaps pre-device; vblank path tested and
-      waiting)
+- [x] Draw-backend slicing (reference
+      `pm4_command_processor_implement.h` + `xenos.h` `ShaderType`):
+      `IM_LOAD_IMMEDIATE` (0x2B) stores sequencer ucode per type
+      (vertex/pixel active-shader state, nonzero-start/bad-type
+      explicit errors); `INVALIDATE_STATE` (0x3B) faithful no-op;
+      `DRAW_INDX_2` (0x36) length-skips but COUNTS draws_seen (draw
+      demand signal, never silent); unit-tested. Retail Braid uploads
+      one shader in init (now stored); no draws issued pre-device.
+- [ ] Draw backend remainder (shader translation + EDRAM/resolve/
+      present — the substantial part)
 - [x] Dash pipeline test (`dash_pipeline`, gated on `X360_DASH_DIR`):
       dash.xex parses/decompresses to 10 PE sections with entry
       `0x92196610` covered, 1628 imports — loader drift excluded for

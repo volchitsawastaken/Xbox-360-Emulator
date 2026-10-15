@@ -50,6 +50,9 @@ const OP_COND_WRITE: u32 = 0x45;
 const OP_INTERRUPT: u32 = 0x54;
 const OP_NOP: u32 = 0x10;
 const OP_ME_INIT: u32 = 0x48;
+const OP_DRAW_INDX_2: u32 = 0x36;
+const OP_IM_LOAD_IMMEDIATE: u32 = 0x2B;
+const OP_INVALIDATE_STATE: u32 = 0x3B;
 
 /// Register indices with executor-visible roles (reference
 /// `register_table.inc`).
@@ -73,6 +76,12 @@ pub struct GpuExecStats {
     /// Draw/state packets length-skipped (no draw backend yet).
     pub skipped_packets: u64,
     pub interrupts: u32,
+    /// `IM_LOAD_IMMEDIATE` shader uploads stored (vertex/pixel ucode).
+    pub shaders_loaded: u64,
+    /// `DRAW_INDX_2` packets seen (length-skipped; draw demand signal).
+    pub draws_seen: u64,
+    /// `INVALIDATE_STATE` packets consumed (reference no-op).
+    pub invalidates: u64,
 }
 
 /// `GpuSwap` (reference `xenos.h` `GpuSwapInline`).
@@ -493,6 +502,76 @@ impl Kernel {
                 // Reference consumes exactly the mask word.
                 Ok(c + 2)
             }
+            OP_IM_LOAD_IMMEDIATE => {
+                // Sequencer ucode upload (reference
+                // `ExecutePacketType3_IM_LOAD_IMMEDIATE`): `[type,
+                // start_size, ucode...]`, `start = size >> 16` (must be
+                // 0), `size = size & 0xFFFF` dwords. Stores the ucode
+                // per shader type (active shader); translation to host
+                // GPU is pending draw-backend work, but the upload
+                // itself is real state. Consumes exactly like the
+                // reference (header + 2 + size); trailing zero pad (if
+                // any) parses as skips, matching the reference reader.
+                if cnt < 2 {
+                    return Err(EmuError::Other("PM4 short IM_LOAD_IMMEDIATE".into()));
+                }
+                let shader_type = p(0);
+                let start_size = p(1);
+                let start = start_size >> 16;
+                let size = (start_size & 0xFFFF) as usize;
+                if start != 0 {
+                    return Err(EmuError::Unsupported(format!(
+                        "PM4 IM_LOAD nonzero start {:08x}",
+                        start
+                    )));
+                }
+                if shader_type > 1 {
+                    return Err(EmuError::Unsupported(format!(
+                        "PM4 IM_LOAD bad shader type {}",
+                        shader_type
+                    )));
+                }
+                if cnt - 2 < size {
+                    return Err(EmuError::Other(format!(
+                        "PM4 IM_LOAD size {} exceeds cnt {}",
+                        size, cnt
+                    )));
+                }
+                let mut ucode = Vec::with_capacity(size);
+                for k in 0..size {
+                    ucode.push(p(2 + k));
+                }
+                if shader_type == 0 {
+                    self.vd_vs_ucode = ucode;
+                } else {
+                    self.vd_ps_ucode = ucode;
+                }
+                st.shaders_loaded += 1;
+                Ok(c + 1 + 2 + size)
+            }
+            OP_INVALIDATE_STATE => {
+                // Selective state-pointer invalidation (reference
+                // `ExecutePacketType3_INVALIDATE_STATE`): reads the
+                // mask and does nothing (driver call commented out).
+                // Faithful no-op: consume exactly the mask word.
+                if cnt < 1 {
+                    return Err(EmuError::Other("PM4 short INVALIDATE_STATE".into()));
+                }
+                let _mask = p(0);
+                st.invalidates += 1;
+                Ok(c + 2)
+            }
+            OP_DRAW_INDX_2 => {
+                // Indexed draw (reference `ExecutePacketType3_DRAW_INDX_2`
+                // → full draw). No draw backend yet: length-skip the
+                // whole packet but COUNT it explicitly (draw demand
+                // signal for backend prioritization, never silent).
+                if seen_opcodes.insert(opcode) {
+                    log::info!("kernel: PM4 op 36 (DRAW_INDX_2) seen, skipped (no draw backend)");
+                }
+                st.draws_seen += 1;
+                Ok(c + 1 + cnt)
+            }
             _ => {
                 // Draw / pipeline-state packets: length-skipped and
                 // counted (no draw backend yet), first sighting logged.
@@ -647,5 +726,86 @@ mod tests {
             .unwrap();
         assert_eq!(st.interrupts, 0);
         assert_eq!(k.vd_irq_pending.len(), 2);
+    }
+
+    #[test]
+    fn im_load_stores_ucode_per_type() {
+        let mut k = kernel();
+        let mut m = Memory::new();
+        // IM_LOAD_IMMEDIATE cnt 5: type=1 (pixel), start=0, size=3.
+        let words = vec![
+            0xC004_2B00,
+            0x0000_0001,
+            0x0000_0003,
+            0xAAAAAAAA,
+            0xBBBBBBBB,
+            0xCCCCCCCC,
+        ];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .unwrap();
+        assert_eq!(st.shaders_loaded, 1);
+        assert_eq!(k.vd_ps_ucode, vec![0xAAAAAAAA, 0xBBBBBBBB, 0xCCCCCCCC]);
+        assert!(k.vd_vs_ucode.is_empty());
+        // Vertex upload replaces (active-shader semantics).
+        let words = vec![
+            0xC003_2B00,
+            0x0000_0000,
+            0x0000_0002,
+            0x11111111,
+            0x22222222,
+        ];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .unwrap();
+        assert_eq!(k.vd_vs_ucode, vec![0x11111111, 0x22222222]);
+        // Nonzero start is explicit Unsupported, never silently stored.
+        let words = vec![
+            0xC003_2B00,
+            0x0000_0000,
+            0x0001_0002,
+            0x11111111,
+            0x22222222,
+        ];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        let e = k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen);
+        assert!(e.is_err());
+        // Bad shader type likewise explicit.
+        let words = vec![
+            0xC003_2B00,
+            0x0000_0007,
+            0x0000_0002,
+            0x11111111,
+            0x22222222,
+        ];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        assert!(k
+            .gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .is_err());
+    }
+
+    #[test]
+    fn invalidate_is_noop_draws_count() {
+        let mut k = kernel();
+        let mut m = Memory::new();
+        // INVALIDATE_STATE cnt 1 + DRAW_INDX_2 cnt 2 (length-skipped).
+        let words = vec![
+            0xC000_3B00,
+            0x0000_FFFF,
+            0xC001_3600,
+            0xAAAAAAAA,
+            0xBBBBBBBB,
+        ];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .unwrap();
+        assert_eq!(st.invalidates, 1);
+        assert_eq!(st.draws_seen, 1);
+        assert_eq!(st.skipped_packets, 0);
     }
 }

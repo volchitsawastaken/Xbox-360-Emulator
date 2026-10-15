@@ -132,6 +132,11 @@ pub struct Kernel {
     pub vd_callback_active: Option<VdCallbackFrame>,
     /// Graphics-interrupt callbacks delivered (for tests/forensics).
     pub vd_delivered: u64,
+    /// Sequencer ucode by shader type (reference `LoadShader` active
+    /// vertex/pixel shaders, fed by `IM_LOAD_IMMEDIATE`; translation
+    /// to host GPU is pending draw-backend work).
+    pub vd_vs_ucode: Vec<u32>,
+    pub vd_ps_ucode: Vec<u32>,
     /// `VdSwap` presents issued (for tests/forensics; no draw backend
     /// yet, but each present queues the vblank interrupt exactly like
     /// reference `MarkVblank`).
@@ -323,6 +328,8 @@ impl Kernel {
             vd_irq_pending: VecDeque::new(),
             vd_callback_active: None,
             vd_delivered: 0,
+            vd_vs_ucode: Vec::new(),
+            vd_ps_ucode: Vec::new(),
             vd_swaps: 0,
             vd_gpu_identifier: None,
             vd_studio_rgb: None,
