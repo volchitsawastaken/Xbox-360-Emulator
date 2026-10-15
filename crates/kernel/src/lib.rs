@@ -132,6 +132,10 @@ pub struct Kernel {
     pub vd_callback_active: Option<VdCallbackFrame>,
     /// Graphics-interrupt callbacks delivered (for tests/forensics).
     pub vd_delivered: u64,
+    /// `VdSwap` presents issued (for tests/forensics; no draw backend
+    /// yet, but each present queues the vblank interrupt exactly like
+    /// reference `MarkVblank`).
+    pub vd_swaps: u64,
     /// System command-buffer GPU identifier address (reference
     /// `VdSetSystemCommandBufferGpuIdentifierAddress`).
     pub vd_gpu_identifier: Option<u32>,
@@ -319,6 +323,7 @@ impl Kernel {
             vd_irq_pending: VecDeque::new(),
             vd_callback_active: None,
             vd_delivered: 0,
+            vd_swaps: 0,
             vd_gpu_identifier: None,
             vd_studio_rgb: None,
             image_base: 0,

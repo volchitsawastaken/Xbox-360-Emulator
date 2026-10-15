@@ -231,6 +231,12 @@ Terminal states only: impossible, done, or something rendering.
       waits keep NULL-block semantics; unit-tested (roundtrip +
       adoption). Retail still faults at the same `bctr` (polls;
       signalers missing) — documented, not reverted
+- [x] `VdSwap` present (reference `VdSwap_entry` + `MarkVblank`):
+      counts presents, queues vblank `(0, 2)` through the existing
+      interrupt-delivery path; unit-tested. No draw backend yet —
+      queued vblanks deliver only once a callback is registered
+      (retail Braid registers one but never swaps; queue stays empty
+      there, documented)
 - [ ] Draw backend (next GPU step) OR VMX128 FP compare/convert
       — pick by retail demand
 - [ ] Kernel shims on demand (file data, content)

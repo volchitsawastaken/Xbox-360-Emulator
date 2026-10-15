@@ -306,7 +306,10 @@ out, and the license note. Workspace license: BSD-3-Clause.
   `src/xenia/kernel/kernel_state.cc` (`EmulateCPInterruptDPC`:
   early-return when null, args `{source, data}`),
   `src/xenia/cpu/processor.cc` (`Execute`: stack pad `64+112`,
-  LR sentinel `0xBCBCBCBC`, args in r3+).
+  LR sentinel `0xBCBCBCBC`, args in r3+),
+  `src/xenia/gpu/graphics_system.cc` (`MarkVblank`:
+  `DispatchInterruptCallback(0, 2)`) + `VdSwap_entry` (present
+  posts; 10-arg ABI).
 - Taken (facts only): register index + framing/field maps, zero
   size, swap table, match function, writeback remap rule.
 - Lives here: `crates/kernel/src/gpu.rs` (executor + unit tests),

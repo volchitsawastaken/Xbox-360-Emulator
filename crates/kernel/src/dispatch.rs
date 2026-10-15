@@ -644,6 +644,18 @@ pub fn dispatch_import(
             kernel.vd_gpu_identifier = Some(arg(t, 0));
             Ok(())
         }
+        // VdSwap(...) (reference `graphics_system.cc` + `VdSwap_entry`:
+        // present posts to the GPU thread; `MarkVblank` then dispatches
+        // `DispatchInterruptCallback(0, 2)`). No draw backend yet, but
+        // the present is real: count it and queue the vblank interrupt
+        // so registered callbacks observe genuine vsync progress via
+        // the existing delivery path. Returns void.
+        (Lib::Xboxkrnl, 0x25B) => {
+            kernel.vd_swaps += 1;
+            kernel.vd_irq_pending.push_back((0, 2));
+            log::info!("kernel: VdSwap #{} queued vblank", kernel.vd_swaps);
+            Ok(())
+        }
         (Lib::Xboxkrnl, 0x379) => {
             // VdSetStudioRGBMode(mode): table-only in the reference.
             // Record the limited/full-range selection for the GPU
@@ -3257,6 +3269,39 @@ mod tests {
             kind: crate::imports::ImportKind::Function,
             thunk_addr: 0x8200_2000,
         }
+    }
+
+    #[test]
+    fn vd_swap_queues_vblank() {
+        assert_eq!(ImportTable::name_of("xboxkrnl.exe", 0x25B), Some("VdSwap"));
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        t.gpr[3] = 0x0115_5000_u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x25B),
+        )
+        .unwrap();
+        assert_eq!(k.vd_swaps, 1);
+        assert_eq!(k.vd_irq_pending.len(), 1);
+        assert_eq!(k.vd_irq_pending[0], (0, 2));
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x25B),
+        )
+        .unwrap();
+        assert_eq!(k.vd_swaps, 2);
+        assert_eq!(k.vd_irq_pending.len(), 2);
     }
 
     #[test]
