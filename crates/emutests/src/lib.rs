@@ -242,6 +242,97 @@ mod integration {
             );
         }
     }
+
+    /// Dash boot progress floor (HostDirFs over `$SystemUpdate`):
+    /// 1M steps fault-free through the 63-import init path (the
+    /// table-walk fault lands later, ~1.16M). Asserts no unimplemented
+    /// imports on this path (any miss would error, not step-limit).
+    /// Gated on `$X360_DASH_DIR`.
+    #[test]
+    fn dash_boot_steps() {
+        let dir = match std::env::var("X360_DASH_DIR") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let name = std::env::var("X360_DASH_XEX").unwrap_or_else(|_| "dash.xex".to_string());
+        let data = std::fs::read(format!("{}/{}", dir, name)).expect("read dash xex");
+        let backend = std::sync::Arc::new(
+            x360_filesystem::hostdir_fs::HostDirFs::load(std::path::Path::new(&dir))
+                .expect("index dash dir"),
+        );
+        let (hdr, info) = x360_loader::parse_xex(&data).expect("dash header parses");
+        let image =
+            x360_loader::image::loadable_image(&data, &hdr, &info).expect("dash decompresses");
+        let mut mem = Memory::new();
+        x360_loader::image::load_image_to_guest(&mut mem, &image, info.base_address)
+            .expect("load image");
+        let mut kernel = x360_kernel::Kernel::new();
+        kernel.set_fs(backend);
+        kernel.set_module_info(
+            info.base_address,
+            image.len() as u32,
+            info.title_id.unwrap_or(0),
+        );
+        let sysflags = info
+            .dirs
+            .iter()
+            .find_map(|d| match d.data {
+                x360_loader::XexDirData::Inline(v) if d.key == 0x0003_0000 => Some(v),
+                _ => None,
+            })
+            .unwrap_or(0);
+        kernel.set_system_flags(sysflags);
+        let hs = (hdr.header_size as usize).min(data.len());
+        kernel.set_xex_header(
+            data[..hs].to_vec(),
+            info.entry_point.unwrap_or(0),
+            "dash".into(),
+        );
+        let mut table = x360_kernel::imports::ImportTable::new();
+        let libs: Vec<(&str, &[u32])> = info
+            .import_libs
+            .iter()
+            .map(|l| (l.name.as_str(), l.records.as_slice()))
+            .collect();
+        x360_kernel::imports::apply(&mut mem, &mut kernel, &mut table, &libs)
+            .expect("apply imports");
+        let stack_size = 128 * 1024u32;
+        let stack_base = kernel.alloc_mem(stack_size, 16).expect("guest stack");
+        mem.write_bytes(stack_base, &vec![0u8; stack_size as usize])
+            .expect("zero stack");
+        kernel.set_stack(stack_base, stack_size);
+        let entry = info.entry_point.expect("dash has entry");
+        let mut xenon = x360_cpu::Xenon::new(entry);
+        xenon.threads[0].t.gpr[1] = (stack_base + stack_size - 16) as u64;
+        match x360_kernel::boot::run_until_exit_traced_imports(
+            &mut mem,
+            &mut xenon,
+            &mut kernel,
+            Some(&mut table),
+            1_000_000,
+            None,
+        ) {
+            Ok(exit) => {
+                println!("dash boot exit code={} steps={}", exit.code, exit.steps);
+            }
+            Err(e) if e.to_string().contains("step limit") => {
+                let done = table.implemented_calls.len();
+                println!(
+                    "dash boot ran 1M steps fault-free ({} imports served)",
+                    done
+                );
+                assert!(done >= 10, "dash boot regressed: only {} imports", done);
+                assert!(
+                    table.unimplemented_calls.is_empty(),
+                    "unexpected unimplemented imports: {:?}",
+                    table.unimplemented_calls.keys().take(8).collect::<Vec<_>>(),
+                );
+            }
+            Err(e) => {
+                panic!("dash boot stopped early: {}", e);
+            }
+        }
+    }
     #[test]
     fn retail_import_slots_dump() {
         use x360_filesystem::stfs::StfsImage;
@@ -424,6 +515,14 @@ mod integration {
                     done, xenon.threads[0].t.pc
                 );
                 assert!(done >= 10, "boot regressed: only {} imports served", done);
+                // No shim demand on this path: every called import is
+                // implemented (any unimplemented call would have errored
+                // instead of hitting the step limit).
+                assert!(
+                    table.unimplemented_calls.is_empty(),
+                    "unexpected unimplemented imports: {:?}",
+                    table.unimplemented_calls.keys().take(8).collect::<Vec<_>>(),
+                );
             }
             Err(e) => {
                 let t = &xenon.threads[0].t;

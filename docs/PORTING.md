@@ -376,15 +376,16 @@ out, and the license note. Workspace license: BSD-3-Clause.
   `VXA` 4-reg layout),
   `src/xenia/cpu/ppc/ppc_emit_altivec.cc` (`InstrEmit_vaddfp_` /
   `vsubfp_` / `vmaxfp_` / `vminfp_` / `vmulfp128` / `vmaddfp_` /
-  `vnmsubfp_`: 4 x f32 lane ops, fused `mul_add`).
+  `vnmsubfp_` / `vrefp_` / `vrsqrtefp_`: 4 x f32 lane ops, fused
+  `mul_add`; estimates precise-beyond-bounds — documented).
 - Taken (facts only): XO numbers, `FormatVX128`/`VXA` field maps,
-  lane width/count, max/min/mul/fused shape.
+  lane width/count, max/min/mul/fused/estimate shape.
 - Lives here: `crates/cpu/src/decode.rs` (kVX XO + kVX128 masked +
-  kVA fused arms) + `crates/cpu/src/exec.rs` (BE f32 lane ops +
-  unit tests).
+  kVA fused + estimate arms) + `crates/cpu/src/exec.rs` (BE f32
+  lane ops + unit tests).
 - NOT taken: FP compares/converts (cmpb/cmpeq/cmpge/cmpgt,
-  csxwfp/cuxwfp, ref/rsqrte/expte/loge), FP exception/FPSCR
-  control, denormal-input flushing.
+  csxwfp/cuxwfp, expte/loge), FP exception/FPSCR control,
+  denormal-input flushing.
 - License: reference is BSD (Ben Vanik / Xenia project); our
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.

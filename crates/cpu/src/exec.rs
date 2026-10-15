@@ -2725,6 +2725,33 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Vrefp { vd, vb } => {
+            // 4 x reciprocal estimate, precise (reference
+            // `InstrEmit_vrefp_`; ISA estimates permit any result
+            // within accuracy bounds — precise exceeds them).
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&(1.0f32 / y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vrsqrtefp { vd, vb } => {
+            // 4 x reciprocal-sqrt estimate, precise (reference
+            // `InstrEmit_vrsqrtefp_`).
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&(1.0f32 / y.sqrt()).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Vmx { word } => Err(EmuError::Unsupported(format!(
             "VMX128 word={:08x} pc={:08x}",
             word, t.pc
@@ -3566,6 +3593,52 @@ mod tests {
         assert_eq!(get(&t, 3), [12.0, 24.0, 36.0, 48.0]);
         run_word(0x1061_112F, &mut t, &mut m);
         assert_eq!(get(&t, 3), [8.0, 16.0, 24.0, 32.0]);
+    }
+
+    #[test]
+    fn vrefp_vrsqrtefp_precise() {
+        let (mut t, mut m) = setup();
+        // vrefp v3,v2 = base(VD=3,VB=2) | 0x10A;
+        // vrsqrtefp v3,v2 = base | 0x14A.
+        let base = (4u32 << 26) | (3 << 21) | (2 << 11);
+        assert!(matches!(
+            decode(base | 0x10A).unwrap(),
+            Decoded::Vrefp { vd: 3, vb: 2 }
+        ));
+        assert!(matches!(
+            decode(base | 0x14A).unwrap(),
+            Decoded::Vrsqrtefp { vd: 3, vb: 2 }
+        ));
+        fn put(t: &mut ThreadState, i: usize, xs: [f32; 4]) {
+            let mut v = [0u8; 16];
+            for (j, x) in xs.iter().enumerate() {
+                v[4 * j..4 * j + 4].copy_from_slice(&x.to_be_bytes());
+            }
+            t.vr[i] = v;
+        }
+        fn get(t: &ThreadState, i: usize) -> [f32; 4] {
+            let mut out = [0.0; 4];
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = f32::from_be_bytes([
+                    t.vr[i][4 * j],
+                    t.vr[i][4 * j + 1],
+                    t.vr[i][4 * j + 2],
+                    t.vr[i][4 * j + 3],
+                ]);
+            }
+            out
+        }
+        put(&mut t, 2, [1.0, 4.0, 2.0, 0.5]);
+        run_word(base | 0x10A, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [1.0, 0.25, 0.5, 2.0]);
+        put(&mut t, 2, [4.0, 1.0, 16.0, 0.25]);
+        run_word(base | 0x14A, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [0.5, 1.0, 0.25, 2.0]);
+        // Specials: 0 -> inf, inf -> 0.
+        put(&mut t, 2, [0.0, f32::INFINITY, 1.0, 1.0]);
+        run_word(base | 0x10A, &mut t, &mut m);
+        assert_eq!(get(&t, 3)[0], f32::INFINITY);
+        assert_eq!(get(&t, 3)[1], 0.0);
     }
 
     #[test]

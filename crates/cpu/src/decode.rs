@@ -1217,6 +1217,18 @@ pub enum Decoded {
         vb: u32,
         vc: u32,
     },
+    // Vector reciprocal estimates (primary 4, kVX; reference
+    // `InstrEmit_vrefp_`/`vrsqrtefp_`): 4 x f32. XOs 0x10A/0x14A.
+    // The ISA specifies estimates; our precise results exceed the
+    // required accuracy (documented, unit-tested on exact values).
+    Vrefp {
+        vd: u32,
+        vb: u32,
+    },
+    Vrsqrtefp {
+        vd: u32,
+        vb: u32,
+    },
     // Vector load/store indexed, 128-bit forms (primary 4, kVX128_1;
     // reference `InstrEmit_lvx128`/`stvx128`). VD is 7-bit
     // (low 5 + bits 0-1); EA aligns down to 16; bytes transfer raw
@@ -1436,6 +1448,8 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     va: ra,
                     vb: rb,
                 }),
+                0x10A => Ok(Decoded::Vrefp { vd: rt, vb: rb }),
+                0x14A => Ok(Decoded::Vrsqrtefp { vd: rt, vb: rb }),
                 0x40A => Ok(Decoded::Vmaxfp {
                     vd: rt,
                     va: ra,

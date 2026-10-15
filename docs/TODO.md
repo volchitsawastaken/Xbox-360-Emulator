@@ -138,12 +138,11 @@ Terminal states only: impossible, done, or something rendering.
       (no draw backend yet); retail Braid kicks twice
       (`0x16`/`0x19`) and the stream executes clean (ME_INIT,
       register programming, nested IBs) — device field still NULL
-- [ ] Retail frontier (STFS-backed boot): scheduler is live — workers
-      run and contend (new fault `leave of unowned critical section
-      01030610` at `0x82558D18`, a worker executing leave without
-      ownership). Still open: whether the imbalance is a divergent
-      worker path (heap history now includes worker allocs) or a
-      genuine game race; needs an enter/leave trace with thread ids
+- [x] Retail `leave of unowned critical section 01030610` (worker
+      contention, superseded): root-caused to main thread 0's token
+      colliding with "free" (fixed by the critsec change below); the
+      fault no longer occurs — subsequent runs fault elsewhere and
+      both retail gates run fault-free to their floors. Closed.
 - [x] Critsec ownership vs thread 0 (found via worker contention):
       main's token 0 collided with "free", letting workers steal
       main-held sections; free is now (lock < 0) or pristine-zero
@@ -232,6 +231,14 @@ Terminal states only: impossible, done, or something rendering.
       waits keep NULL-block semantics; unit-tested (roundtrip +
       adoption). Retail still faults at the same `bctr` (polls;
       signalers missing) — documented, not reverted
+- [x] VMX128 FP estimates `vrefp` (0x10A) / `vrsqrtefp` (0x14A):
+      precise 4x f32 reciprocal/reciprocal-sqrt (ISA specifies
+      estimates; precise exceeds the accuracy bounds — documented);
+      unit-tested incl. 0→inf/inf→0 specials. FP compare/convert
+      remains (no retail demand: zero VMX `Unsupported` in any run).
+- [ ] Draw backend (next GPU step once a callback/swap fires it —
+      retail Braid never swaps pre-device; vblank path tested and
+      waiting)
 - [x] Dash pipeline test (`dash_pipeline`, gated on `X360_DASH_DIR`):
       dash.xex parses/decompresses to 10 PE sections with entry
       `0x92196610` covered, 1628 imports — loader drift excluded for
@@ -246,10 +253,14 @@ Terminal states only: impossible, done, or something rendering.
       (`VdInitializeScalerCommandBuffer_entry`, kImplemented): fills
       `dest_count` words with NOPs (`0x80000000`), returns the count;
       absurd counts explicit errors; unit-tested
-- [ ] Draw backend (next GPU step) OR VMX128 FP compare/convert
-      — pick by retail demand
-- [ ] Kernel shims on demand (file data, content)
-- [ ] Commit + push; update PORTING.md / COMPATIBILITY.md
+- [x] `dash_boot_steps` progress floor (HostDirFs, 1M steps
+      fault-free, 59 imports, zero unimplemented — permanent gate):
+      locks the 63-import Dash init path below the table-walk fault
+- [x] Kernel shims on demand: NO current demand — both retail gates
+      (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
+      unimplemented imports; every called import is implemented.
+      Reopens automatically on the next unimplemented-import fault.
+- [x] Commit + push; update PORTING.md / COMPATIBILITY.md
 
 ## Later roadmap
 
