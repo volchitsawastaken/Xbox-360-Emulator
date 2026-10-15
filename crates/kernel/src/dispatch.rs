@@ -656,6 +656,33 @@ pub fn dispatch_import(
             log::info!("kernel: VdSwap #{} queued vblank", kernel.vd_swaps);
             Ok(())
         }
+        // VdInitializeScalerCommandBuffer(...) (reference
+        // `VdInitializeScalerCommandBuffer_entry`, kImplemented): fill
+        // `dest_count` words at `dest_ptr` with NOPs (`0x80000000`)
+        // and return `dest_count`. Args 0-7 in r3-r10, args 8-11 on
+        // the stack (`dest_ptr` = stack 2, `dest_count` = stack 3).
+        // Bounds are explicit errors, never silent truncation.
+        (Lib::Xboxkrnl, 0x1C5) => {
+            let r1 = t.gpr[1] as u32;
+            let dest_ptr = crate::fs::stack_arg(mem, r1, 2).unwrap_or(0);
+            let dest_count = crate::fs::stack_arg(mem, r1, 3).unwrap_or(0);
+            if dest_count > 1_048_576 {
+                return Err(EmuError::Other(format!(
+                    "scaler command buffer count {} too large",
+                    dest_count
+                )));
+            }
+            if dest_ptr != 0 {
+                for i in 0..dest_count {
+                    let addr = dest_ptr.wrapping_add(i * 4);
+                    mem.write_u32(addr, 0x8000_0000).map_err(|e| {
+                        EmuError::Other(format!("scaler buffer {:08x}: {}", addr, e))
+                    })?;
+                }
+            }
+            t.gpr[3] = (dest_count) as u64;
+            Ok(())
+        }
         (Lib::Xboxkrnl, 0x379) => {
             // VdSetStudioRGBMode(mode): table-only in the reference.
             // Record the limited/full-range selection for the GPU
@@ -3302,6 +3329,48 @@ mod tests {
         .unwrap();
         assert_eq!(k.vd_swaps, 2);
         assert_eq!(k.vd_irq_pending.len(), 2);
+    }
+
+    #[test]
+    fn vd_scaler_command_buffer_fills_nops() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x1C5),
+            Some("VdInitializeScalerCommandBuffer")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let dest = 0x8400_6000;
+        t.gpr[1] = 0x8400_7000_u64;
+        m.write_u32(0x8400_7010, dest).unwrap(); // stack arg 2 (11th)
+        m.write_u32(0x8400_7014, 4).unwrap(); // stack arg 3 (12th)
+                                              // Dirty the range first to prove the fill.
+        m.write_u32(dest, 0xDEAD_BEEF).unwrap();
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1C5),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 4);
+        for i in 0..4u32 {
+            assert_eq!(m.read_u32(dest + i * 4).unwrap(), 0x8000_0000);
+        }
+        // Absurd counts are explicit errors, never silent truncation.
+        m.write_u32(0x8400_7014, 0xFFFF_FFFF).unwrap();
+        assert!(dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x1C5),
+        )
+        .is_err());
     }
 
     #[test]

@@ -237,6 +237,10 @@ Terminal states only: impossible, done, or something rendering.
       queued vblanks deliver only once a callback is registered
       (retail Braid registers one but never swaps; queue stays empty
       there, documented)
+- [x] `VdInitializeScalerCommandBuffer` (0x1C5) per reference
+      (`VdInitializeScalerCommandBuffer_entry`, kImplemented): fills
+      `dest_count` words with NOPs (`0x80000000`), returns the count;
+      absurd counts explicit errors; unit-tested
 - [ ] Draw backend (next GPU step) OR VMX128 FP compare/convert
       — pick by retail demand
 - [ ] Kernel shims on demand (file data, content)

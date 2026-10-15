@@ -309,7 +309,9 @@ out, and the license note. Workspace license: BSD-3-Clause.
   LR sentinel `0xBCBCBCBC`, args in r3+),
   `src/xenia/gpu/graphics_system.cc` (`MarkVblank`:
   `DispatchInterruptCallback(0, 2)`) + `VdSwap_entry` (present
-  posts; 10-arg ABI).
+  posts; 10-arg ABI),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc`
+  (`VdInitializeScalerCommandBuffer_entry`: NOP-fill + count).
 - Taken (facts only): register index + framing/field maps, zero
   size, swap table, match function, writeback remap rule.
 - Lives here: `crates/kernel/src/gpu.rs` (executor + unit tests),
