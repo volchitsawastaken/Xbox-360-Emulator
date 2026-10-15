@@ -210,6 +210,39 @@ mod integration {
     /// (pc, registers, last trace, import call tables) until the game
     /// runs further. Package bytes stay out of git.
     #[test]
+    fn dash_pipeline() {
+        let dir = match std::env::var("X360_DASH_DIR") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let name = std::env::var("X360_DASH_XEX").unwrap_or_else(|_| "dash.xex".to_string());
+        let data = std::fs::read(format!("{}/{}", dir, name)).expect("read dash xex");
+        let (hdr, info) = x360_loader::parse_xex(&data).expect("dash header parses");
+        let image =
+            x360_loader::image::loadable_image(&data, &hdr, &info).expect("dash decompresses");
+        let sections = x360_loader::image::parse_pe_sections(&image).expect("dash PE parses");
+        println!(
+            "dash entry={:08x} base={:08x} sections={} imports={}",
+            info.entry_point.unwrap_or(0),
+            info.base_address,
+            sections.len(),
+            info.import_libs
+                .iter()
+                .map(|l| l.import_count as usize)
+                .sum::<usize>(),
+        );
+        assert!(!sections.is_empty());
+        if let Some(entry) = info.entry_point {
+            let rel = entry.wrapping_sub(info.base_address);
+            assert!(
+                sections.iter().any(|s| (s.virt_addr as usize) < image.len()
+                    && rel >= s.virt_addr
+                    && rel < s.virt_addr + s.virt_size.max(1)),
+                "dash entry not covered"
+            );
+        }
+    }
+    #[test]
     fn retail_import_slots_dump() {
         use x360_filesystem::stfs::StfsImage;
         let path = match std::env::var("X360_STFS_FILE") {

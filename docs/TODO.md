@@ -231,6 +231,10 @@ Terminal states only: impossible, done, or something rendering.
       waits keep NULL-block semantics; unit-tested (roundtrip +
       adoption). Retail still faults at the same `bctr` (polls;
       signalers missing) — documented, not reverted
+- [x] Dash pipeline test (`dash_pipeline`, gated on `X360_DASH_DIR`):
+      dash.xex parses/decompresses to 10 PE sections with entry
+      `0x92196610` covered, 1628 imports — loader drift excluded for
+      the table-walk frontier (fault is logic/data, not placement)
 - [x] `VdSwap` present (reference `VdSwap_entry` + `MarkVblank`):
       counts presents, queues vblank `(0, 2)` through the existing
       interrupt-delivery path; unit-tested. No draw backend yet —
