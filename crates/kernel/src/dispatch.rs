@@ -287,9 +287,16 @@ pub fn dispatch_import(
             }
             Ok(())
         }
-        (Lib::Xboxkrnl, 0xFE) => {
-            nt_wait_multiple(kernel, mem, arg(t, 0), arg(t, 1), arg(t, 2), thread_id, t)
-        }
+        (Lib::Xboxkrnl, 0xFE) => nt_wait_multiple(
+            kernel,
+            mem,
+            arg(t, 0),
+            arg(t, 1),
+            arg(t, 2),
+            thread_id,
+            arg(t, 5),
+            t,
+        ),
         // ---- NT threads (reference `xboxkrnl_threading.cc`) ----
         (Lib::Xboxkrnl, 0x0D) => ex_create_thread(
             kernel,
@@ -307,8 +314,8 @@ pub fn dispatch_import(
         (Lib::Xboxkrnl, 0xFC) => nt_suspend_thread(kernel, mem, arg(t, 0), arg(t, 1), t),
         (Lib::Xboxkrnl, 0x19) => ex_terminate_thread(kernel, thread_id, arg(t, 0), t),
         (Lib::Xboxkrnl, 0x101) => {
-            // NtYieldExecution: cooperative yield is a no-op with one
-            // running thread; still a real return, not a stub.
+            // NtYieldExecution: the round-robin runner picks the next
+            // runnable thread anyway; still a real return, not a stub.
             t.gpr[3] = (STATUS_SUCCESS) as u64;
             Ok(())
         }
@@ -1799,6 +1806,18 @@ fn wait_on_handle(
     Ok(())
 }
 
+/// Shared not-ready outcome: NULL (infinite) timeout blocks
+/// cooperatively; any non-null timeout stays immediate TIMEOUT
+/// (zero polls, finite waits pending time-based expiry).
+fn wait_not_ready(mem: &Memory, timeout_ptr: u32, t: &mut ThreadState) -> Result<()> {
+    if timeout_ptr == 0 {
+        return Err(EmuError::Blocked("multi-wait with infinite timeout".into()));
+    }
+    let _ = mem.read_u64(timeout_ptr).unwrap_or(0);
+    t.gpr[3] = (STATUS_TIMEOUT) as u64;
+    Ok(())
+}
+
 /// `KeWaitForSingleObject(ptr, reason, mode, alertable, timeout_ptr)`.
 fn ke_wait_single(
     kernel: &mut Kernel,
@@ -1846,9 +1865,13 @@ fn mirror_waited(kernel: &Kernel, mem: &mut Memory, handle: u32, thread_id: u32)
     }
 }
 
-/// `NtWaitForMultipleObjectsEx(count, handles_ptr, wait_type, ...)`:
-/// wait_type 0 = WaitAll, 1 = WaitAny. Poll semantics matching
-/// `nt_wait_single` per object; failed WaitAll consumes nothing.
+/// `NtWaitForMultipleObjectsEx(count, handles_ptr, wait_type,
+/// wait_mode, alertable, timeout_ptr)` (reference
+/// `NtWaitForMultipleObjectsEx_entry`): wait_type 0 = WaitAll, 1 =
+/// WaitAny. Unready with NULL (infinite) timeout reports Blocked for
+/// cooperative rewind-retry; zero/non-null timeouts stay immediate
+/// TIMEOUT like the single form. Failed WaitAll consumes nothing.
+#[allow(clippy::too_many_arguments)]
 fn nt_wait_multiple(
     kernel: &mut Kernel,
     mem: &mut Memory,
@@ -1856,6 +1879,7 @@ fn nt_wait_multiple(
     handles_ptr: u32,
     wait_type: u32,
     thread_id: u32,
+    timeout_ptr: u32,
     t: &mut ThreadState,
 ) -> Result<()> {
     if count == 0 || count > 64 || handles_ptr == 0 {
@@ -1888,8 +1912,7 @@ fn nt_wait_multiple(
                 return Ok(());
             }
         }
-        t.gpr[3] = (STATUS_TIMEOUT) as u64;
-        return Ok(());
+        return wait_not_ready(mem, timeout_ptr, t);
     }
     // WaitAll: all must be ready; snapshot first so a partial set is
     // never consumed.
@@ -1918,7 +1941,7 @@ fn nt_wait_multiple(
         }
         t.gpr[3] = (STATUS_SUCCESS) as u64;
     } else {
-        t.gpr[3] = (STATUS_TIMEOUT) as u64;
+        return wait_not_ready(mem, timeout_ptr, t);
     }
     Ok(())
 }
@@ -5188,6 +5211,93 @@ mod tests {
             7,
             &mut t,
             &imp("xboxkrnl.exe", 0xFD),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn multi_wait_blocks_on_null_timeout() {
+        use x360_common::EmuError;
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // Two unsignaled auto-reset events.
+        let (hp, ap) = (0x8400_4600, 0x8400_4700);
+        for h in [hp, ap] {
+            t.gpr[3] = h as u64;
+            t.gpr[4] = 0;
+            t.gpr[5] = 1;
+            t.gpr[6] = 0;
+            dispatch_import(
+                &mut k,
+                &mut m,
+                &mut tab,
+                7,
+                &mut t,
+                &imp("xboxkrnl.exe", 0xD1),
+            )
+            .unwrap();
+        }
+        let (e1, e2) = (m.read_u32(hp).unwrap(), m.read_u32(ap).unwrap());
+        m.write_u32(0x8400_4800, e1).unwrap();
+        m.write_u32(0x8400_4804, e2).unwrap();
+        m.write_u64(0x8400_4810, 0).unwrap(); // zero timeout
+                                              // WaitAny, NULL timeout: Blocked.
+        t.gpr[3] = 2;
+        t.gpr[4] = 0x8400_4800;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        t.gpr[8] = 0;
+        let e = dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xFE),
+        )
+        .expect_err("must block");
+        assert!(matches!(e, EmuError::Blocked(_)));
+        // Same with zero timeout: TIMEOUT.
+        t.gpr[8] = 0x8400_4810;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xFE),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_TIMEOUT);
+        // Signal one: WaitAny succeeds (auto-reset consumes).
+        t.gpr[3] = e1 as u64;
+        t.gpr[4] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xF6),
+        )
+        .unwrap();
+        t.gpr[3] = 2;
+        t.gpr[4] = 0x8400_4800;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        t.gpr[8] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xFE),
         )
         .unwrap();
         assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
