@@ -14,7 +14,7 @@ Statuses: `verified` (tested, evidence), `partial` (some paths work),
 | CR/XER/LR/CTR moves (mfcr/mtcr, mflr/mtlr, mfctr/mtctr, mfxer) | partial | LR/CTR only; other SPRs explicit Unsupported |
 | lwarx/stwcx. reservations | partial | Single-thread correct + CR EQ; SMP invalidation pending |
 | sync/lwsync/isync/eieio | partial | Barriers as scheduler fences for now |
-| VMX128 vector ops | unsupported | Tracked per-opcode, required for retail |
+| VMX128 vector ops | partial | Integer subset + classic FP (`vaddfp`/`vsubfp`/`vmaxfp`/`vminfp`, 4x f32, tested); 128-bit FP + remaining ops tracked per-opcode, required for retail |
 | FP unit | partial | FPR file + D-form lfs/lfd/stfs/stfd (plain+update); double+single ALU (add/sub/mul/div/madd/msub/nmadd/nmsub, fused mul_add), fmr/fneg/fabs/fnabs/frsp/fctiw(fctiwz)/fctid/fcfid/fsqrt/fres/frsqrte/fsel, fcmpu/fcmpo to CR, stfiwx/lfiwax; A-form decodes on the real 5-bit XO (nonzero FRC, e.g. retail `fmuls` 0xEC200732); `mftb` (50MHz wall clock), `td`/`tdi` traps, word+doubleword mul/div (`mullw`/`mulhw`/`divw`, `mulld`/`mulhd`/`divd`); FPSCR exceptions unmodeled (CR1=0), RN assumed nearest-even; tested |
 | Exceptions (DSI/ISI/program/sc) | partial | Fault codes surfaced; sc traps with r0=syscall id convention |
 | 6-thread scheduling | partial | Xenon round-robin wired in frontend; priorities pending M6 |

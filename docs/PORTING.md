@@ -277,8 +277,8 @@ out, and the license note. Workspace license: BSD-3-Clause.
   `crates/kernel/src/lib.rs` (`dash_context`, `launch_data`,
   `symlinks`, `vd_studio_rgb`), `crates/kernel/src/dispatch.rs`
   (shims + unit tests), `crates/filesystem/src/hostdir_fs.rs`.
-- NOT taken: VMX128 FP arithmetic, blocking lock waits (explicit
-  Unsupported), download/storage backends, ETX consumers.
+- NOT taken: VMX128 128-bit FP arithmetic, blocking lock waits
+  (explicit Unsupported), download/storage backends, ETX consumers.
 - License: reference is BSD (Ben Vanik / Xenia project); our
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.
@@ -347,6 +347,22 @@ out, and the license note. Workspace license: BSD-3-Clause.
 - NOT taken: time-based finite waits (immediate TIMEOUT),
   overlapped-async UI completion (sync completion), APC delivery.
   (Interrupt-callback delivery is now implemented — see §10.)
+- License: reference is BSD (Ben Vanik / Xenia project); our
+  tracking and logic are original under the workspace
+  BSD-3-Clause. Attribution is kept in the module docs.
+
+## 12. VMX128 classic FP arithmetic facts
+
+- Source: `src/xenia/cpu/ppc/ppc_opcode_table_gen.cc`
+  (`vaddfp 0x1000000A`, `vsubfp 0x1000004A`, `vmaxfp 0x1000040A`,
+  `vminfp 0x1000044A`, all kVX),
+  `src/xenia/cpu/ppc/ppc_emit_altivec.cc` (`InstrEmit_vaddfp_` /
+  `vsubfp_` / `vmaxfp_` / `vminfp_`: 4 x f32 lane ops).
+- Taken (facts only): XO numbers, lane width/count, max/min shape.
+- Lives here: `crates/cpu/src/decode.rs` (kVX XO arms) +
+  `crates/cpu/src/exec.rs` (BE f32 lane ops + unit test).
+- NOT taken: 128-bit FP (`vaddfp128`/`vsubfp128`/`vmulfp128` etc.),
+  madd/msum fused ops, FP exception/FPSCR control.
 - License: reference is BSD (Ben Vanik / Xenia project); our
   tracking and logic are original under the workspace
   BSD-3-Clause. Attribution is kept in the module docs.

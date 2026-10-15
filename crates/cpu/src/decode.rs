@@ -1160,6 +1160,30 @@ pub enum Decoded {
         va: u32,
         vb: u32,
     },
+    // Vector FP add/sub/max/min (primary 4, kVX; reference
+    // `ppc_emit_altivec.cc` `InstrEmit_vaddfp_/vsubfp_/vmaxfp_/vminfp_`:
+    // 4 x f32 lane ops, PPC byte order). XOs: vaddfp 0x00A, vsubfp
+    // 0x04A, vmaxfp 0x40A, vminfp 0x44A. 128-bit forms stay tracked.
+    Vaddfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
+    Vsubfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
+    Vmaxfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
+    Vminfp {
+        vd: u32,
+        va: u32,
+        vb: u32,
+    },
     // Vector load/store indexed, 128-bit forms (primary 4, kVX128_1;
     // reference `InstrEmit_lvx128`/`stvx128`). VD is 7-bit
     // (low 5 + bits 0-1); EA aligns down to 16; bytes transfer raw
@@ -1353,6 +1377,26 @@ pub fn decode(word: u32) -> Result<Decoded> {
                     vb: rb,
                 }),
                 0x20C => Ok(Decoded::Vspltb {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                }),
+                0x00A => Ok(Decoded::Vaddfp {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                }),
+                0x04A => Ok(Decoded::Vsubfp {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                }),
+                0x40A => Ok(Decoded::Vmaxfp {
+                    vd: rt,
+                    va: ra,
+                    vb: rb,
+                }),
+                0x44A => Ok(Decoded::Vminfp {
                     vd: rt,
                     va: ra,
                     vb: rb,

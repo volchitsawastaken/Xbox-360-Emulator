@@ -2592,6 +2592,63 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Vaddfp { vd, va, vb } => {
+            // 4 x f32 add, PPC byte order (reference
+            // `InstrEmit_vaddfp_`).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&(x + y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vsubfp { vd, va, vb } => {
+            // 4 x f32 sub (reference `InstrEmit_vsubfp_`).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&(x - y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vmaxfp { vd, va, vb } => {
+            // 4 x f32 max (reference `InstrEmit_vmaxfp_`).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&x.max(y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vminfp { vd, va, vb } => {
+            // 4 x f32 min (reference `InstrEmit_vminfp_`).
+            let a = t.vr[va as usize];
+            let b = t.vr[vb as usize];
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let x = f32::from_be_bytes([a[4 * i], a[4 * i + 1], a[4 * i + 2], a[4 * i + 3]]);
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&x.min(y).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Vmx { word } => Err(EmuError::Unsupported(format!(
             "VMX128 word={:08x} pc={:08x}",
             word, t.pc
@@ -3218,6 +3275,74 @@ mod tests {
         t.vr[8] = [0x0Fu8; 16];
         run_word(vsel, &mut t, &mut m);
         assert_eq!(t.vr[5], [0xF0u8; 16]);
+    }
+
+    #[test]
+    fn vaddfp_family_classic() {
+        let (mut t, mut m) = setup();
+        // vaddfp v3,v1,v2 = 0x1061100A; vsubfp 0x1061104A;
+        // vmaxfp 0x1061140A; vminfp 0x1061144A.
+        assert!(matches!(
+            decode(0x1061_100A).unwrap(),
+            Decoded::Vaddfp {
+                vd: 3,
+                va: 1,
+                vb: 2
+            }
+        ));
+        assert!(matches!(
+            decode(0x1061_104A).unwrap(),
+            Decoded::Vsubfp {
+                vd: 3,
+                va: 1,
+                vb: 2
+            }
+        ));
+        assert!(matches!(
+            decode(0x1061_140A).unwrap(),
+            Decoded::Vmaxfp {
+                vd: 3,
+                va: 1,
+                vb: 2
+            }
+        ));
+        assert!(matches!(
+            decode(0x1061_144A).unwrap(),
+            Decoded::Vminfp {
+                vd: 3,
+                va: 1,
+                vb: 2
+            }
+        ));
+        fn put(t: &mut ThreadState, i: usize, xs: [f32; 4]) {
+            let mut v = [0u8; 16];
+            for (j, x) in xs.iter().enumerate() {
+                v[4 * j..4 * j + 4].copy_from_slice(&x.to_be_bytes());
+            }
+            t.vr[i] = v;
+        }
+        fn get(t: &ThreadState, i: usize) -> [f32; 4] {
+            let mut out = [0.0; 4];
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = f32::from_be_bytes([
+                    t.vr[i][4 * j],
+                    t.vr[i][4 * j + 1],
+                    t.vr[i][4 * j + 2],
+                    t.vr[i][4 * j + 3],
+                ]);
+            }
+            out
+        }
+        put(&mut t, 1, [1.0, 2.0, -3.0, 4.5]);
+        put(&mut t, 2, [0.5, -1.0, 4.0, 1.5]);
+        run_word(0x1061_100A, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [1.5, 1.0, 1.0, 6.0]);
+        run_word(0x1061_104A, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [0.5, 3.0, -7.0, 3.0]);
+        run_word(0x1061_140A, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [1.0, 2.0, 4.0, 4.5]);
+        run_word(0x1061_144A, &mut t, &mut m);
+        assert_eq!(get(&t, 3), [0.5, -1.0, -3.0, 1.5]);
     }
 
     #[test]

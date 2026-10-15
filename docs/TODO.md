@@ -6,7 +6,7 @@ Terminal states only: impossible, done, or something rendering.
 ## Entire Xbox 360 emulation total: ~5 out of 100%
 
 100% = running ANY game released for the Xbox 360. Honest breakdown:
-- CPU interpreter (integer+FPU, no JIT) 40% · VMX128 0% · MMU/paging 0%
+- CPU interpreter (integer+FPU, no JIT) 40% · VMX128 integer done + FP classic (128-bit FP 0%) · MMU/paging 0%
 - Kernel (of ~300+ used imports across xboxkrnl/xam) ~15%
 - GPU (shaders/eDRAM/draw path) 3% · audio 5% · input 0% · storage/saves 40%
 - Scheduler 15% · networking 10% · frontend 35% · per-game compat work 2%
@@ -93,8 +93,14 @@ Terminal states only: impossible, done, or something rendering.
       `vslb`, `vor`, `vspltb`, `lvx`/`stvx` + `lvlx`/`lvrx`/`stvlx`/
       `stvrx` (zero-fill/no-op edges per backend TBL notes) +
       `lvebx`/`lvehx`/`lvewx`/`stvebx`/`stvehx`/`stvewx` element ops +
-      128-bit forms, `vperm`/`vperm128`/`vsel`; FP vector arithmetic
-      still `Unsupported`
+      128-bit forms, `vperm`/`vperm128`/`vsel`
+- [x] CPU VMX128 FP arithmetic, classic subset (reference
+      `ppc_emit_altivec.cc` `InstrEmit_vaddfp_/vsubfp_/vmaxfp_/vminfp_`):
+      `vaddfp` (0x00A) / `vsubfp` (0x04A) / `vmaxfp` (0x40A) /
+      `vminfp` (0x44A), 4 x f32 lane ops in PPC byte order;
+      unit-tested (add/sub/max/min incl. negatives); 128-bit FP
+      (`vaddfp128`/`vsubfp128`/`vmulfp128`/madd/msum) stays tracked
+      `Unsupported`
 - [x] Filesystem `HostDirFs`: read-only host-directory backend
       (recursive index, lazy Arc cache, dir listings) for extracted
       layouts and system-update dirs; tested
@@ -213,8 +219,9 @@ Terminal states only: impossible, done, or something rendering.
       its stream contains zero INTERRUPT packets, so this is not the
       missing queueing trigger (documented, not reverted: genuine OS
       feature)
-- [ ] Draw backend (next GPU step) OR VMX128 FP arithmetic (`vaddfp`,
-      `vmulfp`, float permutes) — pick by retail demand
+- [ ] Draw backend (next GPU step) OR VMX128 128-bit FP
+      (`vaddfp128`/`vsubfp128`/`vmulfp128`/madd/msum) — pick by retail
+      demand
 - [ ] Kernel shims on demand (file data, content)
 - [ ] Commit + push; update PORTING.md / COMPATIBILITY.md
 
