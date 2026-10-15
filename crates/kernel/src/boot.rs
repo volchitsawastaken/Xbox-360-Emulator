@@ -153,7 +153,7 @@ pub fn run_until_exit_traced_imports(
             // Extra fetch only on the tracing path; hot path untouched.
             let pc = xenon.threads[i].t.pc;
             if let Ok(word) = mem.fetch_u32(pc) {
-                tb.push(pc, word);
+                tb.push(pc, word, i as u32);
             }
         }
         let trap = match xenon.threads[i].step(mem) {
@@ -385,5 +385,37 @@ mod tests {
         let rec = kernel.nt_thread(handle).expect("tracked");
         assert!(!rec.exited);
         assert_eq!(rec.suspend_count, 1);
+    }
+
+    #[test]
+    fn traced_run_attributes_threads() {
+        use x360_debugger::TraceBuffer;
+        let mut mem = Memory::new();
+        // Worker: two nops then return.
+        let worker = 0x9000_0000u32;
+        mem.write_u32(worker, 0x6000_0000).unwrap();
+        mem.write_u32(worker + 4, 0x6000_0000).unwrap();
+        mem.write_u32(worker + 8, 0x4E80_0020).unwrap();
+        // Main: six nops then exit 0 (outlives the worker).
+        let entry = 0x8200_0000u32;
+        for i in 0..6u32 {
+            mem.write_u32(entry + i * 4, 0x6000_0000).unwrap();
+        }
+        mem.write_u32(entry + 24, 0x3860_0000).unwrap();
+        mem.write_u32(entry + 28, 0x3800_0001).unwrap();
+        mem.write_u32(entry + 32, 0x4400_0002).unwrap();
+        let mut xenon = Xenon::new(entry);
+        let mut kernel = Kernel::new();
+        kernel
+            .ex_create_thread(&mut mem, 0, worker, 0, 0)
+            .expect("spawn worker");
+        let mut trace = TraceBuffer::new(256);
+        let exit = run_until_exit_traced(&mut mem, &mut xenon, &mut kernel, 200, Some(&mut trace))
+            .unwrap();
+        assert_eq!(exit.code, 0);
+        assert_eq!(trace.len() as u64, exit.steps);
+        let threads: std::collections::HashSet<u32> = trace.iter().map(|e| e.thread).collect();
+        assert!(threads.contains(&0));
+        assert!(threads.contains(&1));
     }
 }

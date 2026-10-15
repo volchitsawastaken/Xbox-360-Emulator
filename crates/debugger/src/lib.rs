@@ -14,6 +14,7 @@ pub const DEFAULT_SYSCALL_CAPACITY: usize = 256;
 /// guest memory, and the disassembly of that word from the real decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceEvent {
+    pub thread: u32,
     pub pc: u32,
     pub word: u32,
     pub disasm: String,
@@ -52,8 +53,9 @@ impl TraceBuffer {
     }
 
     /// Record one fetch at `pc` with raw `word`, disassembling the word
-    /// with the real CPU decoder.
-    pub fn push(&mut self, pc: u32, word: u32) {
+    /// with the real CPU decoder. `thread` is the Xenon slot that
+    /// executed it (0 for single-threaded runs).
+    pub fn push(&mut self, pc: u32, word: u32, thread: u32) {
         if self.capacity == 0 {
             return;
         }
@@ -61,12 +63,31 @@ impl TraceBuffer {
             self.events.pop_front();
         }
         let disasm = disasm(word);
-        self.events.push_back(TraceEvent { pc, word, disasm });
+        self.events.push_back(TraceEvent {
+            thread,
+            pc,
+            word,
+            disasm,
+        });
     }
 
     /// Events oldest-first.
     pub fn iter(&self) -> std::collections::vec_deque::Iter<'_, TraceEvent> {
         self.events.iter()
+    }
+
+    /// Render the retained events, oldest-first, one per line:
+    /// `th{thread} {pc:08x}: {word:08x} {disasm}`. This is the
+    /// on-disk trace format (see [`write_trace_file`]).
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for ev in self.iter() {
+            out.push_str(&format!(
+                "th{} {:08x}: {:08x} {}\n",
+                ev.thread, ev.pc, ev.word, ev.disasm
+            ));
+        }
+        out
     }
 
     pub fn clear(&mut self) {
@@ -78,6 +99,19 @@ impl Default for TraceBuffer {
     fn default() -> Self {
         Self::new(DEFAULT_TRACE_CAPACITY)
     }
+}
+
+/// Write a trace to `path` in [`TraceBuffer::render`] format.
+/// Returns the number of events written. Used by runners to dump the
+/// retained window on faults (trace-diff forensics); errors surface
+/// instead of panicking.
+pub fn write_trace_file(
+    path: &std::path::Path,
+    trace: &TraceBuffer,
+) -> std::result::Result<usize, String> {
+    std::fs::write(path, trace.render())
+        .map_err(|e| format!("trace write {}: {}", path.display(), e))?;
+    Ok(trace.len())
 }
 
 /// One watched guest-memory range: half-open interval `[addr, addr + len)`.
@@ -283,7 +317,8 @@ impl Debugger {
         let mut out = Vec::new();
         for (i, ev) in self.trace.iter().enumerate() {
             out.push(format!(
-                "trace[{i}]: pc={pc:08x} word={word:08x} {dis}",
+                "trace[{i}]: th={thread} pc={pc:08x} word={word:08x} {dis}",
+                thread = ev.thread,
                 pc = ev.pc,
                 word = ev.word,
                 dis = ev.disasm
@@ -330,7 +365,7 @@ mod tests {
     fn trace_respects_capacity() {
         let mut buf = TraceBuffer::new(4);
         for i in 0..10u32 {
-            buf.push(0x1000 + i * 4, 0x6000_0000);
+            buf.push(0x1000 + i * 4, 0x6000_0000, 0);
         }
         assert_eq!(buf.len(), 4);
         assert_eq!(buf.capacity(), 4);
@@ -340,7 +375,7 @@ mod tests {
     fn trace_overwrites_oldest_in_order() {
         let mut buf = TraceBuffer::new(3);
         for i in 0..5u32 {
-            buf.push(0x1000 + i * 4, 0x6000_0000);
+            buf.push(0x1000 + i * 4, 0x6000_0000, 0);
         }
         let pcs: Vec<u32> = buf.iter().map(|e| e.pc).collect();
         assert_eq!(pcs, vec![0x1008, 0x100C, 0x1010]);
@@ -349,13 +384,13 @@ mod tests {
     #[test]
     fn trace_push_records_real_disasm() {
         let mut buf = TraceBuffer::new(8);
-        buf.push(0x2000, 0x6000_0000);
+        buf.push(0x2000, 0x6000_0000, 2);
         let ev = buf.iter().next().expect("one event");
         assert_eq!(ev.pc, 0x2000);
         assert_eq!(ev.word, 0x6000_0000);
         assert!(ev.disasm.contains("Nop"), "got: {}", ev.disasm);
         // Unknown encoding is still decoded explicitly, never blank.
-        buf.push(0x2004, 0xFFFF_FFFF);
+        buf.push(0x2004, 0xFFFF_FFFF, 2);
         let words: Vec<u32> = buf.iter().map(|e| e.word).collect();
         assert_eq!(words, vec![0x6000_0000, 0xFFFF_FFFF]);
     }
@@ -363,8 +398,8 @@ mod tests {
     #[test]
     fn trace_clear_empties() {
         let mut buf = TraceBuffer::new(4);
-        buf.push(0x1000, 0x6000_0000);
-        buf.push(0x1004, 0x6000_0000);
+        buf.push(0x1000, 0x6000_0000, 0);
+        buf.push(0x1004, 0x6000_0000, 0);
         assert!(!buf.is_empty());
         buf.clear();
         assert!(buf.is_empty());
@@ -375,8 +410,25 @@ mod tests {
     #[test]
     fn trace_zero_capacity_push_is_noop() {
         let mut buf = TraceBuffer::new(0);
-        buf.push(0x1000, 0x6000_0000);
+        buf.push(0x1000, 0x6000_0000, 0);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn trace_render_and_file_roundtrip() {
+        let mut buf = TraceBuffer::new(8);
+        buf.push(0x2000, 0x6000_0000, 2);
+        buf.push(0x2004, 0x3860_0010, 0);
+        let text = buf.render();
+        assert!(text.contains("th2 00002000:"), "got: {}", text);
+        assert!(text.contains("th0 00002004:"), "got: {}", text);
+        assert!(text.contains("Nop"), "got: {}", text);
+        let path = std::env::temp_dir().join("x360_trace_harness_test.log");
+        let n = write_trace_file(&path, &buf).expect("write");
+        assert_eq!(n, 2);
+        let back = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(back, text);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -481,7 +533,7 @@ mod tests {
     fn debugger_snapshot_reflects_instruments() {
         let mut dbg = Debugger::new();
         assert!(dbg.trace_snapshot().is_empty());
-        dbg.trace.push(0x1000, 0x6000_0000);
+        dbg.trace.push(0x1000, 0x6000_0000, 0);
         dbg.mem_watch.watch(0x2000, 0x40);
         dbg.syscall_log.record(7, 0x1000);
         let snap = dbg.trace_snapshot();

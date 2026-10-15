@@ -408,17 +408,15 @@ mod integration {
                 println!("--- last trace (oldest first, last 400) ---");
                 let events: Vec<_> = trace.iter().collect();
                 for ev in events.iter().skip(events.len().saturating_sub(400)) {
-                    println!("{:08x}: {}", ev.pc, ev.disasm);
+                    println!("th{} {:08x}: {}", ev.thread, ev.pc, ev.disasm);
                 }
                 // Full trace to TEMP for dataflow forensics.
                 {
-                    let mut s = String::new();
-                    for ev in events.iter() {
-                        s.push_str(&format!("{:08x}: {}\n", ev.pc, ev.disasm));
-                    }
                     let p = std::env::temp_dir().join("braid_trace.log");
-                    let _ = std::fs::write(&p, s);
-                    println!("full trace ({} events) -> {}", events.len(), p.display());
+                    match x360_debugger::write_trace_file(&p, &trace) {
+                        Ok(n) => println!("full trace ({} events) -> {}", n, p.display()),
+                        Err(e) => println!("trace write failed: {}", e),
+                    }
                 }
                 let mut done: Vec<_> = table.implemented_calls.iter().collect();
                 done.sort();

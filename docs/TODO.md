@@ -156,8 +156,13 @@ Terminal states only: impossible, done, or something rendering.
       KeWait succeeds via worker signaling). +120/+16 and the
       post-kick callbacks stay virgin: device creation needs the
       undelivered graphics-interrupt callback or adapter state the
-      NOP pump doesn't produce. NEXT: GPU interrupt-callback delivery
-      (safe guest reentry), then draw backend
+      NOP pump doesn't produce. NOTE (verified by full method
+      disasm): the lazy block formats on BOTH sides of its
+      null-checks and stores +16 on NEITHER — so +16's writer is a
+      function that never executes here at all (not a skipped store
+      in executed code); the error path reading it is latently buggy
+      code that only runs without a GPU. NEXT: GPU interrupt-callback
+      delivery (safe guest reentry), then draw backend
 - [ ] Dash frontier (HostDirFs boot): 63 imports to a table walk at
       `0x921B86BC` (`lwz r8,896(r11)`), fully decoded this session:
       prologue sets r27=r31+896 (table = object itself +896),
@@ -187,6 +192,11 @@ Terminal states only: impossible, done, or something rendering.
       r3 = context, LR 0), round-robin stepping honors suspend
       counts, worker return (PC/LR 0) marks clean exits; retail Braid
       workers now run and contend (see Active)
+- [x] Trace harness as a real debugger feature (file sink for
+      `TraceBuffer` + per-thread pcs + fault context): unblocks
+      trace-diffing both table-walk frontiers without TEMP cycles
+      (`TraceEvent.thread`, `render`/`write_trace_file`, boot wires
+      slot ids, gate failure dump uses the sink)
 - [ ] GPU interrupt-callback delivery (safe guest reentry) once the
       scheduler exists; then draw backend
 - [ ] VMX128 FP arithmetic (`vaddfp`, `vmulfp`, float permutes)
