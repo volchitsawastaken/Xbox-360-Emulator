@@ -66,6 +66,9 @@ pub struct Kernel {
     pub nt_mutants: HashMap<u32, NtMutant>,
     pub nt_timers: HashMap<u32, NtTimer>,
     pub nt_threads: HashMap<u32, NtThread>,
+    /// Game-allocated events by guest struct address (reference
+    /// `KeInitializeEvent`; no handles involved).
+    pub ke_events: HashMap<u32, KeEvent>,
     /// NT-thread spawn queue for the boot runner (handles, in creation
     /// order). Dispatch cannot reach Xenon CPU state, so the runner
     /// drains this and installs each thread's registers.
@@ -183,6 +186,18 @@ pub struct NtTimer {
     pub guest_ptr: u32,
 }
 
+/// Game-allocated kernel event, initialized in place via
+/// `KeInitializeEvent` (reference `xboxkrnl_threading.cc` +
+/// `xevent.h` `X_KEVENT`: 0x10-byte `X_DISPATCH_HEADER`, type byte 0
+/// = Notification/manual, 1 = Synchronization/auto, signal state at
+/// +4). No handle; manipulated purely by guest pointer via
+/// `KeSetEvent`/`KePulseEvent`/`KeResetEvent`/`KeWaitForSingleObject`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeEvent {
+    pub manual: bool,
+    pub signaled: bool,
+}
+
 /// XAM notification listener (reference `xnotifylistener.h/.cc`).
 #[derive(Debug, Clone)]
 pub struct NotifyListener {
@@ -284,6 +299,7 @@ impl Kernel {
             nt_mutants: HashMap::new(),
             nt_timers: HashMap::new(),
             nt_threads: HashMap::new(),
+            ke_events: HashMap::new(),
             pending_spawns: Vec::new(),
             files: fs::FileTable::default(),
             guest_fs: None,
@@ -756,6 +772,144 @@ impl Kernel {
         let prev = i32::from(e.signaled);
         e.signaled = false;
         Ok(prev)
+    }
+
+    /// Initialize a game-allocated event in place (reference
+    /// `KeInitializeEvent_entry`: zero 0x10 bytes, `type =
+    /// event_type`, `signal_state = initial`). `event_type` 0 =
+    /// Notification/manual, 1 = Synchronization/auto. Other types are
+    /// explicit errors (the reference would fail to resolve the
+    /// native object).
+    pub fn ke_init_event(
+        &mut self,
+        mem: &mut x360_memory::Memory,
+        ptr: u32,
+        event_type: u32,
+        initial: u32,
+    ) -> Result<()> {
+        if ptr == 0 {
+            return Err(EmuError::Other("KeInitializeEvent null pointer".into()));
+        }
+        if event_type > 1 {
+            return Err(EmuError::Other(format!(
+                "KeInitializeEvent bad type {}",
+                event_type
+            )));
+        }
+        Self::write_dispatch_header(mem, ptr, event_type as u8, u32::from(initial != 0))?;
+        self.ke_events.insert(
+            ptr,
+            KeEvent {
+                manual: event_type == 0,
+                signaled: initial != 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Set a game-allocated event; returns previous state (reference
+    /// `xeKeSetEvent` / `XEvent::Set`). Mirrors `signal_state` to the
+    /// guest header.
+    pub fn ke_set_event(&mut self, mem: &mut x360_memory::Memory, ptr: u32) -> Result<i32> {
+        let e = self
+            .ke_events
+            .get_mut(&ptr)
+            .ok_or_else(|| EmuError::Other(format!("bad Ke event {:08x}", ptr)))?;
+        let prev = i32::from(e.signaled);
+        e.signaled = true;
+        let _ = mem.write_u32(ptr + 4, 1);
+        Ok(prev)
+    }
+
+    /// Pulse a game-allocated event: report previous state, leave
+    /// nonsignaled (reference `XEvent::Pulse`; waiters would release —
+    /// with rewind-retry waits there is no parked waiter to release,
+    /// so set-then-clear).
+    pub fn ke_pulse_event(&mut self, mem: &mut x360_memory::Memory, ptr: u32) -> Result<i32> {
+        let e = self
+            .ke_events
+            .get_mut(&ptr)
+            .ok_or_else(|| EmuError::Other(format!("bad Ke event {:08x}", ptr)))?;
+        let prev = i32::from(e.signaled);
+        e.signaled = false;
+        let _ = mem.write_u32(ptr + 4, 0);
+        Ok(prev)
+    }
+
+    /// Reset a game-allocated event; returns previous state (reference
+    /// `KeResetEvent_entry` / `XEvent::Reset`).
+    pub fn ke_reset_event(&mut self, mem: &mut x360_memory::Memory, ptr: u32) -> Result<i32> {
+        let e = self
+            .ke_events
+            .get_mut(&ptr)
+            .ok_or_else(|| EmuError::Other(format!("bad Ke event {:08x}", ptr)))?;
+        let prev = i32::from(e.signaled);
+        e.signaled = false;
+        let _ = mem.write_u32(ptr + 4, 0);
+        Ok(prev)
+    }
+
+    /// Adopt an in-place-initialized game event that bypassed
+    /// `KeInitializeEvent` (reference headers are self-describing:
+    /// type byte 0/1, signal 0/1, wait list self-pointed as retail
+    /// lays out with `XeInitializeListHead`). Zeroed wait lists do
+    /// NOT adopt (uninitialized memory must stay `INVALID_HANDLE`,
+    /// never a phantom event). Returns true when adopted.
+    pub fn adopt_ke_event(&mut self, mem: &x360_memory::Memory, ptr: u32) -> bool {
+        if ptr == 0 || self.ke_events.contains_key(&ptr) {
+            return self.ke_events.contains_key(&ptr);
+        }
+        let ty = match mem.read_u8(ptr) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        if ty > 1 {
+            return false;
+        }
+        let sig = match mem.read_u32(ptr + 4) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        if sig > 1 {
+            return false;
+        }
+        let flink = mem.read_u32(ptr + 8).unwrap_or(0xFFFF_FFFF);
+        let blink = mem.read_u32(ptr + 12).unwrap_or(0xFFFF_FFFF);
+        if !(flink == ptr + 8 && blink == ptr + 8) {
+            return false;
+        }
+        self.ke_events.insert(
+            ptr,
+            KeEvent {
+                manual: ty == 0,
+                signaled: sig != 0,
+            },
+        );
+        true
+    }
+    /// Poll a game-allocated event: acquire when signaled (auto-reset
+    /// consumes), else report not-ready. Returns true on acquire.
+    /// Mirrors `signal_state` to the guest header on consume.
+    pub fn ke_wait_single(&mut self, mem: &mut x360_memory::Memory, ptr: u32) -> Result<bool> {
+        let auto_consume = {
+            let e = self
+                .ke_events
+                .get_mut(&ptr)
+                .ok_or_else(|| EmuError::Other(format!("bad Ke event {:08x}", ptr)))?;
+            if !e.signaled {
+                return Ok(false);
+            }
+            if !e.manual {
+                e.signaled = false;
+                true
+            } else {
+                false
+            }
+        };
+        if auto_consume {
+            let _ = mem.write_u32(ptr + 4, 0);
+        }
+        Ok(true)
     }
 
     /// Create an NT semaphore. Validates `0 <= count <= limit > 0`

@@ -273,10 +273,80 @@ pub fn dispatch_import(
         // the handle form (NULL timeout blocks cooperatively).
         (Lib::Xboxkrnl, 0xB0) => ke_wait_single(kernel, mem, arg(t, 0), thread_id, arg(t, 4), t),
         // KeResetEvent(ptr) (reference `KeResetEvent_entry`): clear
-        // and return the previous signaled state (0/1).
+        // and return the previous signaled state (0/1). Game-allocated
+        // (`KeInitializeEvent`) objects resolve first, then
+        // handle-backed ones.
         (Lib::Xboxkrnl, 0x8F) => {
+            if kernel.ke_events.contains_key(&arg(t, 0)) || kernel.adopt_ke_event(mem, arg(t, 0)) {
+                match kernel.ke_reset_event(mem, arg(t, 0)) {
+                    Ok(prev) => t.gpr[3] = (prev as u32) as u64,
+                    Err(_) => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+                }
+                return Ok(());
+            }
             match kernel.nt_handle_of_guest(arg(t, 0)) {
                 Some((handle, _)) => match kernel.nt_clear_event(handle) {
+                    Ok(prev) => {
+                        mirror_event(kernel, mem, handle);
+                        t.gpr[3] = (prev as u32) as u64;
+                    }
+                    Err(_) => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+                },
+                None => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+            }
+            Ok(())
+        }
+        // KeInitializeEvent(ptr, type, initial) (reference
+        // `KeInitializeEvent_entry`): zero the 0x10-byte header, set
+        // type/signal_state, track by guest address. Type 0 =
+        // Notification/manual, 1 = Synchronization/auto.
+        (Lib::Xboxkrnl, 0x70) => {
+            match kernel.ke_init_event(mem, arg(t, 0), arg(t, 1), arg(t, 2)) {
+                Ok(()) => t.gpr[3] = 0_u64,
+                Err(e) => {
+                    log::warn!("kernel: KeInitializeEvent failed: {}", e);
+                    t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
+                }
+            }
+            Ok(())
+        }
+        // KeSetEvent(ptr, increment, wait) (reference
+        // `KeSetEvent_entry` / `xeKeSetEvent`): signal, return previous
+        // state. Game-allocated objects resolve first, then
+        // handle-backed ones (for symmetry with reset/wait).
+        (Lib::Xboxkrnl, 0x9D) => {
+            if kernel.ke_events.contains_key(&arg(t, 0)) || kernel.adopt_ke_event(mem, arg(t, 0)) {
+                match kernel.ke_set_event(mem, arg(t, 0)) {
+                    Ok(prev) => t.gpr[3] = (prev as u32) as u64,
+                    Err(_) => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+                }
+                return Ok(());
+            }
+            match kernel.nt_handle_of_guest(arg(t, 0)) {
+                Some((handle, _)) => match kernel.nt_set_event(handle) {
+                    Ok(prev) => {
+                        mirror_event(kernel, mem, handle);
+                        t.gpr[3] = (prev as u32) as u64;
+                    }
+                    Err(_) => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+                },
+                None => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+            }
+            Ok(())
+        }
+        // KePulseEvent(ptr, increment, wait) (reference
+        // `KePulseEvent_entry`): report previous state, leave
+        // nonsignaled. Same resolution order as set/reset.
+        (Lib::Xboxkrnl, 0x7F) => {
+            if kernel.ke_events.contains_key(&arg(t, 0)) || kernel.adopt_ke_event(mem, arg(t, 0)) {
+                match kernel.ke_pulse_event(mem, arg(t, 0)) {
+                    Ok(prev) => t.gpr[3] = (prev as u32) as u64,
+                    Err(_) => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+                }
+                return Ok(());
+            }
+            match kernel.nt_handle_of_guest(arg(t, 0)) {
+                Some((handle, _)) => match kernel.nt_pulse_event(handle) {
                     Ok(prev) => {
                         mirror_event(kernel, mem, handle);
                         t.gpr[3] = (prev as u32) as u64;
@@ -1819,6 +1889,9 @@ fn wait_not_ready(mem: &Memory, timeout_ptr: u32, t: &mut ThreadState) -> Result
 }
 
 /// `KeWaitForSingleObject(ptr, reason, mode, alertable, timeout_ptr)`.
+/// Game-allocated events (`KeInitializeEvent` table) resolve first;
+/// kernel-handle-backed objects resolve via `nt_handle_of_guest`.
+/// Unsignaled + NULL (infinite) timeout blocks cooperatively.
 fn ke_wait_single(
     kernel: &mut Kernel,
     mem: &mut Memory,
@@ -1827,6 +1900,25 @@ fn ke_wait_single(
     timeout_ptr: u32,
     t: &mut ThreadState,
 ) -> Result<()> {
+    if kernel.ke_events.contains_key(&ptr) || kernel.adopt_ke_event(mem, ptr) {
+        match kernel.ke_wait_single(mem, ptr) {
+            Ok(true) => {
+                t.gpr[3] = (STATUS_SUCCESS) as u64;
+            }
+            Ok(false) => {
+                if timeout_ptr == 0 {
+                    return Err(EmuError::Blocked(format!(
+                        "ke wait on {:08x} with infinite timeout",
+                        ptr
+                    )));
+                }
+                let _ = mem.read_u64(timeout_ptr).unwrap_or(0);
+                t.gpr[3] = (STATUS_TIMEOUT) as u64;
+            }
+            Err(_) => t.gpr[3] = (STATUS_INVALID_HANDLE) as u64,
+        }
+        return Ok(());
+    }
     match kernel.nt_handle_of_guest(ptr) {
         Some((handle, _)) => wait_on_handle(kernel, mem, handle, thread_id, timeout_ptr, t),
         None => {
@@ -5214,6 +5306,203 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn ke_game_events_roundtrip() {
+        use x360_common::EmuError;
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x70),
+            Some("KeInitializeEvent")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x9D),
+            Some("KeSetEvent")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x7F),
+            Some("KePulseEvent")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let ev = 0x8400_5000;
+        // Init auto-reset (type 1), initially nonsignaled.
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 1;
+        t.gpr[5] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x70),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u8(ev).unwrap(), 1);
+        assert_eq!(m.read_u32(ev + 4).unwrap(), 0);
+        // Wait unsignaled + NULL timeout blocks (never INVALID_HANDLE).
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        let e = dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .expect_err("must block");
+        assert!(matches!(e, EmuError::Blocked(_)));
+        // Set returns 0 (was nonsignaled), mirrors signaled.
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x9D),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u32(ev + 4).unwrap(), 1);
+        // Wait now succeeds and auto-consumes.
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+        assert_eq!(m.read_u32(ev + 4).unwrap(), 0);
+        // Manual event stays signaled across waits.
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 1;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x70),
+        )
+        .unwrap();
+        t.gpr[3] = ev as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x9D),
+        )
+        .unwrap();
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+        assert_eq!(m.read_u32(ev + 4).unwrap(), 1);
+        // Pulse reports previous (1) and clears.
+        t.gpr[3] = ev as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x7F),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 1);
+        assert_eq!(m.read_u32(ev + 4).unwrap(), 0);
+        // Reset reports previous (0) when already clear.
+        t.gpr[3] = ev as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x8F),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn ke_adopt_in_place_header() {
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // In-place header bypassing KeInitializeEvent: type 0,
+        // signal 0, self-pointed wait list (as retail lays out).
+        let ev = 0x8400_5100;
+        m.write_u8(ev, 0).unwrap();
+        m.write_u32(ev + 4, 0).unwrap();
+        m.write_u32(ev + 8, ev + 8).unwrap();
+        m.write_u32(ev + 12, ev + 8).unwrap();
+        assert!(!k.ke_events.contains_key(&ev));
+        // First wait adopts instead of INVALID_HANDLE, then blocks
+        // on the NULL timeout (never a bogus handle error).
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        let e = dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .expect_err("must block, not invalid-handle");
+        assert!(matches!(e, EmuError::Blocked(_)));
+        assert!(k.ke_events.contains_key(&ev));
+        // Garbage header never adopts: still INVALID_HANDLE.
+        t.gpr[3] = 0x8400_5200_u64;
+        m.write_u32(0x8400_5200, 0xDEAD_BEEF).unwrap();
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
     }
 
     #[test]

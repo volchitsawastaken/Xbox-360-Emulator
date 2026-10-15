@@ -336,14 +336,23 @@ out, and the license note. Workspace license: BSD-3-Clause.
   u32be at +0, 8 bytes),
   `src/xenia/kernel/xam/am_ui.cc` (`XamShowMessageBoxUi`: raw
   UTF-16 title/text/buttons, empty list falls back to "OK",
-  headless auto-picks the focused button + SUCCESS).
+  headless auto-picks the focused button + SUCCESS),
+  `src/xenia/kernel/xevent.h` (`X_KEVENT` = 0x10-byte
+  `X_DISPATCH_HEADER`: type byte 0 = Notification/manual, 1 =
+  Synchronization/auto, signal at +4),
+  `src/xenia/kernel/xboxkrnl/xboxkrnl_threading.cc`
+  (`KeInitializeEvent_entry`: zero + set type/signal;
+  `xeKeSetEvent`/`KeSetEvent_entry`, `KePulseEvent_entry`,
+  `KeResetEvent_entry`: return previous state).
 - Taken (facts only): startup arg convention, wait signatures +
-  NULL semantics, reset return, result layout, headless rule.
+  NULL semantics, reset return, result layout, headless rule, event
+  header layout + init/set/pulse/reset returns.
 - Lives here: `crates/kernel/src/boot.rs` (spawn drain + round
-  robin), `crates/kernel/src/lib.rs` (slot assignment, `Blocked`),
-  `crates/kernel/src/dispatch.rs` (`KeWaitForSingleObject`,
-  `KeResetEvent`, `XamShowMessageBoxUI(Ex)` + unit tests),
-  `crates/common/src/lib.rs` (`EmuError::Blocked`).
+  robin), `crates/kernel/src/lib.rs` (slot assignment, `Blocked`,
+  `ke_events` + adoption), `crates/kernel/src/dispatch.rs`
+  (`KeWaitForSingleObject`, `KeResetEvent`, `KeSetEvent`,
+  `KePulseEvent`, `KeInitializeEvent`, `XamShowMessageBoxUI(Ex)` +
+  unit tests), `crates/common/src/lib.rs` (`EmuError::Blocked`).
 - NOT taken: time-based finite waits (immediate TIMEOUT),
   overlapped-async UI completion (sync completion), APC delivery.
   (Interrupt-callback delivery is now implemented — see §10.)

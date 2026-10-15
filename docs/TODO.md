@@ -219,6 +219,17 @@ Terminal states only: impossible, done, or something rendering.
       its stream contains zero INTERRUPT packets, so this is not the
       missing queueing trigger (documented, not reverted: genuine OS
       feature)
+- [x] Game-allocated sync events (found via Braid 4850x
+      `KeWait`/`KeReset` storm on game-heap `X_KEVENT`s `0x010462FC` /
+      `0x0104634C`): `KeInitializeEvent` (0x70), `KeSetEvent` (0x9D),
+      `KePulseEvent` (0x7F) implemented per reference
+      (`KeInitializeEvent_entry`/`xeKeSetEvent`); `KeWait`/`KeReset`/
+      `KeSet`/`KePulse` resolve in-place headers first (type 0/1,
+      signal 0/1, self-pointed wait list — zeroed memory never
+      adopts, stays `INVALID_HANDLE`), then handle-backed objects;
+      waits keep NULL-block semantics; unit-tested (roundtrip +
+      adoption). Retail still faults at the same `bctr` (polls;
+      signalers missing) — documented, not reverted
 - [ ] Draw backend (next GPU step) OR VMX128 128-bit FP
       (`vaddfp128`/`vsubfp128`/`vmulfp128`/madd/msum) — pick by retail
       demand
