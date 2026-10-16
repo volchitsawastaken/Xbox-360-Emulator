@@ -307,6 +307,39 @@ fn update_cr6(t: &mut ThreadState, v: &[u8; 16]) {
     t.cr.set_field(6, ((all_eq as u8) << 3) | ((none_eq as u8) << 1));
 }
 
+/// Saturating `f64` to `i32` with truncation (reference
+/// `VectorConvertF2I` + saturation fixups): NaN maps to `MIN`
+/// (x86 `cvtt` indefinite), strictly out-of-range values clamp;
+/// exactly-representable endpoints convert without flagging.
+/// `f64` math keeps 2^31-scale products exact.
+fn sat_i32(x: f64) -> (i32, bool) {
+    if x.is_nan() {
+        return (i32::MIN, true);
+    }
+    if x > i32::MAX as f64 {
+        return (i32::MAX, true);
+    }
+    if x < i32::MIN as f64 {
+        return (i32::MIN, true);
+    }
+    (x.trunc() as i32, false)
+}
+
+/// Saturating `f64` to `u32` with truncation: NaN and negatives
+/// map to 0, values above `MAX` clamp.
+fn sat_u32(x: f64) -> (u32, bool) {
+    if x.is_nan() {
+        return (0, true);
+    }
+    if x > u32::MAX as f64 {
+        return (u32::MAX, true);
+    }
+    if x < 0.0 {
+        return (0, true);
+    }
+    (x.trunc() as u32, false)
+}
+
 pub fn execute(
     d: Decoded,
     word: u32,
@@ -2760,6 +2793,78 @@ pub fn execute(
             t.pc = next;
             Ok(None)
         }
+        Decoded::Vcfsx { vd, vb, uimm } => {
+            // 4 x float(signed) / 2^uimm (reference
+            // `InstrEmit_vcfsx_`): integer-to-float rounds once,
+            // the power-of-two scale is exact.
+            let b = t.vr[vb as usize];
+            let scale = 2f32.powi(-(uimm as i32));
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let w = i32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&((w as f32) * scale).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vcfux { vd, vb, uimm } => {
+            // 4 x float(unsigned) / 2^uimm (reference
+            // `InstrEmit_vcfux_`).
+            let b = t.vr[vb as usize];
+            let scale = 2f32.powi(-(uimm as i32));
+            let mut v = [0u8; 16];
+            for i in 0..4 {
+                let w = u32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                v[4 * i..4 * i + 4].copy_from_slice(&((w as f32) * scale).to_be_bytes());
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vctsxs { vd, vb, uimm } => {
+            // 4 x saturating int(signed * 2^uimm), truncating
+            // (reference `InstrEmit_vctsxs_` + `StoreSAT`): NaN and
+            // out-of-range lanes saturate and set the sticky SAT
+            // slot (`vscr` bit 0; no mfvscr/mtvscr exists yet, so the
+            // bit is currently guest-unobservable).
+            let b = t.vr[vb as usize];
+            let scale = 2f64.powi(uimm as i32);
+            let mut v = [0u8; 16];
+            let mut sat = false;
+            for i in 0..4 {
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                let (w, s) = sat_i32(y as f64 * scale);
+                sat |= s;
+                v[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            if sat {
+                t.vscr |= 1;
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
+        Decoded::Vctuxs { vd, vb, uimm } => {
+            // 4 x saturating int(unsigned * 2^uimm) (reference
+            // `InstrEmit_vctuxs_` + `StoreSAT`).
+            let b = t.vr[vb as usize];
+            let scale = 2f64.powi(uimm as i32);
+            let mut v = [0u8; 16];
+            let mut sat = false;
+            for i in 0..4 {
+                let y = f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+                let (w, s) = sat_u32(y as f64 * scale);
+                sat |= s;
+                v[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            if sat {
+                t.vscr |= 1;
+            }
+            t.vr[vd as usize] = v;
+            t.pc = next;
+            Ok(None)
+        }
         Decoded::Vcmpeqfp { vd, va, vb, rc } => {
             // Per-lane equality mask, NaN lanes 0 (reference
             // `InstrEmit_vcmpxxfp_` eq + `UpdateCR6` on Rc).
@@ -3731,6 +3836,105 @@ mod tests {
         run_word(base | 0x10A, &mut t, &mut m);
         assert_eq!(get(&t, 3)[0], f32::INFINITY);
         assert_eq!(get(&t, 3)[1], 0.0);
+    }
+
+    #[test]
+    fn vcvx_converts_roundtrip_and_saturate() {
+        let (mut t, mut m) = setup();
+        // vcfsx v3,v2,uimm / vcfux / vctsxs / vctuxs: VD=3, VA=uimm,
+        // VB=2; XOs 0x34A/0x30A/0x3CA/0x38A.
+        let word = |uimm: u32, xo: u32| (4u32 << 26) | (3 << 21) | (uimm << 16) | (2 << 11) | xo;
+        for (xo, vd, vb, uimm) in [
+            (0x34Au32, 3u32, 2u32, 0u32),
+            (0x30A, 3, 2, 1),
+            (0x3CA, 3, 2, 0),
+            (0x38A, 3, 2, 2),
+        ] {
+            let d = decode(word(uimm, xo)).unwrap();
+            let (got_vd, got_vb, got_uimm) = match d {
+                Decoded::Vcfsx { vd, vb, uimm } => (vd, vb, uimm),
+                Decoded::Vcfux { vd, vb, uimm } => (vd, vb, uimm),
+                Decoded::Vctsxs { vd, vb, uimm } => (vd, vb, uimm),
+                Decoded::Vctuxs { vd, vb, uimm } => (vd, vb, uimm),
+                _ => panic!("wrong decode for {:#x}", xo),
+            };
+            assert_eq!((got_vd, got_vb, got_uimm), (vd, vb, uimm));
+        }
+        fn put_words(t: &mut ThreadState, i: usize, xs: [u32; 4]) {
+            let mut v = [0u8; 16];
+            for (j, x) in xs.iter().enumerate() {
+                v[4 * j..4 * j + 4].copy_from_slice(&x.to_be_bytes());
+            }
+            t.vr[i] = v;
+        }
+        fn get_words(t: &ThreadState, i: usize) -> [u32; 4] {
+            let mut out = [0u32; 4];
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = u32::from_be_bytes([
+                    t.vr[i][4 * j],
+                    t.vr[i][4 * j + 1],
+                    t.vr[i][4 * j + 2],
+                    t.vr[i][4 * j + 3],
+                ]);
+            }
+            out
+        }
+        fn get_floats(t: &ThreadState, i: usize) -> [f32; 4] {
+            let mut out = [0.0; 4];
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = f32::from_be_bytes([
+                    t.vr[i][4 * j],
+                    t.vr[i][4 * j + 1],
+                    t.vr[i][4 * j + 2],
+                    t.vr[i][4 * j + 3],
+                ]);
+            }
+            out
+        }
+        // vcfsx: signed words to float (uimm 0).
+        put_words(&mut t, 2, [1, 0xFFFF_FFFF, 0x7FFF_FFFF, 0x8000_0000]);
+        run_word(word(0, 0x34A), &mut t, &mut m);
+        assert_eq!(get_floats(&t, 3), [1.0, -1.0, 2147483647.0, -2147483648.0]);
+        // vcfsx uimm 1 halves.
+        run_word(word(1, 0x34A), &mut t, &mut m);
+        assert_eq!(get_floats(&t, 3)[0], 0.5);
+        // vcfux: unsigned words (uimm 0); 0xFFFFFFFF rounds to 2^32.
+        put_words(&mut t, 2, [1, 0xFFFF_FFFF, 0x8000_0000, 0]);
+        run_word(word(0, 0x30A), &mut t, &mut m);
+        assert_eq!(get_floats(&t, 3), [1.0, 4294967296.0, 2147483648.0, 0.0]);
+        // vctsxs: trunc + saturate; NaN -> MIN, all flag SAT.
+        fn put_floats(t: &mut ThreadState, i: usize, xs: [f32; 4]) {
+            let mut v = [0u8; 16];
+            for (j, x) in xs.iter().enumerate() {
+                v[4 * j..4 * j + 4].copy_from_slice(&x.to_be_bytes());
+            }
+            t.vr[i] = v;
+        }
+        t.vscr = 0;
+        put_floats(&mut t, 2, [1.5, -1.5, 1e10, -1e10]);
+        run_word(word(0, 0x3CA), &mut t, &mut m);
+        assert_eq!(get_words(&t, 3), [1, 0xFFFF_FFFF, 0x7FFF_FFFF, 0x8000_0000]);
+        assert_eq!(t.vscr & 1, 1);
+        t.vscr = 0;
+        put_floats(&mut t, 2, [f32::NAN, 2147483647.0, -0.0, 2.0]);
+        run_word(word(0, 0x3CA), &mut t, &mut m);
+        assert_eq!(get_words(&t, 3)[0], 0x8000_0000);
+        assert_eq!(get_words(&t, 3)[1], 0x7FFF_FFFF);
+        assert_eq!(get_words(&t, 3)[2], 0);
+        // uimm 31 scales up: 2.0 * 2^31 saturates.
+        run_word(word(31, 0x3CA), &mut t, &mut m);
+        assert_eq!(get_words(&t, 3)[3], 0x7FFF_FFFF);
+        // vctuxs: negatives/NaN -> 0, huge -> MAX.
+        t.vscr = 0;
+        put_floats(&mut t, 2, [1.9, -1.0, 1e10, f32::NAN]);
+        run_word(word(0, 0x38A), &mut t, &mut m);
+        assert_eq!(get_words(&t, 3), [1, 0, 0xFFFF_FFFF, 0]);
+        assert_eq!(t.vscr & 1, 1);
+        // In-range converts leave SAT clear.
+        t.vscr = 0;
+        put_floats(&mut t, 2, [3.0, 4.0, 5.0, 6.0]);
+        run_word(word(0, 0x3CA), &mut t, &mut m);
+        assert_eq!(t.vscr & 1, 0);
     }
 
     #[test]

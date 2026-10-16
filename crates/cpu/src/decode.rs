@@ -1229,6 +1229,30 @@ pub enum Decoded {
         vd: u32,
         vb: u32,
     },
+    // Vector fixed/float converts (primary 4, kVX; reference
+    // `InstrEmit_vcfsx_`/`vcfux_`/`vctsxs_`/`vctuxs_`): UIMM is the
+    // VA field. XOs: vcfux 0x30A, vcfsx 0x34A, vctuxs 0x38A,
+    // vctsxs 0x3CA.
+    Vcfux {
+        vd: u32,
+        vb: u32,
+        uimm: u32,
+    },
+    Vcfsx {
+        vd: u32,
+        vb: u32,
+        uimm: u32,
+    },
+    Vctuxs {
+        vd: u32,
+        vb: u32,
+        uimm: u32,
+    },
+    Vctsxs {
+        vd: u32,
+        vb: u32,
+        uimm: u32,
+    },
     // Vector FP compares (primary 4, kVXR; reference
     // `InstrEmit_vcmpxxfp_`/`vcmpbfp_`): per-lane 0xFFFFFFFF/0 masks,
     // NaN lanes always 0; Rc updates CR6 as
@@ -1504,6 +1528,26 @@ pub fn decode(word: u32) -> Result<Decoded> {
                 }),
                 0x10A => Ok(Decoded::Vrefp { vd: rt, vb: rb }),
                 0x14A => Ok(Decoded::Vrsqrtefp { vd: rt, vb: rb }),
+                0x30A => Ok(Decoded::Vcfux {
+                    vd: rt,
+                    vb: rb,
+                    uimm: ra,
+                }),
+                0x34A => Ok(Decoded::Vcfsx {
+                    vd: rt,
+                    vb: rb,
+                    uimm: ra,
+                }),
+                0x38A => Ok(Decoded::Vctuxs {
+                    vd: rt,
+                    vb: rb,
+                    uimm: ra,
+                }),
+                0x3CA => Ok(Decoded::Vctsxs {
+                    vd: rt,
+                    vb: rb,
+                    uimm: ra,
+                }),
                 0x40A => Ok(Decoded::Vmaxfp {
                     vd: rt,
                     va: ra,

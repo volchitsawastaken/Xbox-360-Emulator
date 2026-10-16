@@ -6,7 +6,7 @@ Terminal states only: impossible, done, or something rendering.
 ## Entire Xbox 360 emulation total: ~5 out of 100%
 
 100% = running ANY game released for the Xbox 360. Honest breakdown:
-- CPU interpreter (integer+FPU, no JIT) 40% · VMX128 integer + FP add/sub/max/min/mul/madd (compare/convert pending) · MMU/paging 0%
+- CPU interpreter (integer+FPU, no JIT) 40% · VMX128 integer + FP add/sub/max/min/mul/madd/compare/estimates/converts · MMU/paging 0%
 - Kernel (of ~300+ used imports across xboxkrnl/xam) ~15%
 - GPU (shaders/eDRAM/draw path) 3% · audio 5% · input 0% · storage/saves 40%
 - Scheduler 15% · networking 10% · frontend 35% · per-game compat work 2%
@@ -270,8 +270,15 @@ Terminal states only: impossible, done, or something rendering.
       + `UpdateCR6`): `vcmpeqfp`/`vcmpgefp`/`vcmpgtfp`/`vcmpbfp`
       (kVXR low-10 XOs + Rc bit 10), per-lane masks, NaN lanes 0,
       CR6 `all_equal|0|none_equal|0`; unit-tested incl. Rc paths.
-      FP converts remain (no retail demand: zero VMX `Unsupported`
-      in any run).
+- [x] VMX128 FP converts (reference `InstrEmit_vcfsx_`/
+      `vcfux_`/`vctsxs_`/`vctuxs_`, XOs 0x34A/0x30A/0x3CA/0x38A):
+      int<->float with UIMM scaling (`as f32` single rounding,
+      exact power-of-two scale; `f64` products for the 2^31 range),
+      truncating saturate (NaN->int-MIN/0, endpoints exact without
+      flagging) with sticky SAT in `vscr` bit 0 (currently
+      guest-unobservable: no mfvscr/mtvscr). Unit-tested incl.
+      decode shapes, roundtrip, saturate + SAT set/clear.
+      VMX FP now complete (no remaining tracked `Unsupported`).
 - [x] Draw-backend slicing (reference
       `pm4_command_processor_implement.h` + `xenos.h` `ShaderType`):
       `IM_LOAD_IMMEDIATE` (0x2B) stores sequencer ucode per type
