@@ -39,18 +39,20 @@
 //! temp-relative (aL) dests/sources and const-relative (a0/aL)
 //! addressing; texture-fetch slots write zeros per the reference
 //! fallback (`StoreFetchResult` with a zero result). Vertex fetches
-//! (memory + fetch constants) stay explicit `Unsupported`, never a
-//! wrong result. CF control flow (loops/calls/jumps/returns) is
+//! execute through [`exec_vfetch`] when the driver is given guest
+//! memory + fetch constants ([`run_cf_mem`]); the memory-less
+//! [`run_cf`] keeps the explicit `Unsupported`. CF control flow (loops/calls/jumps/returns) is
 //! driven per the reference (`Execute` dispatch); unmatched returns
 //! and overflowed nests are faithful no-ops/skips. `eval_alu` skips
 //! predicated-out instructions itself (reference per-instruction
 //! check); CF-level predication lives in the clause driver.
 
 use x360_common::{EmuError, Result};
+use x360_memory::Memory;
 
 use super::ucode::{
     is_end_opcode, is_exec_opcode, parse_alu, parse_fetch, unpack_cf_pair, validate_ucode,
-    AluInstr, CfInstr,
+    AluInstr, CfInstr, FetchInstr,
 };
 
 /// Temp register count (reference `kMaxShaderTempRegisters`).
@@ -84,6 +86,12 @@ pub struct ShaderCore {
     pub exports: [[f32; 4]; 64],
     /// Per-export-slot written-component mask (4 bits each).
     pub export_written: [u32; 64],
+    /// Last full-fetch constant index (mini fetches reuse it,
+    /// reference `vfetch_full_last`).
+    pub vfetch_const: usize,
+    /// Last full-fetch base address in dwords
+    /// (`stride * index + const.address`).
+    pub vfetch_addr_dwords: u32,
 }
 
 impl Default for ShaderCore {
@@ -98,6 +106,8 @@ impl Default for ShaderCore {
             loop_iters: [0; 4],
             exports: [[0.0; 4]; 64],
             export_written: [0; 64],
+            vfetch_const: 0,
+            vfetch_addr_dwords: 0,
         }
     }
 }
@@ -940,6 +950,328 @@ pub struct CfRunStats {
     pub ended: bool,
 }
 
+/// Vertex-fetch constant (reference `xenos::xe_gpu_vertex_fetch_t`:
+/// dword base address, dword size window, endian swap mode 0-3).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VertexFetchConst {
+    /// Base address in dwords.
+    pub address_dwords: u32,
+    /// Size window in dwords (reads outside read as zeros).
+    pub size_dwords: u32,
+    /// Endian swap (0 none, 1 8in16, 2 8in32, 3 16in32).
+    pub endian: u32,
+}
+
+impl VertexFetchConst {
+    /// Decode two register dwords (the type field is ignored: the
+    /// interpreter only needs address/size/endian, and an
+    /// unprogrammed constant reads back zeros either way).
+    pub fn from_words(w: &[u32; 2]) -> Self {
+        Self {
+            address_dwords: w[0] >> 2,
+            size_dwords: (w[1] >> 2) & 0xFF_FFFF,
+            endian: w[1] & 3,
+        }
+    }
+}
+
+/// Dword endian swap (reference `xenos::GpuSwap` 32-bit).
+fn gpu_swap_dword(v: u32, endian: u32) -> u32 {
+    match endian {
+        0 => v,
+        1 => ((v << 8) & 0xFF00_FF00) | ((v >> 8) & 0x00FF_00FF),
+        2 => v.swap_bytes(),
+        3 => v.rotate_right(16),
+        // Unreachable (2-bit field); identity rather than a fault.
+        _ => v,
+    }
+}
+
+/// IEEE half to float (reference `xenos_half_to_float` for the
+/// finite paths; denormals flush to signed zero per the default
+/// path). Deliberate deviation for exponent 31: the reference
+/// formula yields 65536.0 for half inf/NaN, contradicting hardware
+/// (IEEE inf/NaN); we produce inf/NaN instead.
+fn half_to_float(h: u16) -> f32 {
+    let e = ((h >> 10) & 0x1F) as u32;
+    let m = (h & 0x3FF) as u32;
+    let sign = (h as u32) << 16 & 0x8000_0000;
+    if e == 0 {
+        f32::from_bits(sign)
+    } else if e == 31 {
+        f32::from_bits(sign | 0x7F80_0000 | (m << 13))
+    } else {
+        f32::from_bits(sign | ((e + 112) << 23) | (m << 13))
+    }
+}
+
+/// Dword read mask for a vertex format given the used result
+/// components (reference `xenos::GetVertexFormatNeededWords`).
+/// `None` for unknown formats (explicit error at the call site).
+fn vertex_format_needed_words(format: u32, used: u32) -> Option<u32> {
+    if used == 0 {
+        return Some(0);
+    }
+    match format {
+        6 | 7 => Some(0b0001),
+        16 | 17 => Some(if used & 0b0111 != 0 { 0b0001 } else { 0 }),
+        25 | 31 => Some(if used & 0b0011 != 0 { 0b0001 } else { 0 }),
+        26 | 32 => Some(u32::from(used & 0b0011 != 0) | (u32::from(used & 0b1100 != 0) << 1)),
+        33 | 36 => Some(used & 0b0001),
+        34 | 37 => Some(used & 0b0011),
+        35 | 38 => Some(used),
+        57 => Some(used & 0b0111),
+        _ => None,
+    }
+}
+
+/// Execute one vertex-fetch clause instruction (reference
+/// `ShaderInterpreter::ExecuteVertexFetchInstruction`): full
+/// fetches latch the constant index and compute
+/// `stride * index + const.address`; minis reuse them. Reads run
+/// through the fetch-constant window (outside reads as zeros,
+/// physical wrap at 128 MiB like the translators), formats unpack
+/// per the reference switch, `exp_adjust` scales, and the result
+/// stores with the fetch dest swizzle.
+pub fn exec_vfetch(
+    core: &mut ShaderCore,
+    fetch: &FetchInstr,
+    consts: &[VertexFetchConst],
+    mem: &Memory,
+) -> Result<()> {
+    if !fetch.vf_mini() {
+        core.vfetch_const = fetch.vf_const_index() as usize;
+        let src = core.temp_index(fetch.src_reg(), fetch.is_src_relative());
+        let x = core.temps[src][fetch.vf_src_swiz() as usize];
+        // Reference `uint32_t(floor(x + (rounded ? 0.5 : 0)))`;
+        // Rust's saturating cast avoids C++'s UB on negatives/NaN
+        // (vertex indices are non-negative in practice).
+        let index = (x + if fetch.vf_index_rounded() { 0.5 } else { 0.0 }).floor() as u32;
+        let fc = consts.get(core.vfetch_const).copied().unwrap_or_default();
+        core.vfetch_addr_dwords = fetch
+            .vf_stride()
+            .wrapping_mul(index)
+            .wrapping_add(fc.address_dwords);
+    }
+    let fc = consts.get(core.vfetch_const).copied().unwrap_or_default();
+    let swiz = fetch.dst_swizzle();
+    let mut used = 0u32;
+    for i in 0..4 {
+        if ((swiz >> (3 * i)) & 7) <= 3 {
+            used |= 1 << ((swiz >> (3 * i)) & 7);
+        }
+    }
+    let needed = vertex_format_needed_words(fetch.vf_format(), used).ok_or_else(|| {
+        EmuError::Unsupported(format!("vfetch: format {} pending", fetch.vf_format()))
+    })?;
+    let mut result = [0.0f32; 4];
+    if needed != 0 {
+        let end = fc.address_dwords.wrapping_add(fc.size_dwords);
+        let base = (core.vfetch_addr_dwords as i32).wrapping_add(fetch.vf_offset()) as u32;
+        let mut data = [0u32; 4];
+        for (i, d) in data.iter_mut().enumerate() {
+            if needed & (1u32 << i) == 0 {
+                continue;
+            }
+            let a = base.wrapping_add(i as u32);
+            if a >= fc.address_dwords && a < end {
+                // Physical wrap like the translators (128 MiB).
+                let bytes = (a & 0x01FF_FFFF).wrapping_mul(4);
+                *d = gpu_swap_dword(mem.read_u32(bytes)?, fc.endian);
+            }
+        }
+        unpack_vertex_format(
+            fetch.vf_format(),
+            &data,
+            used,
+            fetch.vf_signed(),
+            fetch.vf_normalized(),
+            fetch.vf_rf_no_zero(),
+            &mut result,
+        );
+    }
+    let adj = fetch.vf_exp_adjust();
+    if adj != 0 {
+        let f = 2f32.powi(adj);
+        for r in result.iter_mut() {
+            *r *= f;
+        }
+    }
+    store_fetch_result(
+        core,
+        fetch.dst_reg(),
+        fetch.is_dest_relative(),
+        swiz,
+        &result,
+    );
+    Ok(())
+}
+
+/// Unpack vertex data dwords to floats (reference the format
+/// switch in `ExecuteVertexFetchInstruction`). Only components in
+/// `used` are written; the rest keep their passed-in values.
+#[allow(clippy::too_many_arguments)]
+fn unpack_vertex_format(
+    format: u32,
+    data: &[u32; 4],
+    used: u32,
+    signed: bool,
+    normalized: bool,
+    rf_no_zero: bool,
+    result: &mut [f32; 4],
+) {
+    // Packed sub-dword formats first (reference packed switch).
+    let packed: u32;
+    let widths: [u32; 4];
+    let offsets: [u32; 4];
+    let mut words = [data[0], data[0]];
+    match format {
+        6 => {
+            packed = 0b1111;
+            widths = [8, 8, 8, 8];
+            offsets = [0, 8, 16, 24];
+        }
+        7 => {
+            packed = 0b1111;
+            widths = [10, 10, 10, 2];
+            offsets = [0, 10, 20, 30];
+        }
+        16 => {
+            packed = 0b0111;
+            widths = [11, 11, 10, 0];
+            offsets = [0, 11, 22, 0];
+        }
+        17 => {
+            packed = 0b0111;
+            widths = [10, 11, 11, 0];
+            offsets = [0, 10, 21, 0];
+        }
+        25 => {
+            packed = 0b0011;
+            widths = [16, 16, 0, 0];
+            offsets = [0, 16, 0, 0];
+        }
+        26 => {
+            packed = 0b1111;
+            widths = [16, 16, 16, 16];
+            offsets = [0, 16, 0, 16];
+            words[1] = data[1];
+        }
+        31 => {
+            if used & 0b0010 != 0 {
+                result[1] = half_to_float((data[0] >> 16) as u16);
+            }
+            if used & 0b0001 != 0 {
+                result[0] = half_to_float(data[0] as u16);
+            }
+            return;
+        }
+        32 => {
+            if used & 0b1000 != 0 {
+                result[3] = half_to_float((data[1] >> 16) as u16);
+            }
+            if used & 0b0100 != 0 {
+                result[2] = half_to_float(data[1] as u16);
+            }
+            if used & 0b0010 != 0 {
+                result[1] = half_to_float((data[0] >> 16) as u16);
+            }
+            if used & 0b0001 != 0 {
+                result[0] = half_to_float(data[0] as u16);
+            }
+            return;
+        }
+        33..=35 => {
+            // 1/2/4 x u32.
+            let n = match format {
+                33 => 1,
+                34 => 2,
+                _ => 4,
+            };
+            for i in 0..n {
+                result[i] = if signed {
+                    (data[i] as i32) as f32
+                } else {
+                    data[i] as f32
+                };
+            }
+            if normalized {
+                if rf_no_zero {
+                    for r in result.iter_mut().take(n) {
+                        *r = (*r + 0.5) / 2147483647.5;
+                    }
+                } else {
+                    for r in result.iter_mut().take(n) {
+                        *r /= 2147483647.0;
+                    }
+                }
+            }
+            return;
+        }
+        36 | 37 | 38 | 57 => {
+            // 1/2/4 (57: 3) x f32.
+            let n = match format {
+                36 => 1,
+                37 => 2,
+                57 => 3,
+                _ => 4,
+            };
+            for (r, d) in result.iter_mut().zip(data.iter()).take(n) {
+                *r = f32::from_bits(*d);
+            }
+            return;
+        }
+        // Unreachable (the caller rejects unknown formats); keep
+        // old values rather than invent data.
+        _ => return,
+    }
+    let packed = packed & used;
+    if packed == 0 {
+        return;
+    }
+    if signed {
+        for i in 0..4 {
+            if packed & (1 << i) == 0 {
+                continue;
+            }
+            let w = widths[i] + offsets[i];
+            result[i] = (((words[i >> 1] << (32 - w)) as i32) >> (32 - widths[i])) as f32;
+        }
+        if normalized {
+            if rf_no_zero {
+                for i in 0..4 {
+                    if packed & (1 << i) == 0 {
+                        continue;
+                    }
+                    result[i] = (result[i] + 0.5) * 2.0 / ((1u32 << widths[i]) - 1) as f32;
+                }
+            } else {
+                for i in 0..4 {
+                    if packed & (1 << i) == 0 {
+                        continue;
+                    }
+                    result[i] = (result[i] / (((1u32 << (widths[i] - 1)) - 1) as f32)).max(-1.0);
+                }
+            }
+        }
+    } else {
+        for i in 0..4 {
+            if packed & (1 << i) == 0 {
+                continue;
+            }
+            result[i] = ((words[i >> 1] >> offsets[i]) & ((1u32 << widths[i]) - 1)) as f32;
+        }
+        if normalized {
+            for i in 0..4 {
+                if packed & (1 << i) == 0 {
+                    continue;
+                }
+                result[i] /= ((1u32 << widths[i]) - 1) as f32;
+            }
+        }
+    }
+}
+
 /// Bool-constant bit test (reference register-file bits;
 /// out-of-range addresses read as false, matching zeroed regs).
 fn bool_set(words: &[u32], addr: u32) -> bool {
@@ -999,12 +1331,48 @@ pub fn run_cf(
 }
 
 /// [`run_cf`] with loop-constant registers (see `loop_words`).
+/// Vertex fetches stay explicit `Unsupported` here (no memory);
+/// use [`run_cf_mem`] when guest memory is available.
 pub fn run_cf_loops(
     core: &mut ShaderCore,
     dwords: &[u32],
     consts: &[[f32; 4]],
     bool_words: &[u32],
     loop_words: &[u32],
+) -> Result<CfRunStats> {
+    run_cf_inner(core, dwords, consts, bool_words, loop_words, None)
+}
+
+/// [`run_cf_loops`] with vertex-fetch memory: full fetch
+/// execution via [`exec_vfetch`] (fetch constants + guest
+/// memory); texture slots still write zeros.
+pub fn run_cf_mem(
+    core: &mut ShaderCore,
+    dwords: &[u32],
+    consts: &[[f32; 4]],
+    bool_words: &[u32],
+    loop_words: &[u32],
+    fetch_consts: &[VertexFetchConst],
+    mem: &Memory,
+) -> Result<CfRunStats> {
+    run_cf_inner(
+        core,
+        dwords,
+        consts,
+        bool_words,
+        loop_words,
+        Some((fetch_consts, mem)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cf_inner(
+    core: &mut ShaderCore,
+    dwords: &[u32],
+    consts: &[[f32; 4]],
+    bool_words: &[u32],
+    loop_words: &[u32],
+    vfetch: Option<(&[VertexFetchConst], &Memory)>,
 ) -> Result<CfRunStats> {
     let st = validate_ucode(dwords)?;
     let mut cf: Vec<CfInstr> = Vec::with_capacity(st.cf_pairs as usize * 2);
@@ -1056,10 +1424,30 @@ pub fn run_cf_loops(
                                 continue;
                             }
                             if fetch.opcode() == 0 {
-                                return Err(EmuError::Unsupported(format!(
-                                    "cf: slot {}: vfetch needs draw backend (vertex memory + fetch constants)",
-                                    slot
-                                )));
+                                match vfetch {
+                                    Some((fcs, mem)) => {
+                                        exec_vfetch(core, &fetch, fcs, mem).map_err(
+                                            |e| match e {
+                                                EmuError::Unsupported(s) => EmuError::Unsupported(
+                                                    format!("cf: slot {}: {}", slot, s),
+                                                ),
+                                                EmuError::Other(s) => EmuError::Other(format!(
+                                                    "cf: slot {}: {}",
+                                                    slot, s
+                                                )),
+                                                other => other,
+                                            },
+                                        )?;
+                                        stats.fetch_executed += 1;
+                                    }
+                                    None => {
+                                        return Err(EmuError::Unsupported(format!(
+                                            "cf: slot {}: vfetch needs draw backend (vertex memory + fetch constants)",
+                                            slot
+                                        )));
+                                    }
+                                }
+                                continue;
                             }
                             store_fetch_result(
                                 core,
@@ -1668,6 +2056,190 @@ mod tests {
         core.temps[5] = [2.0, 2.0, 2.0, 2.0];
         let st = run_cf(&mut core, &words, &[], &[1 << 5]).unwrap();
         assert_eq!((st.cf_visited, st.ctrl_taken), (2, 1));
+    }
+
+    /// Identity fetch dest swizzle (x<-X, y<-Y, z<-Z, w<-W).
+    const FETCH_IDENTITY_SWIZ: u32 = (3 << 9) | (2 << 6) | (1 << 3);
+
+    /// Full-fetch triple builder (unsigned float format by default).
+    fn vfetch_triple(dst: u32, src: u32, cidx: u32, format: u32, stride: u32) -> [u32; 3] {
+        [
+            (src << 5) | (dst << 12) | (cidx << 20),
+            FETCH_IDENTITY_SWIZ | (format << 16),
+            stride,
+        ]
+    }
+
+    /// CF upload running one fetch slot then ending: pair0 =
+    /// exec(fetch) + exece(end), pair1 = the fetch triple (slot 1).
+    fn cf_fetch_upload(fetch: [u32; 3]) -> Vec<u32> {
+        let p0 = cf_pair((1, 1 | (1 << 12) | (1 << 16), 0), (2, 1, 0));
+        vec![p0[0], p0[1], p0[2], fetch[0], fetch[1], fetch[2]]
+    }
+
+    fn write_floats(mem: &mut x360_memory::Memory, base: u32, xs: &[f32]) {
+        for (i, x) in xs.iter().enumerate() {
+            mem.write_u32(base + 4 * i as u32, x.to_bits()).unwrap();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn vfetch_float_stride_and_mini() {
+        // Two f32x4 vertices at dwords 0x400/0x404.
+        let mut mem = x360_memory::Memory::new();
+        write_floats(&mut mem, 0x1000, &[10.0, 20.0, 30.0, 40.0]);
+        write_floats(&mut mem, 0x1010, &[1.0, 2.0, 3.0, 4.0]);
+        let fc = VertexFetchConst {
+            address_dwords: 0x400,
+            size_dwords: 16,
+            endian: 0,
+        };
+        // Full fetch, src r4.x = 1.0, stride 4 -> second vertex.
+        // (const 5 selects effective index 5*3+0 = 15.)
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 0.0, 0.0, 0.0];
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 5, 38, 4));
+        let st = run_cf_mem(&mut core, &words, &[], &[], &[], &[fc; 16], &mem).unwrap();
+        assert_eq!((st.fetch_executed, st.ended), (1, true));
+        assert_eq!(core.temps[3], [1.0, 2.0, 3.0, 4.0]);
+        // Mini fetch reuses the latched address into another dest.
+        let mut mini = vfetch_triple(6, 4, 5, 38, 4);
+        mini[1] |= 1 << 30;
+        let p0 = cf_pair((1, 1 | (1 << 12) | (1 << 16), 0), (2, 1, 0));
+        let words = vec![p0[0], p0[1], p0[2], mini[0], mini[1], mini[2]];
+        let mut core = ShaderCore::default();
+        core.vfetch_const = 15;
+        core.vfetch_addr_dwords = 0x404;
+        let st = run_cf_mem(&mut core, &words, &[], &[], &[], &[fc; 16], &mem).unwrap();
+        assert_eq!(st.fetch_executed, 1);
+        assert_eq!(core.temps[6], [1.0, 2.0, 3.0, 4.0]);
+        // Floored 1.5 -> vertex 1, rounded 1.5 -> vertex 2.
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.5, 0.0, 0.0, 0.0];
+        write_floats(&mut mem, 0x1000, &[10.0, 20.0, 30.0, 40.0]);
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 5, 38, 4));
+        run_cf_mem(&mut core, &words, &[], &[], &[], &[fc; 16], &mem).unwrap();
+        assert_eq!(core.temps[3], [1.0, 2.0, 3.0, 4.0]);
+        let mut round = vfetch_triple(3, 4, 5, 38, 4);
+        round[1] |= 1 << 15;
+        let words = cf_fetch_upload(round);
+        write_floats(&mut mem, 0x1020, &[9.0, 9.0, 9.0, 9.0]);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.5, 0.0, 0.0, 0.0];
+        run_cf_mem(&mut core, &words, &[], &[], &[], &[fc; 16], &mem).unwrap();
+        assert_eq!(core.temps[3], [9.0, 9.0, 9.0, 9.0]);
+    }
+
+    #[test]
+    fn vfetch_strided_address_oob_offset_endian() {
+        // Stride 8 dwords: index 1 lands 8 past the base.
+        let mut mem = x360_memory::Memory::new();
+        write_floats(&mut mem, 0x2020, &[7.0, 8.0, 9.0, 1.0]);
+        let fc = VertexFetchConst {
+            address_dwords: 0x800,
+            size_dwords: 32,
+            endian: 0,
+        };
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 0.0, 0.0, 0.0];
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 0, 38, 8));
+        run_cf_mem(&mut core, &words, &[], &[], &[], &[fc], &mem).unwrap();
+        assert_eq!(core.temps[3], [7.0, 8.0, 9.0, 1.0]);
+        // Offset shifts the read by dwords.
+        let mut off = vfetch_triple(3, 4, 0, 38, 8);
+        off[2] |= 4 << 8;
+        let words = cf_fetch_upload(off);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [0.0, 0.0, 0.0, 0.0];
+        write_floats(&mut mem, 0x2010, &[5.0, 6.0, 0.5, 0.25]);
+        run_cf_mem(&mut core, &words, &[], &[], &[], &[fc], &mem).unwrap();
+        assert_eq!(core.temps[3], [5.0, 6.0, 0.5, 0.25]);
+        // Window miss reads zeros (size 0).
+        let fc_empty = VertexFetchConst {
+            address_dwords: 0x800,
+            size_dwords: 0,
+            endian: 0,
+        };
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 0, 38, 8));
+        let mut core = ShaderCore::default();
+        let st = run_cf_mem(&mut core, &words, &[], &[], &[], &[fc_empty], &mem).unwrap();
+        assert_eq!(st.fetch_executed, 1);
+        assert_eq!(core.temps[3], [0.0; 4]);
+        // 8in32 endian swap round-trips swapped storage.
+        let mut mem = x360_memory::Memory::new();
+        mem.write_u32(0x1000, 0x0000_803F).unwrap();
+        let fc_swapped = VertexFetchConst {
+            address_dwords: 0x400,
+            size_dwords: 4,
+            endian: 2,
+        };
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 0, 36, 1));
+        let mut core = ShaderCore::default();
+        run_cf_mem(&mut core, &words, &[], &[], &[], &[fc_swapped], &mem).unwrap();
+        assert_eq!(core.temps[3][0], 1.0);
+    }
+
+    #[test]
+    fn vfetch_packed_half_and_errors() {
+        // Unsigned normalized 8_8_8_8: all-ones -> all 1.0.
+        let mut mem = x360_memory::Memory::new();
+        mem.write_u32(0x1000, 0xFFFF_FFFF).unwrap();
+        let fc = VertexFetchConst {
+            address_dwords: 0x400,
+            size_dwords: 4,
+            endian: 0,
+        };
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 0, 6, 1));
+        let mut core = ShaderCore::default();
+        run_cf_mem(&mut core, &words, &[], &[], &[], &[fc], &mem).unwrap();
+        assert_eq!(core.temps[3], [1.0, 1.0, 1.0, 1.0]);
+        // Signed normalized 8_8_8_8 0x80 clamps to -1.0.
+        mem.write_u32(0x1000, 0x8080_8080).unwrap();
+        let mut signed = vfetch_triple(3, 4, 0, 6, 1);
+        signed[1] |= 1 << 12;
+        let words = cf_fetch_upload(signed);
+        let mut core = ShaderCore::default();
+        run_cf_mem(&mut core, &words, &[], &[], &[], &[fc], &mem).unwrap();
+        assert_eq!(core.temps[3], [-1.0, -1.0, -1.0, -1.0]);
+        // Half floats 1.0/1.0.
+        mem.write_u32(0x1000, 0x3C00_3C00).unwrap();
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 0, 31, 1));
+        let mut core = ShaderCore::default();
+        run_cf_mem(&mut core, &words, &[], &[], &[], &[fc], &mem).unwrap();
+        assert_eq!(core.temps[3][0], 1.0);
+        assert_eq!(core.temps[3][1], 1.0);
+        // Unknown format is explicit, never invented.
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 0, 5, 1));
+        let mut core = ShaderCore::default();
+        let err = run_cf_mem(&mut core, &words, &[], &[], &[], &[fc], &mem).unwrap_err();
+        assert!(err.to_string().contains("format 5"));
+        // No-memory driver keeps the explicit error.
+        let words = cf_fetch_upload(vfetch_triple(3, 4, 0, 38, 1));
+        let mut core = ShaderCore::default();
+        let err = run_cf(&mut core, &words, &[], &[]).unwrap_err();
+        assert!(err.to_string().contains("vfetch"));
+    }
+
+    #[test]
+    fn fetch_const_bits_and_helpers() {
+        let fc = VertexFetchConst::from_words(&[(0x400 << 2) | 3, (16 << 2) | 2]);
+        assert_eq!(
+            (fc.address_dwords, fc.size_dwords, fc.endian),
+            (0x400, 16, 2)
+        );
+        assert_eq!(gpu_swap_dword(0xAA_BB_CC_DD, 0), 0xAA_BB_CC_DD);
+        assert_eq!(gpu_swap_dword(0xAA_BB_CC_DD, 1), 0xBB_AA_DD_CC);
+        assert_eq!(gpu_swap_dword(0xAA_BB_CC_DD, 2), 0xDD_CC_BB_AA);
+        assert_eq!(gpu_swap_dword(0xAA_BB_CC_DD, 3), 0xCC_DD_AA_BB);
+        assert_eq!(half_to_float(0x3C00), 1.0);
+        assert_eq!(half_to_float(0xBC00), -1.0);
+        assert_eq!(half_to_float(0x0000), 0.0);
+        assert_eq!(half_to_float(0x7C00), f32::INFINITY);
+        assert_eq!(half_to_float(0x0001), 0.0);
+        assert_eq!(vertex_format_needed_words(38, 0b1111), Some(0b1111));
+        assert_eq!(vertex_format_needed_words(38, 0), Some(0));
+        assert_eq!(vertex_format_needed_words(5, 0b1111), None);
     }
 
     #[test]

@@ -474,13 +474,18 @@ Terminal states only: impossible, done, or something rendering.
       per `src_const_is_addressed`/`const_address_register_relative`
       (negative/OOB read zeros). Unit-tested (clamp/wrap, temp
       src/dest, const a0/aL/negative).
-- [x] Fetch-slot handling (`kernel::uint::run_cf`, reference fetch
-      `Execute` branch + `StoreFetchResult`): predicated fetches
-      skip; texture slots (opcode != vfetch) write zeros with
-      absolute dest swizzle (0-3 select, 4=>0, 5=>1, 7=>keep, else
-      0, aL-relative dest); vertex fetches (opcode 0, needing vertex
-      memory + fetch constants) stay explicit `Unsupported`.
-      Unit-tested (zero + swizzle/keep, vertex error).
+- [x] Vertex-fetch execution (`kernel::uint::exec_vfetch` +
+      `run_cf_mem`, reference `ExecuteVertexFetchInstruction` +
+      `xenos.h` layouts): full/mini latching, strided/indexed
+      addressing (rounded/floored), fetch-constant windows
+      (OOB-as-zero, 128 MiB physical wrap), dword endian swaps,
+      all 15 vertex formats (packed, half, u32, f32 with
+      signed/normalized/rf modes), `exp_adjust`, fetch dest
+      swizzle. Memory-less `run_cf` keeps the explicit error.
+      Unit-tested (stride/mini/rounding/offset/OOB/endian,
+      packed/signed-clamp/half/unknown-format, const bits, swaps).
+      The shader interpreter is now complete (no remaining
+      `Unsupported` on the CF path).
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
