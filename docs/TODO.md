@@ -293,7 +293,14 @@ Terminal states only: impossible, done, or something rendering.
 - [x] EDRAM clear/resolve state (reference `xenos.h` 10 MiB sizing):
       10 MiB backing, solid-32bpp clear (tiling-independent, exact),
       linear resolve to DRAM with explicit OOB errors; unit-tested.
-      Patterned content needs detiling (pending).
+- [x] EDRAM tiled layout + detiled resolve (`kernel::gpu`,
+      reference `edram.xesli` `XeEdramOffsetBytes` 1x-32bpp-color
+      case): tile offset math (80x16 tiles, base/pitch, hardware
+      wrap), per-pixel tiled write, row-major detiled resolve with
+      pitch coverage + OOB errors. Unit-tested (offset spots,
+      160x32 gradient roundtrip, tiling-reality check, edges).
+      Present path still uses the solid fast path; tiled resolve
+      waits on draw-produced content.
 - [x] Dash pipeline test (`dash_pipeline`, gated on `X360_DASH_DIR`):
       dash.xex parses/decompresses to 10 PE sections with entry
       `0x92196610` covered, 1628 imports — loader drift excluded for

@@ -95,6 +95,27 @@ const MAX_PACKETS: u64 = 1_000_000;
 /// × `kEdramTileHeightSamples(16)` × `kEdramTileWidthSamples(80)` ×
 /// 4 bytes = 10 MiB).
 pub const EDRAM_SIZE: usize = 2048 * 16 * 80 * 4;
+/// EDRAM tile width in 32bpp samples (reference `edram.xesli`).
+pub const EDRAM_TILE_W: u32 = 80;
+/// EDRAM tile height in 32bpp samples.
+pub const EDRAM_TILE_H: u32 = 16;
+/// EDRAM tile count.
+pub const EDRAM_TILE_COUNT: u32 = 2048;
+
+/// Tiled byte offset of pixel (`x`, `y`) for a 1x-MSAA 32bpp color
+/// surface (reference `edram.xesli` `XeEdramOffsetBytes` with
+/// single-sample, non-depth, `format_ints_log2 = 0`, scale 1).
+/// `base_tiles`/`pitch_tiles` come from the surface registers;
+/// addressing wraps modulo the EDRAM size like hardware.
+pub fn edram_tile_offset_bytes(x: u32, y: u32, base_tiles: u32, pitch_tiles: u32) -> usize {
+    let tx = (x / EDRAM_TILE_W) as u64;
+    let ty = (y / EDRAM_TILE_H) as u64;
+    let lx = (x % EDRAM_TILE_W) as u64;
+    let ly = (y % EDRAM_TILE_H) as u64;
+    let tile = base_tiles as u64 + ty * pitch_tiles as u64 + tx;
+    let dwords = tile * (EDRAM_TILE_W as u64 * EDRAM_TILE_H as u64) + ly * EDRAM_TILE_W as u64 + lx;
+    ((dwords % (EDRAM_SIZE as u64 / 4)) * 4) as usize
+}
 
 /// Per-batch execution stats (tests + TEMP forensics).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -805,6 +826,79 @@ impl Kernel {
             .map_err(|e| EmuError::Other(format!("resolve dest {:08x}: {}", dest, e)))?;
         Ok(())
     }
+
+    /// Write one 32bpp pixel through the tiled layout (PPC byte
+    /// order per unit). Out-of-tile-grid writes are explicit errors
+    /// (no silent wrap: resolve callers must size surfaces
+    /// correctly).
+    pub fn edram_write_pixel_32bpp(
+        &mut self,
+        x: u32,
+        y: u32,
+        base_tiles: u32,
+        pitch_tiles: u32,
+        color: u32,
+    ) -> Result<()> {
+        let off = edram_tile_offset_bytes(x, y, base_tiles, pitch_tiles);
+        if off + 4 > self.vd_edram.len() {
+            return Err(EmuError::Other(format!(
+                "tiled pixel {},{} base {} pitch {} out of EDRAM",
+                x, y, base_tiles, pitch_tiles
+            )));
+        }
+        self.vd_edram[off..off + 4].copy_from_slice(&color.to_be_bytes());
+        Ok(())
+    }
+
+    /// Detiled resolve of a `w`×`h` 32bpp surface to guest `dest`
+    /// in row-major order (reference resolve with the tiled layout
+    /// applied). Pitch must cover the width
+    /// (`pitch_tiles * 80 >= w`); violations are explicit errors.
+    pub fn edram_resolve_tiled(
+        &self,
+        mem: &mut Memory,
+        dest: u32,
+        w: u32,
+        h: u32,
+        base_tiles: u32,
+        pitch_tiles: u32,
+    ) -> Result<()> {
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        if (pitch_tiles as u64) * u64::from(EDRAM_TILE_W) < u64::from(w) {
+            return Err(EmuError::Other(format!(
+                "tiled resolve {}x{} exceeds pitch {} tiles",
+                w, h, pitch_tiles
+            )));
+        }
+        let size = (w as u64)
+            .checked_mul(h as u64)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| EmuError::Other("tiled resolve size overflows".into()))?;
+        if size > EDRAM_SIZE as u64 {
+            return Err(EmuError::Other(format!(
+                "tiled resolve {}x{} exceeds EDRAM",
+                w, h
+            )));
+        }
+        let mut out = Vec::with_capacity(size as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let off = edram_tile_offset_bytes(x, y, base_tiles, pitch_tiles);
+                if off + 4 > self.vd_edram.len() {
+                    return Err(EmuError::Other(format!(
+                        "tiled resolve pixel {},{} out of EDRAM",
+                        x, y
+                    )));
+                }
+                out.extend_from_slice(&self.vd_edram[off..off + 4]);
+            }
+        }
+        mem.write_bytes(dest, &out)
+            .map_err(|e| EmuError::Other(format!("tiled resolve dest {:08x}: {}", dest, e)))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1078,6 +1172,50 @@ mod tests {
             .edram_resolve(&mut m, 0x0100_A000, EDRAM_SIZE + 4)
             .is_err());
         assert!(k.edram_resolve(&mut m, 0xFFFF_FFF0, 16).is_err());
+    }
+
+    #[test]
+    fn edram_tiled_offsets_and_detile() {
+        // Reference layout spot checks (1x 32bpp, pitch 16 tiles).
+        assert_eq!(edram_tile_offset_bytes(0, 0, 0, 16), 0);
+        assert_eq!(edram_tile_offset_bytes(79, 0, 0, 16), 79 * 4);
+        assert_eq!(edram_tile_offset_bytes(80, 0, 0, 16), 1280 * 4);
+        assert_eq!(edram_tile_offset_bytes(0, 16, 0, 16), 16 * 1280 * 4);
+        assert_eq!(edram_tile_offset_bytes(0, 0, 5, 16), 5 * 1280 * 4);
+        assert_eq!(
+            edram_tile_offset_bytes(159, 31, 0, 16),
+            (17 * 1280 + 15 * 80 + 79) * 4
+        );
+        // Patterned roundtrip: 160x32 gradient detiles row-major.
+        let mut k = kernel();
+        let mut m = Memory::new();
+        for y in 0..32u32 {
+            for x in 0..160u32 {
+                k.edram_write_pixel_32bpp(x, y, 0, 2, x * 0x10000 + y)
+                    .unwrap();
+            }
+        }
+        k.edram_resolve_tiled(&mut m, 0x0100_A000, 160, 32, 0, 2)
+            .unwrap();
+        assert_eq!(m.read_u32(0x0100_A000).unwrap(), 0x0000_0000);
+        assert_eq!(m.read_u32(0x0100_A000 + 4 * 159).unwrap(), 159 * 0x10000);
+        assert_eq!(
+            m.read_u32(0x0100_A000 + 4 * (31 * 160 + 159)).unwrap(),
+            159 * 0x10000 + 31
+        );
+        // Linear resolve of the same bytes is NOT row-major (tiling
+        // is real: raw EDRAM at linear dword 80 holds pixel (0,1),
+        // not pixel (80,0)).
+        assert_eq!(
+            u32::from_be_bytes(k.vd_edram[320..324].try_into().unwrap()),
+            1
+        );
+        // Narrow pitch and zero-size edges.
+        assert!(k
+            .edram_resolve_tiled(&mut m, 0x0100_A000, 160, 32, 0, 1)
+            .is_err());
+        k.edram_resolve_tiled(&mut m, 0x0100_A000, 0, 32, 0, 2)
+            .unwrap();
     }
 
     #[test]
