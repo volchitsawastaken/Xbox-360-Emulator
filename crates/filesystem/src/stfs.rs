@@ -365,6 +365,122 @@ mod tests {
         assert!(stfs.read_file(&files[0]).is_err());
     }
 
+    #[test]
+    fn header_size_edges_rejected() {
+        let mut img = tiny_image();
+        img[0x340..0x344].copy_from_slice(&0u32.to_be_bytes());
+        assert!(StfsImage::open(&img).is_err());
+        let mut img = tiny_image();
+        img[0x340..0x344].copy_from_slice(&0x10_0000u32.to_be_bytes());
+        assert!(StfsImage::open(&img).is_err());
+    }
+
+    #[test]
+    fn bad_descriptor_rejected() {
+        let mut img = tiny_image();
+        img[0x379] = 0x23;
+        assert!(StfsImage::open(&img).is_err());
+    }
+
+    #[test]
+    fn dual_backing_is_unsupported() {
+        let mut img = tiny_image();
+        img[0x379 + 2] &= !1; // clear read-only: resiliency tables
+        assert!(matches!(
+            StfsImage::open(&img),
+            Err(EmuError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn svod_is_unsupported() {
+        let mut img = tiny_image();
+        img[0x3A9..0x3AD].copy_from_slice(&1u32.to_be_bytes());
+        assert!(matches!(
+            StfsImage::open(&img),
+            Err(EmuError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn block_count_edges_rejected() {
+        let mut img = tiny_image();
+        img[0x379 + 0x1C..0x379 + 0x20].copy_from_slice(&0u32.to_be_bytes());
+        assert!(StfsImage::open(&img).is_err());
+        let mut img = tiny_image();
+        img[0x379 + 0x1C..0x379 + 0x20].copy_from_slice(&0x100_0001u32.to_be_bytes());
+        assert!(StfsImage::open(&img).is_err());
+    }
+
+    #[test]
+    fn bad_name_length_rejected() {
+        let mut img = tiny_image();
+        img[0x2000 + 40] = 0; // name length 0
+        let stfs = StfsImage::open(&img).unwrap();
+        assert!(stfs.list_files().is_err());
+        let mut img = tiny_image();
+        img[0x2000 + 40] = 41; // name length past the 40-byte field
+        let stfs = StfsImage::open(&img).unwrap();
+        assert!(stfs.list_files().is_err());
+    }
+
+    #[test]
+    fn read_of_directory_rejected() {
+        let img = tiny_image();
+        let stfs = StfsImage::open(&img).unwrap();
+        let dir = StfsEntry {
+            name: "d".into(),
+            is_dir: true,
+            parent: 0xFFFF,
+            start_block: 1,
+            length: 3,
+        };
+        assert!(stfs.read_file(&dir).is_err());
+    }
+
+    #[test]
+    fn chain_block_oob_rejected() {
+        let img = tiny_image();
+        let stfs = StfsImage::open(&img).unwrap();
+        let bad = StfsEntry {
+            name: "hi.bin".into(),
+            is_dir: false,
+            parent: 0xFFFF,
+            start_block: 99, // past total_blocks=8
+            length: 3,
+        };
+        assert!(stfs.read_file(&bad).is_err());
+    }
+
+    #[test]
+    fn short_chain_rejected() {
+        // Length needs 2 blocks (0x1001 bytes) but the chain ends after 1.
+        let img = tiny_image();
+        let stfs = StfsImage::open(&img).unwrap();
+        let long = StfsEntry {
+            name: "hi.bin".into(),
+            is_dir: false,
+            parent: 0xFFFF,
+            start_block: 1,
+            length: 0x1001 as u32,
+        };
+        assert!(stfs.read_file(&long).is_err());
+    }
+
+    #[test]
+    fn zero_length_reads_empty() {
+        let img = tiny_image();
+        let stfs = StfsImage::open(&img).unwrap();
+        let empty = StfsEntry {
+            name: "hi.bin".into(),
+            is_dir: false,
+            parent: 0xFFFF,
+            start_block: 1,
+            length: 0,
+        };
+        assert_eq!(stfs.read_file(&empty).unwrap(), Vec::<u8>::new());
+    }
+
     /// Retail proof: Braid GOD lists real files and its XEX extracts
     /// with a valid header. Gated on `$X360_STFS_FILE` (a `LIVE` package
     /// such as the quarantined Braid data file). Package bytes stay out

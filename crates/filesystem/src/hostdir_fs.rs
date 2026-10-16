@@ -5,6 +5,10 @@
 //! file bytes lazily with an Arc cache. Used for extracted layouts
 //! and system-update directories (e.g. dash), where no STFS
 //! container exists. Read-only: the guest can never write through.
+//!
+//! Lookups normalize defensively via [`super::normalize_lookup`]
+//! (case, `\` separators, leading `/`, `.`/`..`), so direct callers
+//! get the same canonical form the kernel resolves to.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -102,8 +106,9 @@ impl HostDirFs {
 
 impl GuestFs for HostDirFs {
     fn lookup(&self, path: &str) -> FsLookup {
-        if let Some(rel) = self.files.get(path) {
-            if let Some(hit) = self.cache.lock().expect("fs cache").get(path) {
+        let key = super::normalize_lookup(path);
+        if let Some(rel) = self.files.get(&key) {
+            if let Some(hit) = self.cache.lock().expect("fs cache").get(&key) {
                 return FsLookup::File(hit.clone());
             }
             match std::fs::read(self.root.join(rel)) {
@@ -112,12 +117,12 @@ impl GuestFs for HostDirFs {
                     self.cache
                         .lock()
                         .expect("fs cache")
-                        .insert(path.to_string(), arc.clone());
+                        .insert(key, arc.clone());
                     FsLookup::File(arc)
                 }
                 Err(_) => FsLookup::NotFound,
             }
-        } else if let Some(kids) = self.tree.get(path) {
+        } else if let Some(kids) = self.tree.get(&key) {
             FsLookup::Dir(kids.clone())
         } else {
             FsLookup::NotFound
@@ -188,6 +193,43 @@ mod tests {
         std::fs::write(&file, b"x").expect("write");
         assert!(HostDirFs::load(&file).is_err());
         assert!(HostDirFs::load(&root.join("missing")).is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn hostdir_lookup_normalizes() {
+        let root = unique_root("norm");
+        write_tree(&root);
+        let fs = HostDirFs::load(&root).expect("index");
+        // Mixed case, backslashes, leading slash, dots all resolve.
+        for probe in [
+            "DATA/STRINGS/ENGLISH.MO",
+            "data\\strings\\english.mo",
+            "/data/strings/english.mo",
+            "data//strings/./english.mo",
+            "data/strings/sub/../english.mo",
+            "data/strings/",
+        ] {
+            let hit = matches!(fs.lookup(probe), FsLookup::File(_) | FsLookup::Dir(_));
+            assert!(hit, "probe missed: {}", probe);
+        }
+        match fs.lookup("DATA\\STRINGS\\ENGLISH.MO") {
+            FsLookup::File(b) => assert_eq!(&b[..], b"mobytes"),
+            _ => panic!("normalized file missing"),
+        }
+        // `..` above the root clamps instead of escaping.
+        match fs.lookup("../../default.xex") {
+            FsLookup::File(b) => assert_eq!(&b[..], b"XEX2fake"),
+            _ => panic!("clamped root file missing"),
+        }
+        // Cache is keyed by the normalized form: both spellings hit.
+        match fs.lookup("default.xex") {
+            FsLookup::File(first) => match fs.lookup("DEFAULT.XEX") {
+                FsLookup::File(second) => assert_eq!(&first[..], &second[..]),
+                _ => panic!("second spelling missing"),
+            },
+            _ => panic!("first spelling missing"),
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 }

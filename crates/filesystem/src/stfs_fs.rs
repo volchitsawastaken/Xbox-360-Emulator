@@ -4,6 +4,10 @@
 //! chain) and extracts file bytes lazily with an Arc cache, so the
 //! kernel serves real game bytes without holding every asset
 //! extracted at once.
+//!
+//! Lookups normalize defensively via [`super::normalize_lookup`]
+//! (case, `\` separators, leading `/`, `.`/`..`), matching the
+//! kernel's canonical form.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -83,9 +87,10 @@ impl StfsFs {
 
 impl GuestFs for StfsFs {
     fn lookup(&self, path: &str) -> FsLookup {
-        if let Some(entry) = self.files.get(path) {
+        let key = super::normalize_lookup(path);
+        if let Some(entry) = self.files.get(&key) {
             // Cached extract, else SHA1-verified read from the package.
-            if let Some(hit) = self.cache.lock().expect("fs cache").get(path) {
+            if let Some(hit) = self.cache.lock().expect("fs cache").get(&key) {
                 return FsLookup::File(hit.clone());
             }
             let img = match StfsImage::open(&self.data) {
@@ -98,12 +103,12 @@ impl GuestFs for StfsFs {
                     self.cache
                         .lock()
                         .expect("fs cache")
-                        .insert(path.to_string(), arc.clone());
+                        .insert(key, arc.clone());
                     FsLookup::File(arc)
                 }
                 Err(_) => FsLookup::NotFound,
             }
-        } else if let Some(kids) = self.tree.get(path) {
+        } else if let Some(kids) = self.tree.get(&key) {
             FsLookup::Dir(kids.clone())
         } else {
             FsLookup::NotFound
@@ -180,5 +185,88 @@ mod tests {
             _ => panic!("strings not a dir"),
         }
         assert!(matches!(fs.lookup("nope/nothing"), FsLookup::NotFound));
+    }
+
+    /// Synthetic package: dir `data` + file `data/english.mo` (3 bytes)
+    /// + one orphaned entry (bad parent, skipped). No retail bytes.
+    fn synthetic_package() -> Vec<u8> {
+        use sha1::{Digest, Sha1};
+        const END: u32 = 0xFF_FFFF;
+        let mut v = vec![0u8; 0x4000];
+        v[0..4].copy_from_slice(b"LIVE");
+        v[0x340..0x344].copy_from_slice(&0x1000u32.to_be_bytes());
+        let vd = 0x379;
+        v[vd] = 0x24;
+        v[vd + 1] = 0;
+        v[vd + 2] = 0x01; // read-only
+        v[vd + 3..vd + 5].copy_from_slice(&1u16.to_be_bytes());
+        v[vd + 5..vd + 8].copy_from_slice(&[0, 0, 0]);
+        v[vd + 0x1C..vd + 0x20].copy_from_slice(&8u32.to_be_bytes());
+        v[0x3A9..0x3AD].copy_from_slice(&0u32.to_be_bytes()); // STFS
+        v[0x3000..0x3003].copy_from_slice(b"ABC");
+        let mut hasher = Sha1::new();
+        hasher.update(&v[0x3000..0x4000]);
+        let digest = hasher.finalize();
+        v[0x1000 + 20..0x1000 + 24].copy_from_slice(&END.to_be_bytes());
+        v[0x1000 + 0x18..0x1000 + 0x2C].copy_from_slice(&digest);
+        v[0x1000 + 0x2C..0x1000 + 0x30].copy_from_slice(&END.to_be_bytes());
+        // Entry 0: dir "data" under root.
+        let e0 = 0x2000;
+        v[e0..e0 + 4].copy_from_slice(b"data");
+        v[e0 + 40] = 0x84; // len 4 + dir bit
+        v[e0 + 47..e0 + 50].copy_from_slice(&[0, 0, 0]); // start 0
+        v[e0 + 50..e0 + 52].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        v[e0 + 52..e0 + 56].copy_from_slice(&0u32.to_be_bytes());
+        // Entry 1: file "english.mo" under entry 0.
+        let e1 = 0x2040;
+        v[e1..e1 + 10].copy_from_slice(b"english.mo");
+        v[e1 + 40] = 10;
+        v[e1 + 47..e1 + 50].copy_from_slice(&[1, 0, 0]); // start block 1
+        v[e1 + 50..e1 + 52].copy_from_slice(&0u16.to_be_bytes());
+        v[e1 + 52..e1 + 56].copy_from_slice(&3u32.to_be_bytes());
+        // Entry 2: orphan (parent 9 never resolves).
+        let e2 = 0x2080;
+        v[e2..e2 + 10].copy_from_slice(b"orphan.bin");
+        v[e2 + 40] = 10;
+        v[e2 + 47..e2 + 50].copy_from_slice(&[1, 0, 0]);
+        v[e2 + 50..e2 + 52].copy_from_slice(&9u16.to_be_bytes());
+        v[e2 + 52..e2 + 56].copy_from_slice(&3u32.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn stfs_fs_synthetic_index_shapes() {
+        let bytes = synthetic_package();
+        let fs = StfsFs::load(Arc::from(bytes.into_boxed_slice())).expect("index");
+        match fs.lookup("data/english.mo") {
+            FsLookup::File(b) => assert_eq!(&b[..], b"ABC"),
+            _ => panic!("nested file missing"),
+        }
+        match fs.lookup("data") {
+            FsLookup::Dir(kids) => {
+                assert!(kids.iter().any(|k| k.name == "english.mo" && !k.is_dir))
+            }
+            _ => panic!("dir missing"),
+        }
+        // Orphaned entry is unreachable, never indexed.
+        assert!(matches!(fs.lookup("orphan.bin"), FsLookup::NotFound));
+        // Normalization: case, separators, and dots resolve alike.
+        for probe in [
+            "DATA/ENGLISH.MO",
+            "data\\english.mo",
+            "/data/english.mo",
+            "data/./english.mo",
+            "data/sub/../english.mo",
+        ] {
+            match fs.lookup(probe) {
+                FsLookup::File(b) => assert_eq!(&b[..], b"ABC", "probe {}", probe),
+                _ => panic!("probe missed: {}", probe),
+            }
+        }
+        // Cached second lookup agrees.
+        match fs.lookup("data/english.mo") {
+            FsLookup::File(b) => assert_eq!(&b[..], b"ABC"),
+            _ => panic!("cache miss"),
+        }
     }
 }
