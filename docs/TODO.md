@@ -402,6 +402,13 @@ Terminal states only: impossible, done, or something rendering.
       in the reference too). NaN-quiet comparison semantics kept
       explicit (`partial_cmp`-style, no negated comparisons).
       Unit-tested incl. chaining and address output.
+- [x] ALU combinational remainder (`kernel::uint`, reference
+      arms): cndEq/cndGe/cndGt select, cube-map coordinate/face
+      select, max4 tournament, setp_eq/ne/gt/ge_push (predicate +
+      counter), kill_eq/gt/ge/ne flags (result only, kill
+      unimplemented like the reference), dst swizzle, maxA
+      (address + max). NaN-quiet comparisons via an explicit
+      `ge_quiet` helper. Unit-tested.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

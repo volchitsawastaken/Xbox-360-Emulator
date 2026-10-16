@@ -210,6 +210,12 @@ fn clamp_float(v: f32, min: f32, max: f32) -> f32 {
     }
 }
 
+/// Quiet greater-or-equal (reference `std::isgreaterequal`):
+/// unordered (NaN) compares quiet-true.
+fn ge_quiet(a: f32, b: f32) -> bool {
+    a.partial_cmp(&b) != Some(std::cmp::Ordering::Less)
+}
+
 /// D3D9 multiply: 0 (or flushed denormal) times anything is +0.
 fn d3d_mul(a: f32, b: f32) -> f32 {
     if a != 0.0 && b != 0.0 {
@@ -237,9 +243,9 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
     // `operand_components_used`; over-fetching is harmless but OOB
     // temp reads must never happen, so fetch exactly).
     let vec_sources: &[u32] = match vop {
-        11 | 17 => &[1, 2, 3],
-        8..=10 => &[1],
-        0..=7 | 15 | 16 => &[1, 2],
+        11..=14 | 17 => &[1, 2, 3],
+        8..=10 | 18 | 19 => &[1],
+        0..=7 | 15 | 16 | 20..=29 => &[1, 2],
         _ => {
             return Err(EmuError::Unsupported(format!(
                 "alu: vector op {} pending",
@@ -339,6 +345,121 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
             sum += src[2][0];
             vr = [sum; 4];
         }
+        12 => {
+            for i in 0..4 {
+                vr[i] = if src[0][i] == 0.0 {
+                    src[1][i]
+                } else {
+                    src[2][i]
+                };
+            }
+        }
+        13 => {
+            for i in 0..4 {
+                vr[i] = if src[0][i].partial_cmp(&0.0) != Some(std::cmp::Ordering::Less) {
+                    src[1][i]
+                } else {
+                    src[2][i]
+                };
+            }
+        }
+        14 => {
+            for i in 0..4 {
+                vr[i] = if src[0][i] > 0.0 {
+                    src[1][i]
+                } else {
+                    src[2][i]
+                };
+            }
+        }
+        18 => {
+            // Cube-map coordinate/face select (reference `kCube`).
+            let (x, y, z) = (src[0][2], src[0][3], src[0][0]);
+            let (xa, ya, za) = (x.abs(), y.abs(), z.abs());
+            if ge_quiet(za, xa) && ge_quiet(za, ya) {
+                let zn = z < 0.0;
+                vr[0] = -y;
+                vr[1] = if zn { -x } else { x };
+                vr[2] = z;
+                vr[3] = if zn { 5.0 } else { 4.0 };
+            } else if ge_quiet(ya, xa) {
+                let yn = y < 0.0;
+                vr[0] = if yn { -z } else { z };
+                vr[1] = x;
+                vr[2] = y;
+                vr[3] = if yn { 3.0 } else { 2.0 };
+            } else {
+                let xn = x < 0.0;
+                vr[0] = -y;
+                vr[1] = if xn { z } else { -z };
+                vr[2] = x;
+                vr[3] = if xn { 1.0 } else { 0.0 };
+            }
+            vr[2] *= 2.0;
+        }
+        19 => {
+            let o = &src[0];
+            let ge = |a: f32, b: f32| a.partial_cmp(&b) != Some(std::cmp::Ordering::Less);
+            if ge(o[0], o[1]) && ge(o[0], o[2]) && ge(o[0], o[3]) {
+                vr[0] = o[0];
+            } else if ge(o[1], o[2]) && ge(o[1], o[3]) {
+                vr[0] = o[1];
+            } else if ge(o[2], o[3]) {
+                vr[0] = o[2];
+            } else {
+                vr[0] = o[3];
+            }
+            vr[1] = vr[0];
+            vr[2] = vr[0];
+            vr[3] = vr[0];
+        }
+        20..=23 => {
+            // Predicate-push compare on W, counter in X (reference
+            // `kSetp*Push`).
+            let (a0, a3, b0, b3) = (src[0][0], src[0][3], src[1][0], src[1][3]);
+            let (pred, zero) = match vop {
+                20 => (a3 == 0.0 && b3 == 0.0, a0 == 0.0 && b0 == 0.0),
+                21 => (a3 == 0.0 && b3 != 0.0, a0 == 0.0 && b0 != 0.0),
+                22 => (a3 == 0.0 && b3 > 0.0, a0 == 0.0 && b0 > 0.0),
+                _ => (
+                    a3 == 0.0 && b3.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less),
+                    a0 == 0.0 && b0.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less),
+                ),
+            };
+            core.predicate = pred;
+            vr[0] = if zero { 0.0 } else { a0 + 1.0 };
+            vr[1] = vr[0];
+            vr[2] = vr[0];
+            vr[3] = vr[0];
+        }
+        24..=27 => {
+            // Kill-test flags (pixel kill itself is unimplemented in
+            // the reference too; only the result word is produced).
+            let any = match vop {
+                24 => (0..4).any(|i| src[0][i] == src[1][i]),
+                25 => (0..4).any(|i| src[0][i] > src[1][i]),
+                26 => (0..4)
+                    .any(|i| src[0][i].partial_cmp(&src[1][i]) != Some(std::cmp::Ordering::Less)),
+                _ => (0..4).any(|i| src[0][i] != src[1][i]),
+            };
+            vr = [if any { 1.0 } else { 0.0 }; 4];
+        }
+        28 => {
+            vr[0] = 1.0;
+            vr[1] = d3d_mul(src[0][1], src[1][1]);
+            vr[2] = src[0][2];
+            vr[3] = src[1][3];
+        }
+        29 => {
+            core.address_register = (clamp_float(src[0][3], -256.0, 255.0) + 0.5).floor() as i32;
+            for i in 0..4 {
+                vr[i] = if src[0][i] < src[1][i] {
+                    src[1][i]
+                } else {
+                    src[0][i]
+                };
+            }
+        }
         _ => {
             return Err(EmuError::Unsupported(format!(
                 "alu: vector op {} pending",
@@ -347,7 +468,7 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
         }
     }
     let sop = ins.scalar_opcode();
-    let vec_three = matches!(vop, 11 | 17);
+    let vec_three = matches!(vop, 11..=14 | 17);
     match sop {
         50 => {}
         0 | 1 | 2 | 3 | 4 | 23 | 24 | 25 | 26 => {
@@ -700,5 +821,50 @@ mod tests {
         eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(33))).unwrap();
         assert!(!core.predicate);
         assert_eq!(core.previous_scalar, f32::MAX);
+    }
+
+    #[test]
+    fn vector_cnd_dst_max4_setppush() {
+        // cndEq r1, r4, r5, r6: op0==0 picks op1 else op2.
+        let mut core = ShaderCore::default();
+        core.temps[4] = [0.0, 1.0, 0.0, 1.0];
+        core.temps[5] = [10.0, 11.0, 12.0, 13.0];
+        core.temps[6] = [20.0, 21.0, 22.0, 23.0];
+        let temps3 = (1 << 31) | (1 << 30) | (1 << 29);
+        let d = [
+            triple(1, 0xF, 0, 0, 12, 50)[0],
+            0,
+            (12 << 24) | (4 << 16) | (5 << 8) | 6 | temps3,
+        ];
+        eval_alu(&mut core, &[], &parse_alu(&d)).unwrap();
+        assert_eq!(core.temps[1], [10.0, 21.0, 12.0, 23.0]);
+        // dst r2, r4, r5: [1, y0*y1, z0, w1] = [1, 11, 0, 13].
+        let d = [
+            triple(2, 0xF, 0, 0, 28, 50)[0],
+            0,
+            (28 << 24) | (4 << 16) | (5 << 8) | (1 << 31) | (1 << 30),
+        ];
+        eval_alu(&mut core, &[], &parse_alu(&d)).unwrap();
+        assert_eq!(core.temps[2], [1.0, 11.0, 0.0, 13.0]);
+        // max4 r3, r4 (r4 = [1,5,3,4]) replicates 5.
+        core.temps[4] = [1.0, 5.0, 3.0, 4.0];
+        let d = [
+            triple(3, 0xF, 0, 0, 19, 50)[0],
+            0,
+            (19 << 24) | (4 << 16) | (1 << 31),
+        ];
+        eval_alu(&mut core, &[], &parse_alu(&d)).unwrap();
+        assert_eq!(core.temps[3], [5.0, 5.0, 5.0, 5.0]);
+        // setp_eq_push r4.x=7: predicate (w: 0==0 && 0==0), result 8.
+        core.temps[4] = [7.0, 0.0, 0.0, 0.0];
+        core.temps[5] = [0.0, 0.0, 0.0, 0.0];
+        let d = [
+            triple(1, 0xF, 0, 0, 20, 50)[0],
+            0,
+            (20 << 24) | (4 << 16) | (5 << 8) | (1 << 31) | (1 << 30),
+        ];
+        eval_alu(&mut core, &[], &parse_alu(&d)).unwrap();
+        assert!(core.predicate);
+        assert_eq!(core.temps[1], [8.0, 8.0, 8.0, 8.0]);
     }
 }
