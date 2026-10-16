@@ -354,7 +354,8 @@ Terminal states only: impossible, done, or something rendering.
       every 16ms wall-time once the ring exists and a callback is
       registered (counter bump + queued `(0, 2)` through the
       existing delivery path; single-threaded, no host threads).
-      Retail Braid takes ~150 real deliveries per boot with no
+      Retail Braid takes 94 verified deliveries per 2M-step boot
+      (queue fully drained, callback registered) with no
       crash (delivery-path robustness proof) but does NOT advance:
       the callback's source-0 path doesn't touch the waited
       events (spinlocks live behind the source==1 branch, which
