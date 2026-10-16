@@ -553,6 +553,23 @@ impl Kernel {
                 for k in 0..size {
                     ucode.push(p(2 + k));
                 }
+                // Structural check only (storage is unconditional):
+                // valid uploads log their census, malformed ones warn
+                // loudly but still store exactly what the game sent.
+                match crate::ucode::validate_ucode(&ucode) {
+                    Ok(st) => log::debug!(
+                        "kernel: IM_LOAD type {} size {}: {:?}",
+                        shader_type,
+                        size,
+                        st
+                    ),
+                    Err(e) => log::warn!(
+                        "kernel: IM_LOAD type {} size {} invalid: {}",
+                        shader_type,
+                        size,
+                        e
+                    ),
+                }
                 if shader_type == 0 {
                     self.vd_vs_ucode = ucode;
                 } else {

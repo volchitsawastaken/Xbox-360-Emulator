@@ -17,6 +17,7 @@ pub mod fs;
 pub mod gpu;
 pub mod imports;
 pub mod ordinals;
+pub mod ucode;
 pub mod variables;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

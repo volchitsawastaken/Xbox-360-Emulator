@@ -294,6 +294,16 @@ Terminal states only: impossible, done, or something rendering.
       hits return `SUCCESS`, misses `NOT_FOUND`, system modules
       `UNSUCCESSFUL` (reference base-class behavior). Boot setups
       plumb `info.resources`; unit-tested incl. served values.
+- [x] Shader-ucode structural validation (`kernel::ucode`,
+      reference `ucode.h` unpack + `AnalyzeUcode` bound +
+      translator clause slots): CF unpack, exec extents, census.
+      Deliberately first-exec-sequential (NOT the reference
+      min-over-all: clause triples like `[0xC8..,0,0xE2..]`
+      decode as `exec@0` and collapse the reference heuristic —
+      observed on retail Braid uploads). `IM_LOAD` validates
+      log-only (storage unconditional); retail Braid vs24/ps9
+      validate clean (vs: 3 CF pairs, 4 execs, 2 allocs; ps:
+      1 pair, exec_end, colors alloc). Unit-tested synthetic.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
