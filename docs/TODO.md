@@ -168,8 +168,8 @@ Terminal states only: impossible, done, or something rendering.
       of either object anywhere (no KeSetEvent/Pulse, no semaphore
       posts, no timer fires). Static disassembly of the registered
       GPU callback `0x82181718`: branches on source==1, uses
-      `KeAcquire/ReleaseSpinLockAtRaisedIrql` (currently
-      unimplemented — needed when interrupts ever fire), compares
+      `KeAcquire/ReleaseSpinLockAtRaisedIrql` (implemented since,
+      with IRQL tracking; unit-tested), compares
       against a game-local `0x0BADF00D` sentinel (distinct from the
       PM4 `0xBAADF00D` skip word); no KeSetEvent in its head,
       tails call into `0x821836B0`/`0x82192490` (untraced).
@@ -188,10 +188,14 @@ Terminal states only: impossible, done, or something rendering.
       the cause: even finite it would spin like worker1 since no
       event is ever set). Signal map exhausted everywhere except
       GPU completion: no KeSetEvent/Pulse, no semaphore posts,
-      no timer fires, callback registered but sourceless.
-      NEXT: spinlock shims (callback path), then the missing
-      signal source (GPU completion for init packets vs D3D
-      device state) — draw backend / device work continues to be
+      no timer fires. Free-running vblank (implemented since)
+      delivers the callback 94x per boot on source 0 with no
+      effect (its source-0 path sets no events); source==1 still
+      needs genuine GPU completion the game never submits
+      pre-device. Shaders unblocked separately: retail vs/ps run
+      end to end in `run_cf` (`retail_shaders_interpret` gate).
+      NEXT: the missing signal source (GPU completion for init
+      packets vs D3D device state) — draw backend / device work continues to be
       the unblocker, now with the callback's requirements mapped
 - [ ] Dash frontier (HostDirFs boot): walk starts ~1.16M steps in
       (past the 1M gate — the gate stays a progress floor, not the
