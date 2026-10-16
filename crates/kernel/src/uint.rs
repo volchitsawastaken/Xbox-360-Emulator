@@ -471,6 +471,59 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
     let vec_three = matches!(vop, 11..=14 | 17);
     match sop {
         50 => {}
+        5..=13 => {
+            // Single-component compares and fractions (reference
+            // `kMaxs`..`kFloors`): maxs/mins use W and X, the rest
+            // only W.
+            let (a, b) = fetch_scalar_pair(core, consts, ins, vec_three)?;
+            core.previous_scalar = match sop {
+                5 => {
+                    if a < b {
+                        b
+                    } else {
+                        a
+                    }
+                }
+                6 => {
+                    if a < b {
+                        a
+                    } else {
+                        b
+                    }
+                }
+                7 => {
+                    if a == 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                8 => {
+                    if a > 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                9 => {
+                    if a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                10 => {
+                    if a != 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                11 => a - a.floor(),
+                12 => a.trunc(),
+                _ => a.floor(),
+            };
+        }
         0 | 1 | 2 | 3 | 4 | 23 | 24 | 25 | 26 => {
             let (a, b) = fetch_scalar_pair(core, consts, ins, vec_three)?;
             match sop {
@@ -913,5 +966,30 @@ mod tests {
         eval_alu(&mut core, &[], &parse_alu(&d)).unwrap();
         assert!(core.predicate);
         assert_eq!(core.temps[1], [8.0, 8.0, 8.0, 8.0]);
+    }
+
+    #[test]
+    fn scalar_compare_fraction_batch() {
+        fn op(sop: u32) -> [u32; 3] {
+            [(3 << 8) | (1 << 20) | ((sop & 0x3F) << 26), 0, (2 << 24)]
+        }
+        let mut core = ShaderCore::default();
+        // maxs keeps NaN in a; mins picks the lesser.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, f32::NAN]], &parse_alu(&op(5))).unwrap();
+        assert!(core.previous_scalar.is_nan());
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 2.0]], &parse_alu(&op(6))).unwrap();
+        assert_eq!(core.previous_scalar, 0.0);
+        // seqs/sgts/sges/snes on c0.w: 0.0 -> [1,0,1,0].
+        for (sop, want) in [(7, 1.0), (8, 0.0), (9, 1.0), (10, 0.0)] {
+            eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(sop))).unwrap();
+            assert_eq!(core.previous_scalar, want);
+        }
+        // frcs(-1.5) = 0.5; truncs/floors exact.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, -1.5]], &parse_alu(&op(11))).unwrap();
+        assert_eq!(core.previous_scalar, 0.5);
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, -1.5]], &parse_alu(&op(12))).unwrap();
+        assert_eq!(core.previous_scalar, -1.0);
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, -1.5]], &parse_alu(&op(13))).unwrap();
+        assert_eq!(core.previous_scalar, -2.0);
     }
 }

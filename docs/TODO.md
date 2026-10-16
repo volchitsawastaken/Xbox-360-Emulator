@@ -399,6 +399,11 @@ Terminal states only: impossible, done, or something rendering.
       eval) with the opcode-derived temp index, flushed + negated
       operands, `abs_constants` correctly ignored (dead in the
       reference interpreter too). Unit-tested.
+- [x] ALU scalar compare/fraction batch (`kernel::uint`):
+      maxs/mins (two-component, NaN-quiet), seqs/sgts/sges/
+      snes, frcs/truncs/floors. Scalar ALU now complete (all
+      defined opcodes; undefined ordinals stay `Unsupported`).
+      Unit-tested.
 - [x] ALU prev/setp/address ops (`kernel::uint`, reference arms):
       adds_prev/muls_prev/muls_prev2/subs_prev chaining `ps`,
       maxas/maxasf writing the address register (exact clamp+
