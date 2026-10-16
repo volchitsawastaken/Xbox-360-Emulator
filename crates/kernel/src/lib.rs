@@ -137,6 +137,12 @@ pub struct Kernel {
     /// to host GPU is pending draw-backend work).
     pub vd_vs_ucode: Vec<u32>,
     pub vd_ps_ucode: Vec<u32>,
+    /// EDRAM backing (10 MiB, zeroed at power-on like DRAM; reference
+    /// size from `xenos.h`). Games must clear before use, so zeros are
+    /// a faithful power-on state for the clear/resolve path below.
+    /// Draws are still pending — only solid fills are representable
+    /// (tiling-independent); patterned content needs detiling.
+    pub vd_edram: Vec<u8>,
     /// `VdSwap` presents issued (for tests/forensics; no draw backend
     /// yet, but each present queues the vblank interrupt exactly like
     /// reference `MarkVblank`).
@@ -330,6 +336,7 @@ impl Kernel {
             vd_delivered: 0,
             vd_vs_ucode: Vec::new(),
             vd_ps_ucode: Vec::new(),
+            vd_edram: vec![0; crate::gpu::EDRAM_SIZE],
             vd_swaps: 0,
             vd_gpu_identifier: None,
             vd_studio_rgb: None,

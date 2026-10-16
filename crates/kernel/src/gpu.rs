@@ -66,6 +66,11 @@ const MAX_IB_DEPTH: u32 = 8;
 /// Runaway guard per pump call (packets, not steps).
 const MAX_PACKETS: u64 = 1_000_000;
 
+/// EDRAM size in bytes (reference `xenos.h`: `kEdramTileCount(2048)`
+/// × `kEdramTileHeightSamples(16)` × `kEdramTileWidthSamples(80)` ×
+/// 4 bytes = 10 MiB).
+pub const EDRAM_SIZE: usize = 2048 * 16 * 80 * 4;
+
 /// Per-batch execution stats (tests + TEMP forensics).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GpuExecStats {
@@ -597,6 +602,41 @@ fn xenos_max_wh() -> u32 {
     8192
 }
 
+impl Kernel {
+    /// Fill EDRAM with a solid 32bpp value (PPC byte order per unit;
+    /// reference clear values come from `RB_COLOR_CLEAR`). Exact for
+    /// solid fills regardless of tiling (every sample identical);
+    /// patterned content needs the tiled layout (pending).
+    pub fn edram_clear_32bpp(&mut self, color: u32) {
+        let b = color.to_be_bytes();
+        let mut i = 0;
+        while i + 4 <= self.vd_edram.len() {
+            self.vd_edram[i..i + 4].copy_from_slice(&b);
+            i += 4;
+        }
+    }
+
+    /// Resolve the first `size` EDRAM bytes linearly to guest `dest`
+    /// (reference resolve copies EDRAM→DRAM; the tiled→linear detile
+    /// is an identity for solid fills, which is all EDRAM can hold
+    /// until draws land). Out-of-range dest/size are explicit errors.
+    pub fn edram_resolve(&self, mem: &mut Memory, dest: u32, size: usize) -> Result<()> {
+        if size > EDRAM_SIZE {
+            return Err(EmuError::Other(format!(
+                "resolve size {} exceeds EDRAM {}",
+                size, EDRAM_SIZE
+            )));
+        }
+        if size == 0 {
+            return Ok(());
+        }
+        let src = &self.vd_edram[..size];
+        mem.write_bytes(dest, src)
+            .map_err(|e| EmuError::Other(format!("resolve dest {:08x}: {}", dest, e)))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,5 +847,31 @@ mod tests {
         assert_eq!(st.invalidates, 1);
         assert_eq!(st.draws_seen, 1);
         assert_eq!(st.skipped_packets, 0);
+    }
+
+    #[test]
+    fn edram_clear_resolve_roundtrip() {
+        assert_eq!(EDRAM_SIZE, 10 * 1024 * 1024);
+        let mut k = kernel();
+        let mut m = Memory::new();
+        // Power-on state resolves as zeros.
+        k.edram_resolve(&mut m, 0x0100_A000, 16).unwrap();
+        assert_eq!(m.read_u32(0x0100_A000).unwrap(), 0);
+        // Solid clear lands in DRAM byte-exact (PPC order per unit).
+        k.edram_clear_32bpp(0xFF00_00FF);
+        assert_eq!(
+            &k.vd_edram[..8],
+            &[0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF]
+        );
+        k.edram_resolve(&mut m, 0x0100_A000, 8).unwrap();
+        assert_eq!(m.read_u32(0x0100_A000).unwrap(), 0xFF00_00FF);
+        assert_eq!(m.read_u32(0x0100_A004).unwrap(), 0xFF00_00FF);
+        // Zero-size resolve is a no-op success.
+        k.edram_resolve(&mut m, 0x0100_A000, 0).unwrap();
+        // Oversize and OOB dest are explicit errors.
+        assert!(k
+            .edram_resolve(&mut m, 0x0100_A000, EDRAM_SIZE + 4)
+            .is_err());
+        assert!(k.edram_resolve(&mut m, 0xFFFF_FFF0, 16).is_err());
     }
 }

@@ -249,8 +249,14 @@ Terminal states only: impossible, done, or something rendering.
       `DRAW_INDX_2` (0x36) length-skips but COUNTS draws_seen (draw
       demand signal, never silent); unit-tested. Retail Braid uploads
       one shader in init (now stored); no draws issued pre-device.
-- [ ] Draw backend remainder (shader translation + EDRAM/resolve/
-      present — the substantial part)
+- [ ] Draw backend remainder (shader translation + resolve wiring
+      into swap/present + EDRAM tiling for patterned content — the
+      substantial part; solid clear/resolve state done below)
+- [x] EDRAM clear/resolve state (reference `xenos.h` 10 MiB sizing):
+      10 MiB backing, solid-32bpp clear (tiling-independent, exact),
+      linear resolve to DRAM with explicit OOB errors; unit-tested.
+      Patterned content needs detiling (pending); swap→present wiring
+      pending.
 - [x] Dash pipeline test (`dash_pipeline`, gated on `X360_DASH_DIR`):
       dash.xex parses/decompresses to 10 PE sections with entry
       `0x92196610` covered, 1628 imports — loader drift excluded for
