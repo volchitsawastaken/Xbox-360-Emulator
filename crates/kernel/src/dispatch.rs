@@ -2102,15 +2102,18 @@ fn ke_wait_single(
     if kernel.ke_events.contains_key(&ptr) || kernel.adopt_ke_event(mem, ptr) {
         match kernel.ke_wait_single(mem, ptr) {
             Ok(true) => {
+                kernel.record_ke_wait(ptr, true, timeout_ptr == 0);
                 t.gpr[3] = (STATUS_SUCCESS) as u64;
             }
             Ok(false) => {
                 if timeout_ptr == 0 {
+                    kernel.record_ke_wait(ptr, false, true);
                     return Err(EmuError::Blocked(format!(
                         "ke wait on {:08x} with infinite timeout",
                         ptr
                     )));
                 }
+                kernel.record_ke_wait(ptr, false, false);
                 let _ = mem.read_u64(timeout_ptr).unwrap_or(0);
                 t.gpr[3] = (STATUS_TIMEOUT) as u64;
             }
@@ -6064,6 +6067,92 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.gpr[3] as u32, 0);
+    }
+
+    #[test]
+    fn wait_outcomes_record_per_object() {
+        use x360_common::EmuError;
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let ev = 0x8400_5200;
+        // Init manual (type 0), nonsignaled.
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x70),
+        )
+        .unwrap();
+        // Finite wait on unsignaled: TIMEOUT + recorded.
+        let to = 0x8400_5210;
+        m.write_u64(to, 0xFFFF_FFFB_6C20_0000).unwrap();
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = to as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_TIMEOUT);
+        // Infinite wait on unsignaled: Blocked + recorded.
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        let e = dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .expect_err("must block");
+        assert!(matches!(e, EmuError::Blocked(_)));
+        // Signal, then success wait: recorded.
+        t.gpr[3] = ev as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x9D),
+        )
+        .unwrap();
+        t.gpr[3] = ev as u64;
+        t.gpr[4] = 3;
+        t.gpr[5] = 1;
+        t.gpr[6] = 0;
+        t.gpr[7] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            7,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB0),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_SUCCESS);
+        let w = k.wait_ke.get(&ev).copied().unwrap_or_default();
+        assert_eq!((w.success, w.timeout, w.blocked), (1, 1, 1));
+        assert_eq!(k.signal_ke_set, 1);
     }
 
     #[test]

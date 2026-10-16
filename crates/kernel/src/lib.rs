@@ -41,6 +41,19 @@ struct Event {
 /// Read-window result: (backing bytes, start, length, NTSTATUS).
 pub type FileReadResult = std::result::Result<(Arc<[u8]>, u64, usize, u32), u32>;
 
+/// Wait-outcome counts for one sync object (forensics).
+///
+/// Reference `xevent.cc` / `xsemaphore.cc` / `xmutant.cc` wait semantics
+/// (facts only): a wait acquires when signaled, else reports TIMEOUT for
+/// a finite timeout or blocks cooperatively for an infinite one. Counts
+/// are observational — they record polls, never synthesize signals.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WaitOutcome {
+    pub success: u64,
+    pub timeout: u64,
+    pub blocked: u64,
+}
+
 /// Kernel state. Owns scheduling and objects.
 pub struct Kernel {
     next_handle: u32,
@@ -166,6 +179,19 @@ pub struct Kernel {
     /// Studio (limited-range) RGB selection (recorded from
     /// `VdSetStudioRGBMode` for the GPU backend).
     pub vd_studio_rgb: Option<u32>,
+    /// Wait-outcome histogram by guest address (Ke, reference
+    /// `KeInitializeEvent` in-place objects) and by handle (NT,
+    /// reference `xobject.h` table). Observational only.
+    pub wait_ke: HashMap<u32, WaitOutcome>,
+    pub wait_nt: HashMap<u32, WaitOutcome>,
+    /// Genuine signal mutations (reference `XEvent::Set` / `Pulse`,
+    /// `XSemaphore::ReleaseSemaphore`; facts only): incremented on
+    /// success, never synthesized.
+    pub signal_ke_set: u64,
+    pub signal_ke_pulse: u64,
+    pub signal_nt_set: u64,
+    pub signal_nt_pulse: u64,
+    pub signal_sem_release: u64,
     /// Loaded module facts for RtlImageXexHeaderField / XexGetModule*.
     pub image_base: u32,
     pub image_size: u32,
@@ -369,6 +395,13 @@ impl Kernel {
             vd_last_vblank: None,
             vd_gpu_identifier: None,
             vd_studio_rgb: None,
+            wait_ke: HashMap::new(),
+            wait_nt: HashMap::new(),
+            signal_ke_set: 0,
+            signal_ke_pulse: 0,
+            signal_nt_set: 0,
+            signal_nt_pulse: 0,
+            signal_sem_release: 0,
             image_base: 0,
             image_size: 0,
             title_id: 0,
@@ -846,6 +879,7 @@ impl Kernel {
             .ok_or_else(|| EmuError::Other(format!("bad NT event {:08x}", handle)))?;
         let prev = i32::from(e.signaled);
         e.signaled = true;
+        self.signal_nt_set += 1;
         Ok(prev)
     }
 
@@ -869,6 +903,7 @@ impl Kernel {
             .ok_or_else(|| EmuError::Other(format!("bad NT event {:08x}", handle)))?;
         let prev = i32::from(e.signaled);
         e.signaled = false;
+        self.signal_nt_pulse += 1;
         Ok(prev)
     }
 
@@ -916,6 +951,7 @@ impl Kernel {
         let prev = i32::from(e.signaled);
         e.signaled = true;
         let _ = mem.write_u32(ptr + 4, 1);
+        self.signal_ke_set += 1;
         Ok(prev)
     }
 
@@ -931,6 +967,7 @@ impl Kernel {
         let prev = i32::from(e.signaled);
         e.signaled = false;
         let _ = mem.write_u32(ptr + 4, 0);
+        self.signal_ke_pulse += 1;
         Ok(prev)
     }
 
@@ -1010,6 +1047,34 @@ impl Kernel {
         Ok(true)
     }
 
+    /// Record one wait outcome for forensics (reference wait semantics;
+    /// facts only). `success` = acquired, `timeout` = finite wait
+    /// reported TIMEOUT, `blocked` = infinite wait reported Blocked for
+    /// cooperative rewind-retry. Invalid handles are not recorded here
+    /// (the caller reports INVALID_HANDLE instead).
+    pub fn record_ke_wait(&mut self, addr: u32, success: bool, infinite: bool) {
+        let e = self.wait_ke.entry(addr).or_default();
+        if success {
+            e.success += 1;
+        } else if infinite {
+            e.blocked += 1;
+        } else {
+            e.timeout += 1;
+        }
+    }
+
+    /// Record one NT-handle wait outcome (see `record_ke_wait`).
+    pub fn record_nt_wait(&mut self, handle: u32, success: bool, infinite: bool) {
+        let e = self.wait_nt.entry(handle).or_default();
+        if success {
+            e.success += 1;
+        } else if infinite {
+            e.blocked += 1;
+        } else {
+            e.timeout += 1;
+        }
+    }
+
     /// Create an NT semaphore. Validates `0 <= count <= limit > 0`
     /// (reference `XSemaphore::Initialize` fails otherwise).
     pub fn nt_create_semaphore(
@@ -1054,6 +1119,7 @@ impl Kernel {
         }
         let prev = s.count;
         s.count += release;
+        self.signal_sem_release += 1;
         Ok(prev)
     }
 
@@ -1717,5 +1783,37 @@ mod tests {
         m.write_u32(MMIO_BASE + 0x01C5 * 4, 0xBAAD_F00D).unwrap();
         k.pump_gpu(&mut m).unwrap();
         assert_eq!((k.vd_wptr_seen, k.vd_rptr), (0x19, 0x19));
+    }
+
+    #[test]
+    fn wait_signal_forensics_count_genuine_mutations() {
+        use x360_memory::Memory;
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        assert_eq!(k.signal_ke_set, 0);
+        assert_eq!(k.signal_nt_set, 0);
+        assert!(k.wait_ke.is_empty());
+        assert!(k.wait_nt.is_empty());
+        k.ke_init_event(&mut m, 0x8400_5000, 1, 0).unwrap();
+        k.record_ke_wait(0x8400_5000, false, false);
+        k.ke_set_event(&mut m, 0x8400_5000).unwrap();
+        k.record_ke_wait(0x8400_5000, true, false);
+        k.ke_pulse_event(&mut m, 0x8400_5000).unwrap();
+        let w = k.wait_ke.get(&0x8400_5000).copied().unwrap_or_default();
+        assert_eq!((w.success, w.timeout, w.blocked), (1, 1, 0));
+        assert_eq!(k.signal_ke_set, 1);
+        assert_eq!(k.signal_ke_pulse, 1);
+        let h = k.nt_create_event(&mut m, 0, false).unwrap();
+        k.record_nt_wait(h, false, true);
+        k.nt_set_event(h).unwrap();
+        k.record_nt_wait(h, true, false);
+        k.nt_pulse_event(h).unwrap();
+        let w = k.wait_nt.get(&h).copied().unwrap_or_default();
+        assert_eq!((w.success, w.timeout, w.blocked), (1, 0, 1));
+        assert_eq!(k.signal_nt_set, 1);
+        assert_eq!(k.signal_nt_pulse, 1);
+        let s = k.nt_create_semaphore(&mut m, 0, 4).unwrap();
+        k.nt_release_semaphore(s, 2).unwrap();
+        assert_eq!(k.signal_sem_release, 1);
     }
 }

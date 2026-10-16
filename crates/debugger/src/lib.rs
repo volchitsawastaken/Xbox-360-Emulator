@@ -93,6 +93,19 @@ impl TraceBuffer {
     pub fn clear(&mut self) {
         self.events.clear();
     }
+
+    /// Per-thread program counters, oldest-first, for forensics.
+    ///
+    /// Groups the retained trace window by Xenon slot id (the
+    /// `thread` field wired by the boot runner). Used to attribute
+    /// table-walk frontiers and wait loops without re-scanning text.
+    pub fn per_thread_pcs(&self) -> std::collections::HashMap<u32, Vec<u32>> {
+        let mut map: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        for ev in self.iter() {
+            map.entry(ev.thread).or_default().push(ev.pc);
+        }
+        map
+    }
 }
 
 impl Default for TraceBuffer {
