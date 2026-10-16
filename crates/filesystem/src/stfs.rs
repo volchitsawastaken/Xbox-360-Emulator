@@ -462,7 +462,7 @@ mod tests {
             is_dir: false,
             parent: 0xFFFF,
             start_block: 1,
-            length: 0x1001 as u32,
+            length: 0x1001,
         };
         assert!(stfs.read_file(&long).is_err());
     }

@@ -194,13 +194,13 @@ mod integration {
         }
         assert!(!sections.is_empty());
         if let Some(entry) = info.entry_point {
-            let rel = entry.wrapping_sub(info.base_address);
-            assert!(
-                sections.iter().any(|s| (s.virt_addr as usize) < image.len()
-                    && rel >= s.virt_addr
-                    && rel < s.virt_addr + s.virt_size.max(1)),
-                "game entry not covered"
-            );
+            x360_loader::image::check_entry_covered(
+                image.len(),
+                info.base_address,
+                entry,
+                &sections,
+            )
+            .expect("game entry not covered");
         }
     }
 
@@ -233,13 +233,13 @@ mod integration {
         );
         assert!(!sections.is_empty());
         if let Some(entry) = info.entry_point {
-            let rel = entry.wrapping_sub(info.base_address);
-            assert!(
-                sections.iter().any(|s| (s.virt_addr as usize) < image.len()
-                    && rel >= s.virt_addr
-                    && rel < s.virt_addr + s.virt_size.max(1)),
-                "dash entry not covered"
-            );
+            x360_loader::image::check_entry_covered(
+                image.len(),
+                info.base_address,
+                entry,
+                &sections,
+            )
+            .expect("dash entry not covered");
         }
     }
 
@@ -519,13 +519,13 @@ mod integration {
             x360_loader::image::loadable_image(&data, &hdr, &info).expect("game decompresses");
         let sections = x360_loader::image::parse_pe_sections(&image).expect("game PE parses");
         if let Some(entry) = info.entry_point {
-            let rel = entry.wrapping_sub(info.base_address);
-            assert!(
-                sections.iter().any(|s| (s.virt_addr as usize) < image.len()
-                    && rel >= s.virt_addr
-                    && rel < s.virt_addr + s.virt_size.max(1)),
-                "game entry not covered"
-            );
+            x360_loader::image::check_entry_covered(
+                image.len(),
+                info.base_address,
+                entry,
+                &sections,
+            )
+            .expect("game entry not covered");
         }
         let mut mem = Memory::new();
         x360_loader::image::load_image_to_guest(&mut mem, &image, info.base_address)
@@ -637,8 +637,10 @@ mod integration {
                 for ev in events.iter().skip(events.len().saturating_sub(400)) {
                     println!("th{} {:08x}: {}", ev.thread, ev.pc, ev.disasm);
                 }
-                // Full trace to TEMP for dataflow forensics.
-                {
+                // Full trace dump is opt-in (`$X360_TRACE_DUMP`): the gate
+                // itself stays dump-free, passing or failing on stdout
+                // alone. Quarantine stays outside the repo (TEMP) when set.
+                if std::env::var("X360_TRACE_DUMP").is_ok() {
                     let p = std::env::temp_dir().join("braid_trace.log");
                     match x360_debugger::write_trace_file(&p, &trace) {
                         Ok(n) => println!("full trace ({} events) -> {}", n, p.display()),

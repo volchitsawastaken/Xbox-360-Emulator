@@ -739,7 +739,7 @@ mod tests {
         assert!(entry_covered(image.len(), base, base + 0x2000, &sections));
         assert!(!entry_covered(image.len(), base, base + 0x2001, &sections));
         // A section past the image end never covers, even on an exact hit.
-        let tiny = vec![0u8; 64];
+        let tiny = [0u8; 64];
         let past = vec![PeSection {
             name: ".reloc".into(),
             virt_addr: 0x50000,
