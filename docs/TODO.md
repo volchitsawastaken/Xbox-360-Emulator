@@ -338,6 +338,12 @@ Terminal states only: impossible, done, or something rendering.
       position/interpolators/colors/export, `cnop`; control
       opcodes beyond exec/alloc print raw words). Exact-output
       unit tests on synthetic vs/ps shapes.
+- [x] ALU clause decode (`kernel::ucode`, reference `ucode.h`
+      `AluInstruction::Data` LSB0 layout): vector/scalar opcodes
+      with exact disassembly names (50+30, incl. the
+      `opcode_NN` placeholders), dests, write masks, export bit,
+      per-source reg/sel/swizzle/negate with `r#`/`c#`
+      resolution. One-line disassembly. Exact-output unit tests.
 - [x] Spinlocks (`KfAcquireSpinLock` 0xB1 /
       `KeAcquireSpinLockAtRaisedIrql` 0x4D, `KfReleaseSpinLock`
       0xB4 / `KeReleaseSpinLockFromRaisedIrql` 0x89,

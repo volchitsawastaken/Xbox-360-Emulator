@@ -297,6 +297,265 @@ pub fn validate_ucode(dwords: &[u32]) -> Result<UcodeStats> {
     Ok(st)
 }
 
+/// One decoded ALU clause instruction (3 dwords).
+///
+/// Bit layout facts ported from the BSD-licensed Xenia `ucode.h`
+/// `AluInstruction::Data` (three 32-bit structs, LSB0 packing):
+/// d0 = vector_dest[0:6], vector_dest_rel[6], abs_constants[7],
+/// scalar_dest[8:14], scalar_dest_rel[14], export_data[15],
+/// vector_write_mask[16:20], scalar_write_mask[20:24],
+/// vector_clamp[24], scalar_clamp[25], scalar_opc[26:32];
+/// d1 = src3/2/1_swiz[0:8,8:16,16:24], src3/2/1_reg_negate[24,25,26],
+/// pred_condition[27], is_predicated[28],
+/// const_address_register_relative[29], const_1_rel_abs[30],
+/// const_0_rel_abs[31];
+/// d2 = src3/2/1_reg[0:8,8:16,16:24], vector_opc[24:29],
+/// src3/2/1_sel[29,30,31] (set = temp r#, clear = const c#).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AluInstr {
+    /// Raw clause dwords.
+    pub dwords: [u32; 3],
+}
+
+/// Wrap 3 clause dwords as an ALU instruction (no validation; the
+/// caller selects ALU slots via the exec sequence bits).
+pub fn parse_alu(dwords: &[u32; 3]) -> AluInstr {
+    AluInstr { dwords: *dwords }
+}
+
+impl AluInstr {
+    fn d0(&self) -> u32 {
+        self.dwords[0]
+    }
+    fn d1(&self) -> u32 {
+        self.dwords[1]
+    }
+    fn d2(&self) -> u32 {
+        self.dwords[2]
+    }
+
+    /// Vector opcode (5 bits).
+    pub fn vector_opcode(&self) -> u32 {
+        (self.d2() >> 24) & 0x1F
+    }
+
+    /// Scalar opcode (6 bits).
+    pub fn scalar_opcode(&self) -> u32 {
+        self.d0() >> 26
+    }
+
+    /// Vector destination register.
+    pub fn vector_dest(&self) -> u32 {
+        self.d0() & 0x3F
+    }
+
+    /// Scalar destination register.
+    pub fn scalar_dest(&self) -> u32 {
+        (self.d0() >> 8) & 0x3F
+    }
+
+    /// Per-component write masks.
+    pub fn vector_write_mask(&self) -> u32 {
+        (self.d0() >> 16) & 0xF
+    }
+
+    /// Per-component write masks.
+    pub fn scalar_write_mask(&self) -> u32 {
+        (self.d0() >> 20) & 0xF
+    }
+
+    /// Export (memexport/stream-out) instruction.
+    pub fn is_export(&self) -> bool {
+        (self.d0() >> 15) & 1 != 0
+    }
+
+    /// Source register index (1-3) and temp-select bit.
+    pub fn src_reg(&self, i: u32) -> u32 {
+        match i {
+            1 => (self.d2() >> 16) & 0xFF,
+            2 => (self.d2() >> 8) & 0xFF,
+            _ => self.d2() & 0xFF,
+        }
+    }
+
+    /// Set = temp register (`r#`), clear = constant (`c#`).
+    pub fn src_is_temp(&self, i: u32) -> bool {
+        match i {
+            1 => (self.d2() >> 31) & 1 != 0,
+            2 => (self.d2() >> 30) & 1 != 0,
+            _ => (self.d2() >> 29) & 1 != 0,
+        }
+    }
+
+    /// Source negate flag.
+    pub fn src_negate(&self, i: u32) -> bool {
+        match i {
+            1 => (self.d1() >> 26) & 1 != 0,
+            2 => (self.d1() >> 25) & 1 != 0,
+            _ => (self.d1() >> 24) & 1 != 0,
+        }
+    }
+
+    /// One source operand in disassembly form (`[-]rN` / `[-]cN`).
+    pub fn src_operand(&self, i: u32) -> String {
+        let reg = if self.src_is_temp(i) {
+            (self.src_reg(i) & 0x3F) as u8
+        } else {
+            self.src_reg(i) as u8
+        };
+        format!(
+            "{}{odef}{reg}",
+            if self.src_negate(i) { "-" } else { "" },
+            odef = if self.src_is_temp(i) { "r" } else { "c" },
+            reg = reg
+        )
+    }
+}
+
+/// Vector ALU opcode mnemonic (reference `kAluVectorOpcodeInfos`
+/// disassembly names, including the `opcode_NN` placeholders).
+pub fn alu_vector_opcode_name(op: u32) -> &'static str {
+    const NAMES: [&str; 32] = [
+        "add",
+        "mul",
+        "max",
+        "min",
+        "seq",
+        "sgt",
+        "sge",
+        "sne",
+        "frc",
+        "trunc",
+        "floor",
+        "mad",
+        "cndeq",
+        "cndge",
+        "cndgt",
+        "dp4",
+        "dp3",
+        "dp2add",
+        "cube",
+        "max4",
+        "setp_eq_push",
+        "setp_ne_push",
+        "setp_gt_push",
+        "setp_ge_push",
+        "kill_eq",
+        "kill_gt",
+        "kill_ge",
+        "kill_ne",
+        "dst",
+        "maxa",
+        "opcode_30",
+        "opcode_31",
+    ];
+    NAMES[op as usize & 31]
+}
+
+/// Scalar ALU opcode mnemonic (reference `kAluScalarOpcodeInfos`
+/// disassembly names, including the `opcode_NN` placeholders).
+pub fn alu_scalar_opcode_name(op: u32) -> &'static str {
+    const NAMES: [&str; 64] = [
+        "adds",
+        "adds_prev",
+        "muls",
+        "muls_prev",
+        "muls_prev2",
+        "maxs",
+        "mins",
+        "seqs",
+        "sgts",
+        "sges",
+        "snes",
+        "frcs",
+        "truncs",
+        "floors",
+        "exp",
+        "logc",
+        "log",
+        "rcpc",
+        "rcpf",
+        "rcp",
+        "rsqc",
+        "rsqf",
+        "rsq",
+        "maxas",
+        "maxasf",
+        "subs",
+        "subs_prev",
+        "setp_eq",
+        "setp_ne",
+        "setp_gt",
+        "setp_ge",
+        "setp_inv",
+        "setp_pop",
+        "setp_clr",
+        "setp_rstr",
+        "kills_eq",
+        "kills_gt",
+        "kills_ge",
+        "kills_ne",
+        "kills_one",
+        "sqrt",
+        "opcode_41",
+        "mulsc",
+        "mulsc",
+        "addsc",
+        "addsc",
+        "subsc",
+        "subsc",
+        "sin",
+        "cos",
+        "retain_prev",
+        "opcode_51",
+        "opcode_52",
+        "opcode_53",
+        "opcode_54",
+        "opcode_55",
+        "opcode_56",
+        "opcode_57",
+        "opcode_58",
+        "opcode_59",
+        "opcode_60",
+        "opcode_61",
+        "opcode_62",
+        "opcode_63",
+    ];
+    NAMES[op as usize & 63]
+}
+
+/// Write-mask component letters (`xyzw`, empty when masked out).
+fn mask_letters(mask: u32) -> String {
+    let mut s = String::new();
+    for (bit, ch) in [(0, 'x'), (1, 'y'), (2, 'z'), (3, 'w')] {
+        if mask & (1 << bit) != 0 {
+            s.push(ch);
+        }
+    }
+    s
+}
+
+/// One-line ALU disassembly (`alu <vec> <vdest> <scal> <sdest>
+/// src1=.. src2=.. src3=..`). Swizzles, clamps, predication, and
+/// export routing are not decoded yet (pending translation work).
+pub fn disassemble_alu(dwords: &[u32; 3]) -> String {
+    let a = parse_alu(dwords);
+    let vd = match mask_letters(a.vector_write_mask()) {
+        m if m.is_empty() => format!("r{}", a.vector_dest()),
+        m => format!("r{}.{}", a.vector_dest(), m),
+    };
+    format!(
+        "alu {} {} {} r{} src1={} src2={} src3={}",
+        alu_vector_opcode_name(a.vector_opcode()),
+        vd,
+        alu_scalar_opcode_name(a.scalar_opcode()),
+        a.scalar_dest(),
+        a.src_operand(1),
+        a.src_operand(2),
+        a.src_operand(3)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +735,29 @@ mod tests {
             disassemble_cf_instr(0, n, true),
             "0: cnop w0=00000000 w1=0000"
         );
+    }
+
+    #[test]
+    fn alu_decode_exact() {
+        // Synthetic triple: vector mad to r1 (mask xyzw), scalar
+        // adds from const, no export.
+        // d0: vd=1 | sd=2<<8 | vmask=0xF<<16 | opc(scalar=0)<<26.
+        // d1: zero swizzles/flags. d2: src3/2/1 regs 6,5,4 | vec opc 11<<24.
+        let d = [0x000F_0201u32, 0x0000_0000, 0x0B04_0506];
+        let a = parse_alu(&d);
+        assert_eq!(a.vector_opcode(), 11);
+        assert_eq!(alu_vector_opcode_name(11), "mad");
+        assert_eq!(a.scalar_opcode(), 0);
+        assert_eq!(alu_scalar_opcode_name(0), "adds");
+        assert_eq!((a.vector_dest(), a.scalar_dest()), (1, 2));
+        assert_eq!((a.vector_write_mask(), a.scalar_write_mask()), (0xF, 0));
+        assert_eq!((a.src_reg(1), a.src_reg(2), a.src_reg(3)), (4, 5, 6));
+        assert_eq!(
+            disassemble_alu(&d),
+            "alu mad r1.xyzw adds r2 src1=c4 src2=c5 src3=c6"
+        );
+        // Reference placeholder names for undefined opcodes.
+        assert_eq!(alu_scalar_opcode_name(41), "opcode_41");
+        assert_eq!(alu_vector_opcode_name(30), "opcode_30");
     }
 }
