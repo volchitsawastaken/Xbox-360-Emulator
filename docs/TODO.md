@@ -331,6 +331,13 @@ Terminal states only: impossible, done, or something rendering.
       log-only (storage unconditional); retail Braid vs24/ps9
       validate clean (vs: 3 CF pairs, 4 execs, 2 allocs; ps:
       1 pair, exec_end, colors alloc). Unit-tested synthetic.
+- [x] CF disassembler (`kernel::ucode::disassemble_cf`):
+      one line per CF instruction with reference mnemonics
+      (`exec`/`exece`, `cexec`/`cexece` + bool, `(p0)` predicated,
+      `loop`/`endloop`, `call`, `ret`, `jmp`, `alloc`
+      position/interpolators/colors/export, `cnop`; control
+      opcodes beyond exec/alloc print raw words). Exact-output
+      unit tests on synthetic vs/ps shapes.
 - [x] Spinlocks (`KfAcquireSpinLock` 0xB1 /
       `KeAcquireSpinLockAtRaisedIrql` 0x4D, `KfReleaseSpinLock`
       0xB4 / `KeReleaseSpinLockFromRaisedIrql` 0x89,

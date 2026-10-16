@@ -18,9 +18,10 @@
 //! - Opcode values + exec/end sets (`ucode.h` `ControlFlowOpcode`,
 //!   `IsControlFlowOpcodeExec`, `DoesControlFlowOpcodeEndShader`).
 //!
-//! Scope: structural validation only (length, CF bound, exec extents,
-//! end-opcode census). No translation, no execution. Invalid uploads
-//! are explicit errors, never silent acceptance.
+//! Scope: structural validation + CF-program disassembly (exec
+//! extents, alloc targets, control flow). Clause (ALU/fetch)
+//! contents are not decoded yet. Invalid uploads are explicit
+//! errors, never silent acceptance.
 
 use x360_common::{EmuError, Result};
 
@@ -43,6 +44,8 @@ pub struct CfInstr {
     pub opcode: u32,
     /// Word 0 (address/count/sequence holder for exec-like opcodes).
     pub word0: u32,
+    /// Word 1 (alloc size/type holder; exec predicate-clean flag).
+    pub word1: u32,
 }
 
 impl CfInstr {
@@ -55,6 +58,48 @@ impl CfInstr {
     pub fn count(&self) -> u32 {
         (self.word0 >> 12) & 7
     }
+
+    /// Sequence bits (exec `sequence_ : 12`, 2 per instruction).
+    pub fn sequence(&self) -> u32 {
+        (self.word0 >> 16) & 0xFFF
+    }
+
+    /// Alloc size (alloc `size_ : 3`).
+    pub fn alloc_size(&self) -> u32 {
+        self.word0 & 7
+    }
+
+    /// Alloc type (alloc `alloc_type_ : 2` at word1 bits 9-10).
+    pub fn alloc_type(&self) -> u32 {
+        (self.word1 >> 9) & 3
+    }
+}
+
+/// CF opcode mnemonic (reference `ucode.h` `ControlFlowOpcode`).
+/// CF opcode mnemonic (reference `shader_translator.cc`
+/// `ParseControlFlow*` `opcode_name` + `shader_translator_disasm.cc`).
+pub fn cf_opcode_name(op: u32) -> &'static str {
+    match op {
+        0 => "cnop",
+        1 => "exec",
+        2 => "exece",
+        3 => "cexec",
+        4 => "cexece",
+        // 5/6 print as exec/exece with a (p0)/(!p0) prefix.
+        5 => "exec",
+        6 => "exece",
+        7 => "loop",
+        8 => "endloop",
+        9 => "call",
+        10 => "ret",
+        11 => "jmp",
+        12 => "alloc",
+        13 => "cexec",
+        14 => "cexece",
+        // 15 prints nothing in the reference.
+        15 => "fetchdone",
+        _ => "?",
+    }
 }
 
 /// Unpack one 3-dword group into its 2 CF instructions (reference
@@ -65,12 +110,92 @@ pub fn unpack_cf_pair(dwords: &[u32; 3]) -> [CfInstr; 2] {
         CfInstr {
             opcode: (d1 & 0xFFFF) >> 12,
             word0: d0,
+            word1: d1 & 0xFFFF,
         },
         CfInstr {
             opcode: d2 >> 28,
             word0: (d1 >> 16) | (d2 << 16),
+            word1: d2 >> 16,
         },
     ]
+}
+
+/// Disassemble the CF program of an upload, one line per CF
+/// instruction (`index: mnemonic operands`). Validates first (same
+/// errors as [`validate_ucode`]). Exec lines show the covered clause
+/// slots; alloc lines name the target; control opcodes beyond
+/// exec/alloc print raw words (honest placeholder until clause
+/// translation lands). Mnemonics match the reference disassembler
+/// (`shader_translator_disasm.cc`, `ParseControlFlow*` names).
+pub fn disassemble_cf(dwords: &[u32], is_vertex_shader: bool) -> Result<Vec<String>> {
+    let st = validate_ucode(dwords)?;
+    let mut out = Vec::new();
+    for pair in 0..st.cf_pairs as usize {
+        let g = [dwords[3 * pair], dwords[3 * pair + 1], dwords[3 * pair + 2]];
+        for (j, ins) in unpack_cf_pair(&g).iter().enumerate() {
+            let idx = pair as u32 * 2 + j as u32;
+            out.push(disassemble_cf_instr(idx, *ins, is_vertex_shader));
+        }
+    }
+    Ok(out)
+}
+
+/// One CF instruction line (see [`disassemble_cf`]).
+pub fn disassemble_cf_instr(idx: u32, ins: CfInstr, is_vertex_shader: bool) -> String {
+    let name = cf_opcode_name(ins.opcode);
+    match ins.opcode {
+        // Exec family: slot range (+ bool/condition for cond forms).
+        1 | 2 => format!("{}: {} @{} x{}", idx, name, ins.address(), ins.count()),
+        3 | 4 | 13 | 14 => {
+            let bool_idx = (ins.word1 >> 2) & 0xFF;
+            let cond = (ins.word1 >> 10) & 1;
+            format!(
+                "{}: {} {}b{} @{} x{}",
+                idx,
+                name,
+                if cond != 0 { "" } else { "!" },
+                bool_idx,
+                ins.address(),
+                ins.count()
+            )
+        }
+        5 | 6 => {
+            let cond = (ins.word1 >> 10) & 1;
+            format!(
+                "{}: ({}) {} @{} x{}",
+                idx,
+                if cond != 0 { "p0" } else { "!p0" },
+                name,
+                ins.address(),
+                ins.count()
+            )
+        }
+        // Alloc: named target (reference `ParsedAllocInstruction`).
+        12 => {
+            let what = match ins.alloc_type() {
+                1 => "position".to_string(),
+                2 => {
+                    if is_vertex_shader {
+                        "interpolators".to_string()
+                    } else {
+                        "colors".to_string()
+                    }
+                }
+                3 => format!("export = {}", ins.alloc_size()),
+                _ => String::new(),
+            };
+            if what.is_empty() {
+                format!("{}: alloc", idx)
+            } else {
+                format!("{}: alloc {}", idx, what)
+            }
+        }
+        // The rest: mnemonic + raw words (no invented decode).
+        _ => format!(
+            "{}: {} w0={:08x} w1={:04x}",
+            idx, name, ins.word0, ins.word1
+        ),
+    }
 }
 
 /// Validation census for one shader upload.
@@ -266,5 +391,90 @@ mod tests {
             0x0000_0000, //
         ];
         assert!(validate_ucode(&bad).is_err());
+    }
+
+    #[test]
+    fn cf_disassembly_exact() {
+        let vs = vec![
+            0x0000_1003,
+            0x0000_1200,
+            0xC400_0000, //
+            0x0000_1004,
+            0x0000_1200,
+            0xC200_0000, //
+            0x0000_1005,
+            0x1006_1200,
+            0x2200_0000, //
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000, //
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000, //
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000, //
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000, //
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000, //
+        ];
+        assert_eq!(
+            disassemble_cf(&vs, true).unwrap(),
+            vec![
+                "0: exec @3 x1",
+                "1: alloc interpolators",
+                "2: exec @4 x1",
+                "3: alloc position",
+                "4: exec @5 x1",
+                "5: exece @6 x1",
+            ]
+        );
+        let ps = vec![
+            0x0000_0000,
+            0x1001_C400,
+            0x2200_0000, //
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000, //
+            0x0000_0000,
+            0x0000_0000,
+            0x0000_0000, //
+        ];
+        assert_eq!(
+            disassemble_cf(&ps, false).unwrap(),
+            vec!["0: alloc colors", "1: exece @1 x1",]
+        );
+        assert!(disassemble_cf(&[], true).is_err());
+    }
+
+    #[test]
+    fn cf_cond_and_raw_lines() {
+        let c = CfInstr {
+            opcode: 3,
+            word0: 0x0000_1003,
+            word1: 0x0000,
+        };
+        assert_eq!(disassemble_cf_instr(7, c, true), "7: cexec !b0 @3 x1");
+        let l = CfInstr {
+            opcode: 7,
+            word0: 0xABCD_EF01,
+            word1: 0x1234,
+        };
+        assert_eq!(
+            disassemble_cf_instr(2, l, true),
+            "2: loop w0=abcdef01 w1=1234"
+        );
+        let n = CfInstr {
+            opcode: 0,
+            word0: 0,
+            word1: 0,
+        };
+        assert_eq!(
+            disassemble_cf_instr(0, n, true),
+            "0: cnop w0=00000000 w1=0000"
+        );
     }
 }
