@@ -3662,6 +3662,51 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_d3d_resolution_end_to_end() {
+        // Game-style flow with no static D3D imports (retail Braid's
+        // shape): XexGetModuleHandle("xam.xex") ->
+        // XexGetProcedureAddress(D3DDevice_Clear) -> call the thunk.
+        let mut k = Kernel::new();
+        k.set_module_info(0x8200_0000, 0x1000, 0x5841_08CE);
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let (name_ptr, out) = (0x0115_6000, 0x0115_6100);
+        m.write_bytes(name_ptr, b"xam.xex\0").unwrap();
+        t.gpr[3] = name_ptr as u64;
+        t.gpr[4] = out as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x195),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, ERROR_SUCCESS);
+        assert_eq!(m.read_u32(out).unwrap(), XAM_HANDLE);
+        t.gpr[3] = XAM_HANDLE as u64;
+        t.gpr[4] = 0x8A4; // D3DDevice_Clear
+        t.gpr[5] = out as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x197),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, ERROR_SUCCESS);
+        let thunk = m.read_u32(out).unwrap();
+        let minted = tab.get(thunk).cloned().unwrap();
+        assert_eq!((minted.lib.as_str(), minted.ordinal), ("xam.xex", 0x8A4));
+        let err = dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &minted).unwrap_err();
+        assert!(err.to_string().contains("D3DDevice_Clear"));
+    }
+
+    #[test]
     fn xex_get_module_section_resolves() {
         let mut k = Kernel::new();
         k.set_module_info(0x8200_0000, 0x1000, 0x5841_08CE);
