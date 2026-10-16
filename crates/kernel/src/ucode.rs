@@ -438,10 +438,31 @@ impl AluInstr {
     }
 
     /// Any relative addressing (a0/aL): temp-relative dests or
-    /// const-addressing bits. Slice-1 evaluation is absolute-only;
-    /// see `has_relative_addressing`.
+    /// const-addressing bits. On exports the dest bits are not
+    /// addressing (reference `AluInstruction::Data`: the vector dest
+    /// "can't be relative" and `scalar_dest_rel` selects constant-0
+    /// components instead) — see export handling in `uint.rs`.
     pub fn has_relative_addressing(&self) -> bool {
-        ((self.d1() >> 29) & 7) != 0 || ((self.d0() >> 6) & 1) != 0 || ((self.d0() >> 14) & 1) != 0
+        if ((self.d1() >> 29) & 7) != 0 {
+            return true;
+        }
+        if self.is_export() {
+            return false;
+        }
+        ((self.d0() >> 6) & 1) != 0 || ((self.d0() >> 14) & 1) != 0
+    }
+
+    /// Vector destination relative flag (aL-indexed; never set on
+    /// well-formed exports per the reference layout comment).
+    pub fn is_vector_dest_relative(&self) -> bool {
+        (self.d0() >> 6) & 1 != 0
+    }
+
+    /// Scalar destination relative flag (aL-indexed; on exports this
+    /// bit instead selects constant-0 components, see
+    /// `GetConstant0WriteMask`).
+    pub fn is_scalar_dest_relative(&self) -> bool {
+        (self.d0() >> 14) & 1 != 0
     }
 
     /// One source operand in disassembly form (`[-]rN` / `[-]cN`).

@@ -20,10 +20,12 @@
 //!   `a < b` is false... precisely `isless(a,b) ? a : b`.
 //! - Scalar ops write `previous_scalar`; vector+scalar results are
 //!   clamped (`saturate`: NaN becomes +0) when flagged, then
-//!   written through the component masks (non-export only).
+//!   written through the component masks (temps) or merged into
+//!   the export registers for exports.
 //!
-//! Scope (slice 1): absolute addressing only; no exports (explicit
-//! error); vector add/mul/max/min/seq/sgt/sge/sne/frc/trunc/floor/
+//! Scope: absolute addressing only (export dest bits excluded per
+//! the reference layout — `scalar_dest_rel` selects const-0 there);
+//! vector add/mul/max/min/seq/sgt/sge/sne/frc/trunc/floor/
 //! mad/dp4/dp3/dp2add; scalar adds/adds_prev/muls/muls_prev/
 //! muls_prev2/subs/subs_prev/maxas/maxasf/setp_eq/ne/gt/ge/inv/
 //! pop/clr/rstr/kills_eq/gt/ge/ne/one/retain_prev plus the
@@ -53,6 +55,15 @@ pub struct ShaderCore {
     pub predicate: bool,
     /// Address register (`a0`, loop-relative base).
     pub address_register: i32,
+    /// Export registers (reference `ExportRegister`: 0-63 cover
+    /// VS interpolators/position/misc and PS colors/depth, plus
+    /// memexport address/data at 32-37). Zero-initialized; each
+    /// export instruction merges masked components into the
+    /// addressed slot. Memory writeback itself is draw-backend
+    /// business, not interpreter business.
+    pub exports: [[f32; 4]; 64],
+    /// Per-export-slot written-component mask (4 bits each).
+    pub export_written: [u32; 64],
 }
 
 impl Default for ShaderCore {
@@ -62,6 +73,8 @@ impl Default for ShaderCore {
             previous_scalar: 0.0,
             predicate: false,
             address_register: 0,
+            exports: [[0.0; 4]; 64],
+            export_written: [0; 64],
         }
     }
 }
@@ -229,9 +242,11 @@ fn d3d_mul(a: f32, b: f32) -> f32 {
 
 /// Evaluate one ALU clause instruction against the core, writing
 /// masked results (reference `ExecuteAluInstruction` vector op +
-/// scalar op + writeback; exports are an explicit error).
-/// Predicated-out instructions skip entirely (reference
-/// per-instruction check ahead of evaluation).
+/// scalar op + writeback). Predicated-out instructions skip
+/// entirely (reference per-instruction check ahead of evaluation).
+/// Exports merge into the core's export registers (reference
+/// export composition with vector/scalar/const0/const1 masks);
+/// memory writeback itself is draw-backend business.
 pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> Result<()> {
     if ins.is_predicated() && ins.pred_condition() != core.predicate {
         return Ok(());
@@ -240,9 +255,6 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
         return Err(EmuError::Unsupported(
             "alu: relative addressing pending".into(),
         ));
-    }
-    if ins.is_export() {
-        return Err(EmuError::Unsupported("alu: export sink pending".into()));
     }
     let vop = ins.vector_opcode();
     // Sources needed per opcode (reference
@@ -740,6 +752,46 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
     if ins.scalar_clamp() {
         sr = saturate(sr);
     }
+    if ins.is_export() {
+        // Export composition (reference `is_export` branch +
+        // `GetConstant0/1WriteMask`): both ops target the vector
+        // dest slot; per component, vector wins over scalar, then
+        // constant-1 (both masks), then constant-0 (scalar_dest_rel
+        // with neither mask), else the slot keeps its value.
+        if ins.is_vector_dest_relative() {
+            return Err(EmuError::Unsupported(
+                "alu: relative export dest malformed".into(),
+            ));
+        }
+        let idx = (ins.vector_dest() & 0x3F) as usize;
+        let vmask = ins.vector_write_mask();
+        let smask = ins.scalar_write_mask();
+        let vec_mask = vmask & !smask;
+        let scal_mask = smask & !vmask;
+        let const1 = vmask & smask;
+        let const0 = if ins.is_scalar_dest_relative() {
+            !(vmask | smask) & 0xF
+        } else {
+            0
+        };
+        for (i, (slot, v)) in core.exports[idx].iter_mut().zip(vr.iter()).enumerate() {
+            let bit = 1 << i;
+            if vec_mask & bit != 0 {
+                *slot = *v;
+                core.export_written[idx] |= bit;
+            } else if scal_mask & bit != 0 {
+                *slot = sr;
+                core.export_written[idx] |= bit;
+            } else if const1 & bit != 0 {
+                *slot = 1.0;
+                core.export_written[idx] |= bit;
+            } else if const0 & bit != 0 {
+                *slot = 0.0;
+                core.export_written[idx] |= bit;
+            }
+        }
+        return Ok(());
+    }
     // Dest fields are 6 bits (always in range); relative dests
     // were rejected above, so no wrapping is needed here.
     let vd = (ins.vector_dest() & 0x3F) as usize;
@@ -840,7 +892,13 @@ pub fn run_cf(
                         )));
                     }
                     let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
-                    eval_alu(core, consts, &parse_alu(&w))?;
+                    eval_alu(core, consts, &parse_alu(&w)).map_err(|e| match e {
+                        EmuError::Unsupported(s) => {
+                            EmuError::Unsupported(format!("cf: slot {}: {}", slot, s))
+                        }
+                        EmuError::Other(s) => EmuError::Other(format!("cf: slot {}: {}", slot, s)),
+                        other => other,
+                    })?;
                     stats.alu_executed += 1;
                 }
                 if is_end_opcode(ins.opcode) {
@@ -1184,5 +1242,36 @@ mod tests {
         let mut core = ShaderCore::default();
         let err = run_cf(&mut core, &words, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("pending"));
+    }
+
+    #[test]
+    fn export_capture_component_select() {
+        // Export to slot 3: x,w from vector add, y from scalar
+        // adds, z constant-0 (scalar_dest_rel, neither mask).
+        // vmask=0x9, smask=0x2.
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 2.0, 3.0, 4.0];
+        core.temps[5] = [10.0, 20.0, 30.0, 40.0];
+        // d0: vd=3 | scalar_dest_rel bit14 | export bit15 |
+        // vmask<<16 | smask<<20 | sop=adds(0).
+        let d0 = 3 | (1 << 14) | (1 << 15) | (0x9 << 16) | (0x2 << 20);
+        // Vector add r4+r5 (temp sels); scalar src3 const (OOB -> 0).
+        let d2 = (4 << 16) | (5 << 8) | (1 << 31) | (1 << 30);
+        eval_alu(&mut core, &[], &parse_alu(&[d0, 0, d2])).unwrap();
+        assert_eq!(core.exports[3], [11.0, 0.0, 0.0, 44.0]);
+        assert_eq!(core.export_written[3], 0xF);
+        // Temps untouched by exports.
+        assert_eq!(core.temps[3], [0.0; 4]);
+        // Constant-1: both masks set on z (vmask=0xF, smask=0x4).
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 2.0, 3.0, 4.0];
+        core.temps[5] = [10.0, 20.0, 30.0, 40.0];
+        let d0 = 5 | (1 << 15) | (0xF << 16) | (0x4 << 20);
+        eval_alu(&mut core, &[], &parse_alu(&[d0, 0, d2])).unwrap();
+        assert_eq!(core.exports[5][2], 1.0);
+        // Relative vector dest on an export is malformed, never
+        // silently accepted.
+        let d0 = 5 | (1 << 6) | (1 << 15) | (0xF << 16);
+        assert!(eval_alu(&mut core, &[], &parse_alu(&[d0, 0, d2])).is_err());
     }
 }

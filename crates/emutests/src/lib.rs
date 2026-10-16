@@ -416,6 +416,89 @@ mod integration {
         }
     }
 
+    /// Retail Braid's uploaded shaders execute end to end through
+    /// the CF driver (`run_cf`): vs (24 dwords) runs 4 ALU clauses,
+    /// ps (9 dwords) runs 1, both terminating on an end-opcode.
+    /// Gated on `X360_STFS_FILE`; passes silently without it.
+    #[test]
+    fn retail_shaders_interpret() {
+        use x360_filesystem::stfs::StfsImage;
+        let path = match std::env::var("X360_STFS_FILE") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let bytes = std::fs::read(&path).expect("read package");
+        let backend_input: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes.into_boxed_slice());
+        let data = {
+            let stfs = StfsImage::open(&backend_input).expect("open package");
+            let xex = stfs
+                .list_files()
+                .expect("list package")
+                .into_iter()
+                .find(|f| !f.is_dir && f.name.to_lowercase().ends_with(".xex"))
+                .expect("no .xex in package");
+            stfs.read_file(&xex).expect("extract xex")
+        };
+        let backend = std::sync::Arc::new(
+            x360_filesystem::stfs_fs::StfsFs::load(backend_input).expect("index package"),
+        );
+        let (hdr, info) = x360_loader::parse_xex(&data).expect("game header parses");
+        let image =
+            x360_loader::image::loadable_image(&data, &hdr, &info).expect("game decompresses");
+        let mut mem = Memory::new();
+        x360_loader::image::load_image_to_guest(&mut mem, &image, info.base_address)
+            .expect("load image");
+        let mut kernel = x360_kernel::Kernel::new();
+        kernel.set_fs(backend);
+        kernel.set_module_info(
+            info.base_address,
+            image.len() as u32,
+            info.title_id.unwrap_or(0),
+        );
+        kernel.set_system_flags(0);
+        let hs = (hdr.header_size as usize).min(data.len());
+        kernel.set_xex_header(
+            data[..hs].to_vec(),
+            info.entry_point.unwrap_or(0),
+            "game".into(),
+        );
+        let mut table = x360_kernel::imports::ImportTable::new();
+        let libs: Vec<(&str, &[u32])> = info
+            .import_libs
+            .iter()
+            .map(|l| (l.name.as_str(), l.records.as_slice()))
+            .collect();
+        x360_kernel::imports::apply(&mut mem, &mut kernel, &mut table, &libs)
+            .expect("apply imports");
+        let stack_size = 128 * 1024u32;
+        let stack_base = kernel.alloc_mem(stack_size, 16).expect("guest stack");
+        mem.write_bytes(stack_base, &vec![0u8; stack_size as usize])
+            .expect("zero stack");
+        kernel.set_stack(stack_base, stack_size);
+        let entry = info.entry_point.expect("game has entry");
+        let mut xenon = x360_cpu::Xenon::new(entry);
+        xenon.threads[0].t.gpr[1] = (stack_base + stack_size - 16) as u64;
+        let _ = x360_kernel::boot::run_until_exit_traced_imports(
+            &mut mem,
+            &mut xenon,
+            &mut kernel,
+            Some(&mut table),
+            2_000_000,
+            None,
+        );
+        for (name, ucode) in [("vs", &kernel.vd_vs_ucode), ("ps", &kernel.vd_ps_ucode)] {
+            let mut core = x360_kernel::uint::ShaderCore::default();
+            let st = x360_kernel::uint::run_cf(&mut core, ucode, &[], &[])
+                .unwrap_or_else(|e| panic!("retail {} shader failed: {}", name, e));
+            assert!(st.ended, "retail {} shader did not reach end-opcode", name);
+            assert!(st.alu_executed > 0, "retail {} shader ran zero ALU", name);
+            println!(
+                "retail {} shader: visited={} alu={} ended={}",
+                name, st.cf_visited, st.alu_executed, st.ended
+            );
+        }
+    }
+
     #[test]
     fn retail_braid_steps() {
         use x360_filesystem::stfs::StfsImage;

@@ -423,6 +423,20 @@ Terminal states only: impossible, done, or something rendering.
       per-instruction check): predicated-out ALU instructions skip
       entirely before fetch/eval; accessors on `AluInstr`.
       Unit-tested (skip + execute paths).
+- [x] Export capture (`kernel::uint`, reference `is_export` branch
+      + `GetConstant0/1WriteMask`): exports merge into 64
+      export-register slots (vector/scalar/const-1/const-0 per
+      component, written-mask tracked; memory writeback stays
+      draw-backend business). `scalar_dest_rel` correctly treated
+      as the const-0 selector, not addressing (fixed a false
+      `relative addressing` reject on retail export slots).
+      Malformed relative vector-dest exports are explicit errors.
+      Unit-tested (component select, const-1, untouched temps,
+      malformed dest).
+- [x] `retail_shaders_interpret` gate (STFS Braid boot): both
+      uploaded shaders run end to end via `run_cf` — vs
+      (visited=6, alu=4, ended) and ps (visited=2, alu=1, ended).
+      First retail code executing in the shader interpreter.
 - [x] CF clause driver (`kernel::uint::run_cf`, reference
       `ShaderInterpreter::Execute` CF loop): straight-line walk over
       the validated CF program executing ALU slots via `eval_alu`
