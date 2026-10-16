@@ -423,6 +423,13 @@ Terminal states only: impossible, done, or something rendering.
       per-instruction check): predicated-out ALU instructions skip
       entirely before fetch/eval; accessors on `AluInstr`.
       Unit-tested (skip + execute paths).
+- [x] CF clause driver (`kernel::uint::run_cf`, reference
+      `ShaderInterpreter::Execute` CF loop): straight-line walk over
+      the validated CF program executing ALU slots via `eval_alu`
+      (bool-constant + predicate gating, end-opcode stop, census).
+      `nop`/`alloc`/`fetchdone` no-ops; fetch slots, loops, calls,
+      jumps, returns are explicit `Unsupported`. Unit-tested
+      (run, gating, fetch/loop errors).
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

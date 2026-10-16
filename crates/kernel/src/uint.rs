@@ -35,7 +35,9 @@
 
 use x360_common::{EmuError, Result};
 
-use super::ucode::AluInstr;
+use super::ucode::{
+    is_end_opcode, is_exec_opcode, parse_alu, unpack_cf_pair, validate_ucode, AluInstr, CfInstr,
+};
 
 /// Temp register count (reference `kMaxShaderTempRegisters`).
 pub const TEMP_COUNT: usize = 64;
@@ -757,6 +759,108 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
     Ok(())
 }
 
+/// CF-driver run stats (straight-line execution census).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CfRunStats {
+    /// CF instructions visited (including skipped/gated).
+    pub cf_visited: u32,
+    /// Clause slots executed as ALU.
+    pub alu_executed: u32,
+    /// Whether an end-opcode terminated the run.
+    pub ended: bool,
+}
+
+/// Bool-constant bit test (reference register-file bits;
+/// out-of-range addresses read as false, matching zeroed regs).
+fn bool_set(words: &[u32], addr: u32) -> bool {
+    let (w, b) = ((addr >> 5) as usize, addr & 31);
+    words.get(w).map(|v| v & (1 << b) != 0).unwrap_or(false)
+}
+
+/// Run the CF program of a validated upload straight through,
+/// executing ALU clause slots via [`eval_alu`] (reference
+/// `ShaderInterpreter::Execute` CF loop, minus control flow).
+///
+/// Supported: `nop`, the full exec family (with bool-constant and
+/// predicate gating), `alloc` (no-op without an export sink),
+/// `fetchdone` (no-op). Fetch clause slots, loops, calls, jumps,
+/// and returns are explicit `Unsupported` — never silently
+/// skipped. Ends at the first end-opcode or at the CF program
+/// bound; Validate errors propagate.
+pub fn run_cf(
+    core: &mut ShaderCore,
+    dwords: &[u32],
+    consts: &[[f32; 4]],
+    bool_words: &[u32],
+) -> Result<CfRunStats> {
+    let st = validate_ucode(dwords)?;
+    let mut cf: Vec<CfInstr> = Vec::with_capacity(st.cf_pairs as usize * 2);
+    for pair in 0..st.cf_pairs as usize {
+        let g = [dwords[3 * pair], dwords[3 * pair + 1], dwords[3 * pair + 2]];
+        let [a, b] = unpack_cf_pair(&g);
+        cf.push(a);
+        cf.push(b);
+    }
+    let mut stats = CfRunStats::default();
+    // Straight-line walk (no jumps yet): at most the CF length.
+    for ins in cf.iter() {
+        if stats.cf_visited >= 4096 {
+            return Err(EmuError::Other("cf: step budget exceeded".into()));
+        }
+        stats.cf_visited += 1;
+        match ins.opcode {
+            0 => {}
+            1 | 2 | 3 | 4 | 5 | 6 | 13 | 14 => {
+                debug_assert!(is_exec_opcode(ins.opcode));
+                // Gating (reference per-opcode checks).
+                let gated_out = match ins.opcode {
+                    3 | 4 | 13 | 14 => bool_set(bool_words, ins.bool_address()) != ins.condition(),
+                    5 | 6 => core.predicate != ins.condition(),
+                    _ => false,
+                };
+                if gated_out {
+                    continue;
+                }
+                for k in 0..ins.count() {
+                    let slot = ins.address().wrapping_add(k) as usize;
+                    let base = slot
+                        .checked_mul(3)
+                        .ok_or_else(|| EmuError::Other("cf: clause slot overflows".into()))?;
+                    if base + 3 > dwords.len() {
+                        return Err(EmuError::Other(format!(
+                            "cf: clause slot {} out of range",
+                            slot
+                        )));
+                    }
+                    let seq = (ins.sequence() >> (2 * k)) & 3;
+                    if seq & 1 != 0 {
+                        return Err(EmuError::Unsupported(format!(
+                            "cf: fetch clause slot {} pending",
+                            slot
+                        )));
+                    }
+                    let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
+                    eval_alu(core, consts, &parse_alu(&w))?;
+                    stats.alu_executed += 1;
+                }
+                if is_end_opcode(ins.opcode) {
+                    stats.ended = true;
+                    return Ok(stats);
+                }
+            }
+            12 | 15 => {}
+            _ => {
+                return Err(EmuError::Unsupported(format!(
+                    "cf: opcode {} ({}) pending",
+                    ins.opcode,
+                    super::ucode::cf_opcode_name(ins.opcode)
+                )));
+            }
+        }
+    }
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,5 +1121,68 @@ mod tests {
         core.predicate = true;
         eval_alu(&mut core, &[], &parse_alu(&d)).unwrap();
         assert_eq!(core.temps[1], [3.0, 3.0, 3.0, 3.0]);
+    }
+
+    /// Two-pair upload builder: pair0 = CF (exec + nop), pair1 =
+    /// one ALU clause triple.
+    fn cf_upload(cf_word0: u32, cf_d1lo: u32, alu: [u32; 3]) -> Vec<u32> {
+        vec![cf_word0, cf_d1lo, 0x0000_0000, alu[0], alu[1], alu[2]]
+    }
+
+    #[test]
+    fn cf_driver_runs_straight_line() {
+        // exec @1 x1 (ALU): mad r1.xyzw = r4*r5 + r6.
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 2.0, 3.0, 4.0];
+        core.temps[5] = [10.0, 10.0, 10.0, 10.0];
+        core.temps[6] = [100.0, 100.0, 100.0, 100.0];
+        let alu = [
+            (1 & 0x3F) | (0xF << 16) | ((50 & 0x3F) << 26),
+            0,
+            (11 << 24) | (4 << 16) | (5 << 8) | 6 | (1 << 31) | (1 << 30) | (1 << 29),
+        ];
+        let words = cf_upload(0x0000_1001, 0x0000_1200, alu);
+        let st = run_cf(&mut core, &words, &[], &[]).unwrap();
+        assert_eq!((st.cf_visited, st.alu_executed, st.ended), (2, 1, false));
+        assert_eq!(core.temps[1], [110.0, 120.0, 130.0, 140.0]);
+    }
+
+    #[test]
+    fn cf_driver_gating_and_errors() {
+        // cexec @1 x1 gated on bool5 == true; bool clear -> skip.
+        let alu = [
+            (1 & 0x3F) | (0xF << 16) | ((50 & 0x3F) << 26),
+            0,
+            (4 << 16) | (5 << 8) | (1 << 31) | (1 << 30),
+        ];
+        let words = cf_upload(0x0000_1001, 0x0000_3414, alu);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        core.temps[5] = [2.0, 2.0, 2.0, 2.0];
+        let st = run_cf(&mut core, &words, &[], &[0]).unwrap();
+        assert_eq!((st.alu_executed, st.ended), (0, false));
+        assert_eq!(core.temps[1], [0.0; 4]);
+        let st = run_cf(&mut core, &words, &[], &[1 << 5]).unwrap();
+        assert_eq!(st.alu_executed, 1);
+        assert_eq!(core.temps[1], [3.0, 3.0, 3.0, 3.0]);
+        // Fetch slot is an explicit error, never silent.
+        let words = cf_upload(0x0001_1001, 0x0000_1200, alu);
+        let mut core = ShaderCore::default();
+        assert!(run_cf(&mut core, &words, &[], &[]).is_err());
+        // Loop opcode is an explicit error.
+        let words = vec![
+            0x0000_0000,
+            0x0000_7000,
+            0x0000_0000,
+            0x0000_1002,
+            0x0000_1200,
+            0x0000_0000,
+            alu[0],
+            alu[1],
+            alu[2],
+        ];
+        let mut core = ShaderCore::default();
+        let err = run_cf(&mut core, &words, &[], &[]).unwrap_err();
+        assert!(err.to_string().contains("pending"));
     }
 }

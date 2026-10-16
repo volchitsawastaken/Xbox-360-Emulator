@@ -73,6 +73,18 @@ impl CfInstr {
     pub fn alloc_type(&self) -> u32 {
         (self.word1 >> 9) & 3
     }
+
+    /// Bool-constant address (cond-exec `bool_address_ : 8` at
+    /// word1 bits 2-9).
+    pub fn bool_address(&self) -> u32 {
+        (self.word1 >> 2) & 0xFF
+    }
+
+    /// Required bool/predicate value (`condition_ : 1` at word1
+    /// bit 10 for cond-exec and predicated-exec forms).
+    pub fn condition(&self) -> bool {
+        (self.word1 >> 10) & 1 != 0
+    }
 }
 
 /// CF opcode mnemonic (reference `ucode.h` `ControlFlowOpcode`).
