@@ -1365,6 +1365,89 @@ pub fn run_cf_mem(
     )
 }
 
+/// Vertex-stage inputs borrowed for one draw (see
+/// `gpu::ShaderInputs` for the owned register-file form).
+#[derive(Debug, Clone, Copy)]
+pub struct VsStageInputs<'a> {
+    /// Float constants.
+    pub floats: &'a [[f32; 4]],
+    /// Vertex-fetch constants.
+    pub fetch: &'a [VertexFetchConst],
+    /// Bool-constant bits.
+    pub bools: &'a [u32],
+    /// Loop-constant words.
+    pub loops: &'a [u32],
+}
+
+/// Position export slot (reference `ExportRegister::kVSPosition`).
+pub const VS_POSITION_EXPORT: usize = 62;
+
+/// Run one vertex invocation: seed every full-fetch index temp
+/// with `vertex_index`, execute via [`run_cf_mem`], and return the
+/// position export (slot 62). Fresh-invocation semantics (temps,
+/// `ps`, predicate, exports, fetch latch reset on entry, like the
+/// reference per-invocation `Reset`). A shader that never writes
+/// xyz of slot 62 is an explicit error, never a zero vertex.
+pub fn run_vs_vertex(
+    core: &mut ShaderCore,
+    vs_dwords: &[u32],
+    inputs: &VsStageInputs,
+    mem: &Memory,
+    vertex_index: u32,
+) -> Result<[f32; 4]> {
+    *core = ShaderCore::default();
+    // Seed full-fetch index temps (mini fetches reuse the runtime
+    // latch, so only full forms need seeding).
+    let st = validate_ucode(vs_dwords)?;
+    let mut cf: Vec<CfInstr> = Vec::with_capacity(st.cf_pairs as usize * 2);
+    for pair in 0..st.cf_pairs as usize {
+        let g = [
+            vs_dwords[3 * pair],
+            vs_dwords[3 * pair + 1],
+            vs_dwords[3 * pair + 2],
+        ];
+        let [a, b] = unpack_cf_pair(&g);
+        cf.push(a);
+        cf.push(b);
+    }
+    for ins in cf.iter().filter(|i| is_exec_opcode(i.opcode)) {
+        for k in 0..ins.count() {
+            let slot = ins.address().wrapping_add(k) as usize;
+            let base = slot
+                .checked_mul(3)
+                .ok_or_else(|| EmuError::Other("vs: clause slot overflows".into()))?;
+            if base + 3 > vs_dwords.len() {
+                return Err(EmuError::Other(format!(
+                    "vs: clause slot {} out of range",
+                    slot
+                )));
+            }
+            if (ins.sequence() >> (2 * k)) & 3 & 1 == 0 {
+                continue;
+            }
+            let fetch = parse_fetch(&[vs_dwords[base], vs_dwords[base + 1], vs_dwords[base + 2]]);
+            if fetch.opcode() != 0 || fetch.vf_mini() {
+                continue;
+            }
+            let dst = core.temp_index(fetch.src_reg(), fetch.is_src_relative());
+            core.temps[dst][fetch.vf_src_swiz() as usize] = vertex_index as f32;
+        }
+    }
+    run_cf_mem(
+        core,
+        vs_dwords,
+        inputs.floats,
+        inputs.bools,
+        inputs.loops,
+        inputs.fetch,
+        mem,
+    )?;
+    if core.export_written[VS_POSITION_EXPORT] & 0x7 != 0x7 {
+        return Err(EmuError::Other("vs: no xyz position export".into()));
+    }
+    Ok(core.exports[VS_POSITION_EXPORT])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cf_inner(
     core: &mut ShaderCore,
@@ -2248,6 +2331,60 @@ mod tests {
         assert_eq!((lc.count, lc.start, lc.step), (3, 1, 2));
         let lc = LoopConstant::from_bits(1 | (0xFE << 16));
         assert_eq!((lc.count, lc.start, lc.step), (1, 0, -2));
+    }
+
+    /// Vertex shader uploading f32x3 positions: fetch -> r1,
+    /// add -> position export 62.
+    fn vs_position_upload() -> Vec<u32> {
+        let fetch = [(4 << 5) | (1 << 12), FETCH_IDENTITY_SWIZ | (57 << 16), 3];
+        let alu = [
+            62 | (1 << 15) | (0xF << 16) | ((50 & 0x3F) << 26),
+            0,
+            (1 << 16) | (1 << 31) | (1 << 30),
+        ];
+        let p0 = cf_pair((1, 2 | (1 << 12) | (1 << 16), 0), (1, 3 | (1 << 12), 0));
+        let p1 = cf_pair((2, 2, 0), (0, 0, 0));
+        let mut words = vec![p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]];
+        words.extend_from_slice(&fetch);
+        words.extend_from_slice(&alu);
+        words
+    }
+
+    #[test]
+    fn vs_vertex_positions_triangle() {
+        let mut mem = x360_memory::Memory::new();
+        write_floats(&mut mem, 0x1000, &[-1.0, -1.0, 0.0]);
+        write_floats(&mut mem, 0x100C, &[1.0, -1.0, 0.0]);
+        write_floats(&mut mem, 0x1018, &[0.0, 1.0, 0.0]);
+        let fc = VertexFetchConst {
+            address_dwords: 0x400,
+            size_dwords: 16,
+            endian: 0,
+        };
+        let inputs = VsStageInputs {
+            floats: &[],
+            fetch: &[fc],
+            bools: &[],
+            loops: &[],
+        };
+        let words = vs_position_upload();
+        let mut core = ShaderCore::default();
+        // Poison state: fresh-invocation semantics must clear it.
+        core.temps[1] = [9.0, 9.0, 9.0, 9.0];
+        let p0 = run_vs_vertex(&mut core, &words, &inputs, &mem, 0).unwrap();
+        let p1 = run_vs_vertex(&mut core, &words, &inputs, &mem, 1).unwrap();
+        let p2 = run_vs_vertex(&mut core, &words, &inputs, &mem, 2).unwrap();
+        assert_eq!(p0, [-1.0, -1.0, 0.0, 0.0]);
+        assert_eq!(p1, [1.0, -1.0, 0.0, 0.0]);
+        assert_eq!(p2, [0.0, 1.0, 0.0, 0.0]);
+        // No position export is explicit, never a zero vertex.
+        let mut no_export = words.clone();
+        // Blank the export bit on the ALU triple (last 3 dwords).
+        let n = no_export.len();
+        no_export[n - 3] &= !(1 << 15);
+        let mut core = ShaderCore::default();
+        let err = run_vs_vertex(&mut core, &no_export, &inputs, &mem, 0).unwrap_err();
+        assert!(err.to_string().contains("no xyz"));
     }
 
     #[test]

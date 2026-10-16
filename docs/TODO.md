@@ -526,6 +526,13 @@ Terminal states only: impossible, done, or something rendering.
       recorded per user, HRESULT form on detached SetState,
       `BAD_ARGUMENTS` on null structs, `EMPTY` on keystroke polls.
       Unit-tested (neutral + ANY + all error paths).
+- [x] Vertex-stage runner (`kernel::uint::run_vs_vertex`):
+      fresh-invocation semantics per vertex (full-fetch index temps
+      seeded, `run_cf_mem`, position export 62 returned; missing xyz
+      is explicit). Unit-tested (triangle positions, poison-state
+      reset, no-export error). First geometry out of the
+      retail-format shader path (synthetic; retail draws await
+      surface/device state).
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
