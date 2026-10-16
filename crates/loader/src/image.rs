@@ -410,6 +410,44 @@ pub fn parse_pe_sections(image: &[u8]) -> Result<Vec<PeSection>> {
     Ok(sections)
 }
 
+/// Whether `entry` (guest VA) lands inside a mapped PE section.
+///
+/// `rel = entry.wrapping_sub(base)` must fall in
+/// `[virt_addr, virt_addr + virt_size.max(1))` for some section whose
+/// `virt_addr` lies within the image. Sections past the image end
+/// never cover (retail linkers emit trailing metadata such as
+/// `.reloc` there); an empty table never covers.
+pub fn entry_covered(image_len: usize, base: u32, entry: u32, sections: &[PeSection]) -> bool {
+    let rel = entry.wrapping_sub(base);
+    sections.iter().any(|s| {
+        (s.virt_addr as usize) < image_len
+            && rel >= s.virt_addr
+            && rel < s.virt_addr.wrapping_add(s.virt_size.max(1))
+    })
+}
+
+/// Check entry coverage with an explicit error (never a silent miss).
+pub fn check_entry_covered(
+    image_len: usize,
+    base: u32,
+    entry: u32,
+    sections: &[PeSection],
+) -> Result<()> {
+    if sections.is_empty() {
+        return Err(EmuError::InvalidExecutable("no PE sections".into()));
+    }
+    if entry_covered(image_len, base, entry, sections) {
+        Ok(())
+    } else {
+        Err(EmuError::InvalidExecutable(format!(
+            "entry {:08x} (base {:08x}) not covered by {} sections",
+            entry,
+            base,
+            sections.len()
+        )))
+    }
+}
+
 /// Place a decompressed/decrypted XEX body flat at `base`.
 ///
 /// The body is already the in-memory image: the reference
@@ -654,6 +692,282 @@ mod tests {
     fn pe_rejects_non_pe() {
         assert!(parse_pe_sections(b"XEX2 rest").is_err());
         assert!(parse_pe_sections(&[0u8; 16]).is_err());
+    }
+
+    fn pe_image_with_sections(specs: &[(u32, u32)]) -> (Vec<u8>, Vec<PeSection>) {
+        // Minimal MZ wrapper is unnecessary here: entry coverage works
+        // on parsed sections directly. Synthesize section records.
+        let image = vec![0u8; 0x5000];
+        let sections = specs
+            .iter()
+            .enumerate()
+            .map(|(i, (virt, size))| PeSection {
+                name: format!(".s{}", i),
+                virt_addr: *virt,
+                virt_size: *size,
+                raw_off: 0,
+                raw_size: 0,
+                raw_available: 0,
+                characteristics: 0,
+            })
+            .collect();
+        (image, sections)
+    }
+
+    #[test]
+    fn entry_coverage_edges() {
+        let (image, sections) = pe_image_with_sections(&[(0x1000, 0x100), (0x4000, 0x1000)]);
+        let base = 0x8200_0000;
+        // Start of first section covers.
+        assert!(entry_covered(image.len(), base, base + 0x1000, &sections));
+        // Last byte covers; one past does not (until the next section).
+        assert!(entry_covered(image.len(), base, base + 0x10FF, &sections));
+        assert!(!entry_covered(image.len(), base, base + 0x1100, &sections));
+        assert!(check_entry_covered(image.len(), base, base + 0x1000, &sections).is_ok());
+        assert!(check_entry_covered(image.len(), base, base + 0x1100, &sections).is_err());
+        // Second section covers despite the gap.
+        assert!(check_entry_covered(image.len(), base, base + 0x4500, &sections).is_ok());
+        // Empty table is an explicit error.
+        assert!(check_entry_covered(image.len(), base, base + 0x1000, &[]).is_err());
+    }
+
+    #[test]
+    fn entry_coverage_zero_size_and_unmapped() {
+        // virt_size 0 covers exactly one byte (the max(1) rule).
+        let (image, sections) = pe_image_with_sections(&[(0x2000, 0)]);
+        let base = 0x8200_0000;
+        assert!(entry_covered(image.len(), base, base + 0x2000, &sections));
+        assert!(!entry_covered(image.len(), base, base + 0x2001, &sections));
+        // A section past the image end never covers, even on an exact hit.
+        let tiny = vec![0u8; 64];
+        let past = vec![PeSection {
+            name: ".reloc".into(),
+            virt_addr: 0x50000,
+            virt_size: 0x1000,
+            raw_off: 0,
+            raw_size: 0,
+            raw_available: 0,
+            characteristics: 0,
+        }];
+        assert!(!entry_covered(tiny.len(), base, base + 0x50000, &past));
+        assert!(check_entry_covered(tiny.len(), base, base + 0x50000, &past).is_err());
+    }
+
+    #[test]
+    fn pe_header_edges_rejected() {
+        // e_lfanew past EOF.
+        let mut v = vec![0u8; 64];
+        v[0] = b'M';
+        v[1] = b'Z';
+        v[0x3C..0x40].copy_from_slice(&0x1000u32.to_le_bytes());
+        assert!(parse_pe_sections(&v).is_err());
+        // Wrong machine.
+        let mut v = vec![0u8; 64 + 24 + 224 + 40];
+        v[0] = b'M';
+        v[1] = b'Z';
+        v[0x3C..0x40].copy_from_slice(&64u32.to_le_bytes());
+        v[64..68].copy_from_slice(b"PE\0\0");
+        v[68..70].copy_from_slice(&0x014Cu16.to_le_bytes()); // x86, not PPCBE
+        v[70..72].copy_from_slice(&1u16.to_le_bytes());
+        v[84..86].copy_from_slice(&224u16.to_le_bytes());
+        v[88..90].copy_from_slice(&0x10Bu16.to_le_bytes());
+        assert!(parse_pe_sections(&v).is_err());
+        // Zero sections.
+        let mut v = vec![0u8; 64 + 24 + 224];
+        v[0] = b'M';
+        v[1] = b'Z';
+        v[0x3C..0x40].copy_from_slice(&64u32.to_le_bytes());
+        v[64..68].copy_from_slice(b"PE\0\0");
+        v[68..70].copy_from_slice(&0x01F2u16.to_le_bytes());
+        v[70..72].copy_from_slice(&0u16.to_le_bytes());
+        v[84..86].copy_from_slice(&224u16.to_le_bytes());
+        v[88..90].copy_from_slice(&0x10Bu16.to_le_bytes());
+        assert!(parse_pe_sections(&v).is_err());
+        // Not PE32.
+        let mut v = vec![0u8; 64 + 24 + 224];
+        v[0] = b'M';
+        v[1] = b'Z';
+        v[0x3C..0x40].copy_from_slice(&64u32.to_le_bytes());
+        v[64..68].copy_from_slice(b"PE\0\0");
+        v[68..70].copy_from_slice(&0x01F2u16.to_le_bytes());
+        v[70..72].copy_from_slice(&1u16.to_le_bytes());
+        v[84..86].copy_from_slice(&224u16.to_le_bytes());
+        v[88..90].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        assert!(parse_pe_sections(&v).is_err());
+    }
+
+    #[test]
+    fn basic_block_table_edges_rejected() {
+        let img = vec![0u8; 64];
+        // Payload smaller than the 8-byte header.
+        assert!(parse_basic_blocks(&img, 0, 4).is_err());
+        // Not a whole block count.
+        assert!(parse_basic_blocks(&img, 0, 9).is_err());
+        // Zero blocks.
+        assert!(parse_basic_blocks(&img, 0, 8).is_err());
+        // Absurd block count.
+        assert!(parse_basic_blocks(&img, 0, 8 + 4097 * 8).is_err());
+        // Payload past EOF.
+        assert!(parse_basic_blocks(&img, 60, 8 + 8).is_err());
+    }
+
+    #[test]
+    fn decompress_header_and_size_edges() {
+        let img = vec![0u8; 16];
+        let blocks = vec![BasicBlock {
+            data_size: 1,
+            zero_size: 0,
+        }];
+        assert!(decompress_basic(&img, 17, &blocks, 8, None).is_err());
+        assert!(decompress_basic(&img, 0, &blocks, 0, None).is_err());
+        assert!(decompress_basic(&img, 0, &blocks, 257 * 1024 * 1024, None).is_err());
+        // Literal bytes past the stream end.
+        assert!(decompress_basic(&img, 16, &blocks, 8, None).is_err());
+        // Encrypted literals must arrive as whole AES blocks.
+        let mut crypt = Cbc::new(&[0u8; 16]);
+        let odd = vec![BasicBlock {
+            data_size: 15,
+            zero_size: 0,
+        }];
+        assert!(decompress_basic(&img, 0, &odd, 15, Some(&mut crypt)).is_err());
+        // CBC length rules surface here too.
+        let mut crypt = Cbc::new(&[0u8; 16]);
+        let mut out = [0u8; 15];
+        assert!(crypt.decrypt_into(&img[..15], &mut out).is_err());
+        assert!(crypt.decrypt_into(&[], &mut []).is_err());
+    }
+
+    #[test]
+    fn page_total_threshold_and_overflow() {
+        use super::super::PageDescriptor;
+        use super::super::SectionKind;
+        let one = |kind| PageDescriptor {
+            section_kind: kind,
+            page_count: 1,
+        };
+        // Below the threshold pages are 64 KiB; at/above, 4 KiB.
+        assert_eq!(
+            page_total(&[one(SectionKind::Code)], 0x8200_0000).unwrap(),
+            64 * 1024
+        );
+        assert_eq!(
+            page_total(&[one(SectionKind::Code)], 0x9000_0000).unwrap(),
+            4 * 1024
+        );
+        assert!(page_total(&[], 0x8200_0000).unwrap() == 0);
+        // Absurd totals are explicit errors, never silent wraps.
+        let many = vec![one(SectionKind::Data); 5000];
+        assert!(page_total(&many, 0x8200_0000).is_err());
+    }
+
+    fn basic_file_fixture(image_size: Option<u32>) -> (Vec<u8>, XexHeader, XexInfo) {
+        use super::super::{
+            FormatInfo, PageDescriptor, SectionKind, XexCompression, XexDir, XexDirData,
+            XexEncryption, XexHeader, XexInfo, KEY_FILE_FORMAT_INFO, XEX2_MAGIC,
+        };
+        use super::BasicBlock;
+        let _ = BasicBlock {
+            data_size: 0,
+            zero_size: 0,
+        };
+        // Header 0x60 bytes; format payload tucked inside at 0x40
+        // (size 16 = header + one block); stream of 4 bytes at 0x60.
+        let mut file = vec![0u8; 0x64];
+        file[0x40..0x44].copy_from_slice(&16u32.to_be_bytes());
+        file[0x44..0x48].copy_from_slice(&0u32.to_be_bytes()); // enc=None comp=Basic
+        file[0x48..0x4C].copy_from_slice(&4u32.to_be_bytes()); // data
+        file[0x4C..0x50].copy_from_slice(&0u32.to_be_bytes()); // zeros
+        file[0x60..0x64].copy_from_slice(b"ABCD");
+        let hdr = XexHeader {
+            magic: XEX2_MAGIC,
+            module_flags: 0,
+            header_size: 0x60,
+            security_offset: 0,
+            header_count: 0,
+        };
+        let info = XexInfo {
+            entry_point: None,
+            base_address: 0x8200_0000,
+            stack_size: None,
+            title_id: None,
+            is_dll: false,
+            size: file.len(),
+            dirs: vec![XexDir {
+                key: KEY_FILE_FORMAT_INFO,
+                data: XexDirData::AtOffset {
+                    offset: 0x40,
+                    size: 16,
+                },
+            }],
+            image_size,
+            image_flags: None,
+            export_table: None,
+            page_descriptor_count: Some(1),
+            page_descriptors: vec![PageDescriptor {
+                section_kind: SectionKind::Code,
+                page_count: 1, // 64 KiB total, never 4
+            }],
+            tls_info: None,
+            static_libs: Vec::new(),
+            import_libs: Vec::new(),
+            format_info: Some(FormatInfo {
+                encryption: XexEncryption::None,
+                compression: XexCompression::Basic,
+            }),
+            aes_key: None,
+            resources: Vec::new(),
+        };
+        (file, hdr, info)
+    }
+
+    #[test]
+    fn loadable_image_validation_edges() {
+        use super::super::XEX2_MAGIC;
+        use super::super::{FormatInfo, XexCompression, XexEncryption, XexHeader, XexInfo};
+        // No format info: explicit error, never guessed.
+        let hdr = XexHeader {
+            magic: XEX2_MAGIC,
+            module_flags: 0,
+            header_size: 32,
+            security_offset: 0,
+            header_count: 0,
+        };
+        let mut info = XexInfo {
+            entry_point: None,
+            base_address: 0x8200_0000,
+            stack_size: None,
+            title_id: None,
+            is_dll: false,
+            size: 32,
+            dirs: Vec::new(),
+            image_size: None,
+            image_flags: None,
+            export_table: None,
+            page_descriptor_count: None,
+            page_descriptors: Vec::new(),
+            tls_info: None,
+            static_libs: Vec::new(),
+            import_libs: Vec::new(),
+            format_info: None,
+            aes_key: None,
+            resources: Vec::new(),
+        };
+        assert!(loadable_image(&[0u8; 32], &hdr, &info).is_err());
+        // Unknown crypto stays explicit Unsupported.
+        info.format_info = Some(FormatInfo {
+            encryption: XexEncryption::Unknown(9),
+            compression: XexCompression::Unknown(9),
+        });
+        assert!(matches!(
+            loadable_image(&[0u8; 32], &hdr, &info),
+            Err(x360_common::EmuError::Unsupported(_))
+        ));
+        // Page total (64 KiB) disagrees with the 4-byte image size.
+        let (file, hdr, info) = basic_file_fixture(Some(4));
+        assert!(loadable_image(&file, &hdr, &info).is_err());
+        // Missing image size has no output to size.
+        let (file, hdr, info) = basic_file_fixture(None);
+        assert!(loadable_image(&file, &hdr, &info).is_err());
     }
 
     #[test]

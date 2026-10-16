@@ -1296,4 +1296,117 @@ mod tests {
         let err = parse_xex(&img).unwrap_err();
         assert!(matches!(err, EmuError::InvalidExecutable(_)));
     }
+
+    #[test]
+    fn resources_empty_table_ok() {
+        // size 4 = zero entries: valid, yields no resources.
+        let mut payload = vec![0u8; 4];
+        put_u32(&mut payload, 0, 4);
+        let img = dir_image_with_payload(KEY_RESOURCE_INFO, &payload);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert!(info.resources.is_empty());
+    }
+
+    #[test]
+    fn resources_zero_size_rejected() {
+        let mut payload = vec![0u8; 4];
+        put_u32(&mut payload, 0, 0);
+        let img = dir_image_with_payload(KEY_RESOURCE_INFO, &payload);
+        assert!(parse_xex(&img).is_err());
+    }
+
+    #[test]
+    fn resources_truncated_entry_rejected() {
+        // Claims one entry (size 20) but only half the bytes are present.
+        let mut payload = vec![0u8; 12];
+        put_u32(&mut payload, 0, 20);
+        payload[4..8].copy_from_slice(b"SHAD");
+        let img = dir_image_with_payload(KEY_RESOURCE_INFO, &payload);
+        assert!(parse_xex(&img).is_err());
+    }
+
+    #[test]
+    fn resources_xex1_accepted() {
+        let mut payload = vec![0u8; 20];
+        put_u32(&mut payload, 0, 20);
+        payload[4..12].copy_from_slice(b"SHADR\x00\x00\x00");
+        put_u32(&mut payload, 12, 0x8200_4000);
+        put_u32(&mut payload, 16, 0x1000);
+        let mut img = dir_image_with_payload(KEY_RESOURCE_INFO, &payload);
+        img[0..4].copy_from_slice(b"XEX1");
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.resources.len(), 1);
+        assert_eq!(info.resources[0].address, 0x8200_4000);
+    }
+
+    #[test]
+    fn header_edges_rejected_or_tolerated() {
+        // File too small for any XEX.
+        assert!(parse_xex(&[0u8; 16]).is_err());
+        // Absurd directory count.
+        let mut img = minimal_xex(0x8200_1000);
+        put_u32(&mut img, 20, 65);
+        assert!(parse_xex(&img).is_err());
+        // header_size past EOF.
+        let mut img = minimal_xex(0x8200_1000);
+        put_u32(&mut img, 8, 0x1000);
+        assert!(parse_xex(&img).is_err());
+        // Zero entry point is never a valid executable entry.
+        assert!(parse_xex(&minimal_xex(0)).is_err());
+        // Directory truncated mid-entry.
+        let mut img = vec![0u8; 28];
+        img[0..4].copy_from_slice(b"XEX2");
+        put_u32(&mut img, 8, 32);
+        put_u32(&mut img, 20, 2);
+        put_u32(&mut img, 24, KEY_ENTRY_POINT);
+        assert!(parse_xex(&img).is_err());
+    }
+
+    #[test]
+    fn security_oob_and_truncated_tolerated() {
+        // OOB offset: tracked, yields Nones rather than a hard error.
+        let mut img = minimal_xex(0x8200_1000);
+        put_u32(&mut img, 16, 0x5000);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.image_size, None);
+        assert!(info.page_descriptors.is_empty());
+        // Truncated header (nonzero but short of the fixed size): same.
+        let mut img = vec![0u8; 0x110];
+        img[0..4].copy_from_slice(b"XEX2");
+        put_u32(&mut img, 8, 32);
+        put_u32(&mut img, 16, 0x100);
+        put_u32(&mut img, 20, 1);
+        put_u32(&mut img, 24, KEY_ENTRY_POINT);
+        put_u32(&mut img, 28, 0x8200_1000);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.image_size, None);
+    }
+
+    #[test]
+    fn execution_info_truncated_tolerated() {
+        // Payload shorter than 0x18 bytes: tracked with size 0, no title.
+        let img = dir_image_with_payload(KEY_EXECUTION_INFO, &[0u8; 8]);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.title_id, None);
+        assert!(info.dirs.iter().any(|d| d.key == KEY_EXECUTION_INFO));
+    }
+
+    #[test]
+    fn static_libs_empty_table_ok() {
+        let mut payload = vec![0u8; 4];
+        put_u32(&mut payload, 0, 4);
+        let img = dir_image_with_payload(KEY_STATIC_LIBRARIES, &payload);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert!(info.static_libs.is_empty());
+    }
+
+    #[test]
+    fn format_info_oob_rejected() {
+        // Declared size runs past EOF.
+        let mut payload = vec![0u8; 8];
+        put_u32(&mut payload, 0, 0x100);
+        put_u32(&mut payload, 4, 0x0001_0002);
+        let img = dir_image_with_payload(KEY_FILE_FORMAT_INFO, &payload);
+        assert!(parse_xex(&img).is_err());
+    }
 }
