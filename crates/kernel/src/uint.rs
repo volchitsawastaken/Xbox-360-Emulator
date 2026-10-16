@@ -39,8 +39,10 @@
 //! temp-relative (aL) dests/sources and const-relative (a0/aL)
 //! addressing; texture-fetch slots write zeros per the reference
 //! fallback (`StoreFetchResult` with a zero result). Vertex fetches
-//! (memory + fetch constants) and CF control flow stay explicit
-//! `Unsupported`, never a wrong result. `eval_alu` skips
+//! (memory + fetch constants) stay explicit `Unsupported`, never a
+//! wrong result. CF control flow (loops/calls/jumps/returns) is
+//! driven per the reference (`Execute` dispatch); unmatched returns
+//! and overflowed nests are faithful no-ops/skips. `eval_alu` skips
 //! predicated-out instructions itself (reference per-instruction
 //! check); CF-level predication lives in the clause driver.
 
@@ -113,10 +115,22 @@ pub struct LoopConstant {
     pub step: i32,
 }
 
+impl LoopConstant {
+    /// Decode register bits (reference `xenos::LoopConstant`:
+    /// count low 8, start next 8, signed step next 8).
+    pub fn from_bits(v: u32) -> Self {
+        Self {
+            count: v & 0xFF,
+            start: ((v >> 8) & 0xFF) as i32,
+            step: ((v >> 16) & 0xFF) as u8 as i8 as i32,
+        }
+    }
+}
+
+/// Loop address (reference `GetLoopAddress`): 0 with no
+/// active loop, else `iterator * step + start` clamped to
+/// [-256, 256].
 impl ShaderCore {
-    /// Loop address (aL) per reference `GetLoopAddress`: 0 with no
-    /// active loop, else `iterator * step + start` clamped to
-    /// [-256, 256].
     pub fn loop_address(&self) -> i32 {
         if self.loop_depth == 0 || self.loop_depth >= 4 {
             return 0;
@@ -909,7 +923,7 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
     Ok(())
 }
 
-/// CF-driver run stats (straight-line execution census).
+/// CF-driver run stats (execution census).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CfRunStats {
     /// CF instructions visited (including skipped/gated).
@@ -919,6 +933,9 @@ pub struct CfRunStats {
     /// Fetch slots executed (texture-fetch zero writes; vertex
     /// fetches are explicit errors, never counted).
     pub fetch_executed: u32,
+    /// Control transfers taken (loop entries/skips/back-edges,
+    /// calls, returns, jumps).
+    pub ctrl_taken: u32,
     /// Whether an end-opcode terminated the run.
     pub ended: bool,
 }
@@ -953,24 +970,41 @@ fn store_fetch_result(
     }
 }
 
-/// Run the CF program of a validated upload straight through,
-/// executing ALU clause slots via [`eval_alu`] (reference
-/// `ShaderInterpreter::Execute` CF loop, minus control flow).
+/// Run the CF program, executing ALU/fetch clause slots
+/// (reference `ShaderInterpreter::Execute` CF loop).
 ///
-/// Supported: `nop`, the full exec family (with bool-constant and
-/// predicate gating), `alloc` (no-op without an export sink),
-/// `fetchdone` (no-op). Texture-fetch clause slots write zeros with
-/// fetch dest swizzle (reference non-vertex fallback via
-/// `StoreFetchResult`); vertex fetches (opcode 0, needing vertex
-/// memory + fetch constants) and loops, calls, jumps, returns are
-/// explicit `Unsupported` — never silently skipped. Ends at the
-/// first end-opcode or at the CF program bound; Validate errors
+/// Supported: `nop`, the full exec family (bool-constant and
+/// predicate gating), loops (nesting depth 4, repeat/skip/break
+/// per the reference), conditional calls/returns (depth 4),
+/// conditional jumps, `alloc` (no-op without an export sink),
+/// `fetchdone` (no-op). Texture-fetch slots write zeros (reference
+/// non-vertex fallback); vertex fetches (needing vertex memory +
+/// fetch constants) stay explicit `Unsupported`. Ends at the first
+/// end-opcode or at the CF program bound; validate errors
 /// propagate.
+///
+/// `loop_words` holds integer loop-constant register bits indexed
+/// by loop id (out-of-range ids read count 0, skipping the loop).
+/// Loop-stack bookkeeping is 0-based and balanced (deviation from
+/// the reference's double-incremented depth, which leaks +1 per
+/// loop, is deliberate: ours terminates with identical per-iteration
+/// `aL` and trip counts).
 pub fn run_cf(
     core: &mut ShaderCore,
     dwords: &[u32],
     consts: &[[f32; 4]],
     bool_words: &[u32],
+) -> Result<CfRunStats> {
+    run_cf_loops(core, dwords, consts, bool_words, &[])
+}
+
+/// [`run_cf`] with loop-constant registers (see `loop_words`).
+pub fn run_cf_loops(
+    core: &mut ShaderCore,
+    dwords: &[u32],
+    consts: &[[f32; 4]],
+    bool_words: &[u32],
+    loop_words: &[u32],
 ) -> Result<CfRunStats> {
     let st = validate_ucode(dwords)?;
     let mut cf: Vec<CfInstr> = Vec::with_capacity(st.cf_pairs as usize * 2);
@@ -980,12 +1014,17 @@ pub fn run_cf(
         cf.push(a);
         cf.push(b);
     }
+    // Control-flow state (reference stack depths, 0-based here).
+    let mut call_stack: [u32; 4] = [0; 4];
+    let mut call_depth: usize = 0;
     let mut stats = CfRunStats::default();
-    // Straight-line walk (no jumps yet): at most the CF length.
-    for ins in cf.iter() {
+    let mut cf_index: u32 = 0;
+    while (cf_index as usize) < cf.len() {
         if stats.cf_visited >= 4096 {
             return Err(EmuError::Other("cf: step budget exceeded".into()));
         }
+        let ins = cf[cf_index as usize];
+        let mut next = cf_index + 1;
         stats.cf_visited += 1;
         match ins.opcode {
             0 => {}
@@ -997,56 +1036,177 @@ pub fn run_cf(
                     5 | 6 => core.predicate != ins.condition(),
                     _ => false,
                 };
-                if gated_out {
-                    continue;
-                }
-                for k in 0..ins.count() {
-                    let slot = ins.address().wrapping_add(k) as usize;
-                    let base = slot
-                        .checked_mul(3)
-                        .ok_or_else(|| EmuError::Other("cf: clause slot overflows".into()))?;
-                    if base + 3 > dwords.len() {
-                        return Err(EmuError::Other(format!(
-                            "cf: clause slot {} out of range",
-                            slot
-                        )));
-                    }
-                    let seq = (ins.sequence() >> (2 * k)) & 3;
-                    if seq & 1 != 0 {
-                        let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
-                        let fetch = parse_fetch(&w);
-                        if fetch.is_predicated() && fetch.pred_condition() != core.predicate {
-                            continue;
-                        }
-                        if fetch.opcode() == 0 {
-                            return Err(EmuError::Unsupported(format!(
-                                "cf: slot {}: vfetch needs draw backend (vertex memory + fetch constants)",
+                if !gated_out {
+                    for k in 0..ins.count() {
+                        let slot = ins.address().wrapping_add(k) as usize;
+                        let base = slot
+                            .checked_mul(3)
+                            .ok_or_else(|| EmuError::Other("cf: clause slot overflows".into()))?;
+                        if base + 3 > dwords.len() {
+                            return Err(EmuError::Other(format!(
+                                "cf: clause slot {} out of range",
                                 slot
                             )));
                         }
-                        store_fetch_result(
-                            core,
-                            fetch.dst_reg(),
-                            fetch.is_dest_relative(),
-                            fetch.dst_swizzle(),
-                            &[0.0; 4],
-                        );
-                        stats.fetch_executed += 1;
-                        continue;
-                    }
-                    let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
-                    eval_alu(core, consts, &parse_alu(&w)).map_err(|e| match e {
-                        EmuError::Unsupported(s) => {
-                            EmuError::Unsupported(format!("cf: slot {}: {}", slot, s))
+                        let seq = (ins.sequence() >> (2 * k)) & 3;
+                        if seq & 1 != 0 {
+                            let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
+                            let fetch = parse_fetch(&w);
+                            if fetch.is_predicated() && fetch.pred_condition() != core.predicate {
+                                continue;
+                            }
+                            if fetch.opcode() == 0 {
+                                return Err(EmuError::Unsupported(format!(
+                                    "cf: slot {}: vfetch needs draw backend (vertex memory + fetch constants)",
+                                    slot
+                                )));
+                            }
+                            store_fetch_result(
+                                core,
+                                fetch.dst_reg(),
+                                fetch.is_dest_relative(),
+                                fetch.dst_swizzle(),
+                                &[0.0; 4],
+                            );
+                            stats.fetch_executed += 1;
+                            continue;
                         }
-                        EmuError::Other(s) => EmuError::Other(format!("cf: slot {}: {}", slot, s)),
-                        other => other,
-                    })?;
-                    stats.alu_executed += 1;
+                        let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
+                        eval_alu(core, consts, &parse_alu(&w)).map_err(|e| match e {
+                            EmuError::Unsupported(s) => {
+                                EmuError::Unsupported(format!("cf: slot {}: {}", slot, s))
+                            }
+                            EmuError::Other(s) => {
+                                EmuError::Other(format!("cf: slot {}: {}", slot, s))
+                            }
+                            other => other,
+                        })?;
+                        stats.alu_executed += 1;
+                    }
+                    if is_end_opcode(ins.opcode) {
+                        stats.ended = true;
+                        return Ok(stats);
+                    }
                 }
-                if is_end_opcode(ins.opcode) {
-                    stats.ended = true;
-                    return Ok(stats);
+            }
+            7 => {
+                // Loop start (reference `kLoopStart` + skip logic).
+                if core.loop_depth as usize >= 4 {
+                    let t = ins.cf_target() as usize;
+                    if t >= cf.len() {
+                        return Err(EmuError::Other(format!(
+                            "cf: loop skip target {} out of range",
+                            t
+                        )));
+                    }
+                    next = t as u32;
+                    stats.ctrl_taken += 1;
+                } else {
+                    let lc = loop_words
+                        .get(ins.loop_id() as usize)
+                        .copied()
+                        .map(LoopConstant::from_bits)
+                        .unwrap_or_default();
+                    let d = core.loop_depth as usize;
+                    if !ins.is_repeat() {
+                        core.loop_iters[d] = 0;
+                    }
+                    if core.loop_iters[d] >= lc.count {
+                        let t = ins.cf_target() as usize;
+                        if t >= cf.len() {
+                            return Err(EmuError::Other(format!(
+                                "cf: loop skip target {} out of range",
+                                t
+                            )));
+                        }
+                        next = t as u32;
+                        stats.ctrl_taken += 1;
+                    } else {
+                        core.loop_constants[d] = lc;
+                        core.loop_depth += 1;
+                    }
+                }
+            }
+            8 => {
+                // Loop end (reference `kLoopEnd`: increment first,
+                // then test count and predicated break).
+                if core.loop_depth == 0 {
+                    // Unmatched endloop outside a loop is a no-op
+                    // (mirrors the reference guard).
+                } else {
+                    let d = (core.loop_depth - 1) as usize;
+                    core.loop_iters[d] = core.loop_iters[d].wrapping_add(1);
+                    let lc = core.loop_constants[d];
+                    let brk = ins.is_predicated_break() && ins.condition() == core.predicate;
+                    if core.loop_iters[d] < lc.count && !brk {
+                        let t = ins.cf_target() as usize;
+                        if t >= cf.len() {
+                            return Err(EmuError::Other(format!(
+                                "cf: loop body target {} out of range",
+                                t
+                            )));
+                        }
+                        next = t as u32;
+                        stats.ctrl_taken += 1;
+                    } else {
+                        core.loop_depth -= 1;
+                    }
+                }
+            }
+            9 => {
+                // Conditional call (reference `kCondCall`, depth 4).
+                if call_depth >= 4 {
+                    // Overflow: skip like the reference.
+                } else {
+                    let take = ins.is_unconditional() || {
+                        if ins.is_ctrl_predicated() {
+                            ins.condition() == core.predicate
+                        } else {
+                            bool_set(bool_words, ins.bool_address()) == ins.condition()
+                        }
+                    };
+                    if take {
+                        let t = ins.cf_target() as usize;
+                        if t >= cf.len() {
+                            return Err(EmuError::Other(format!(
+                                "cf: call target {} out of range",
+                                t
+                            )));
+                        }
+                        call_stack[call_depth] = cf_index + 1;
+                        call_depth += 1;
+                        next = t as u32;
+                        stats.ctrl_taken += 1;
+                    }
+                }
+            }
+            10 => {
+                // Return (reference `kReturn`: no-op outside a call).
+                if call_depth > 0 {
+                    call_depth -= 1;
+                    next = call_stack[call_depth];
+                    stats.ctrl_taken += 1;
+                }
+            }
+            11 => {
+                // Conditional jump (reference `kCondJmp`).
+                let take = ins.is_unconditional() || {
+                    if ins.is_ctrl_predicated() {
+                        ins.condition() == core.predicate
+                    } else {
+                        bool_set(bool_words, ins.bool_address()) == ins.condition()
+                    }
+                };
+                if take {
+                    let t = ins.cf_target() as usize;
+                    if t >= cf.len() {
+                        return Err(EmuError::Other(format!(
+                            "cf: jump target {} out of range",
+                            t
+                        )));
+                    }
+                    next = t as u32;
+                    stats.ctrl_taken += 1;
                 }
             }
             12 | 15 => {}
@@ -1058,6 +1218,7 @@ pub fn run_cf(
                 )));
             }
         }
+        cf_index = next;
     }
     Ok(stats)
 }
@@ -1386,21 +1547,135 @@ mod tests {
         let mut core = ShaderCore::default();
         let err = run_cf(&mut core, &words, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("vfetch"));
-        // Loop opcode is an explicit error.
-        let words = vec![
-            0x0000_0000,
-            0x0000_7000,
-            0x0000_0000,
-            0x0000_1002,
-            0x0000_1200,
-            0x0000_0000,
-            alu[0],
-            alu[1],
-            alu[2],
-        ];
+        // Loop start with no loop words reads count 0 and skips
+        // forward to the exec (target 2).
+        let p0 = cf_pair((7, 0x0000_0002, 0), (0, 0, 0));
+        let p1 = cf_pair((1, exec_w0(2, 1), 0), (2, exec_w0(2, 0), 0));
+        let mut words = vec![p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]];
+        words.extend_from_slice(&alu);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        core.temps[5] = [2.0, 2.0, 2.0, 2.0];
+        let st = run_cf(&mut core, &words, &[], &[]).unwrap();
+        assert_eq!((st.cf_visited, st.alu_executed, st.ctrl_taken), (3, 1, 1));
+        assert_eq!(core.temps[1], [3.0, 3.0, 3.0, 3.0]);
+        // Malformed jump target is an explicit error, never a wrap.
+        let p0 = cf_pair((11, 0x0000_2009, 0), (0, 0, 0));
+        let p1 = cf_pair((2, exec_w0(2, 0), 0), (0, 0, 0));
+        let mut words = vec![p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]];
+        words.extend_from_slice(&alu);
         let mut core = ShaderCore::default();
         let err = run_cf(&mut core, &words, &[], &[]).unwrap_err();
-        assert!(err.to_string().contains("pending"));
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    /// CF pair encoder (reference `UnpackControlFlowInstructions`
+    /// inverse): two (opcode, word0, word1) instructions share the
+    /// middle dword.
+    fn cf_pair(a: (u32, u32, u32), b: (u32, u32, u32)) -> [u32; 3] {
+        let aw1 = ((a.0 & 0xF) << 12) | (a.2 & 0xFFF);
+        let bw1 = ((b.0 & 0xF) << 12) | (b.2 & 0xFFF);
+        [
+            a.1,
+            aw1 | ((b.1 & 0xFFFF) << 16),
+            ((b.1 >> 16) & 0xFFFF) | ((bw1 & 0xFFFF) << 16),
+        ]
+    }
+
+    /// Exec word0 for `address @slot count n` (ALU sequence).
+    fn exec_w0(slot: u32, n: u32) -> u32 {
+        (slot & 0xFFF) | ((n & 7) << 12)
+    }
+
+    #[test]
+    fn cf_loops_iterate_and_skip() {
+        // add r1, r1, r4 accumulating over 3 loop trips.
+        let alu = [
+            (1 & 0x3F) | (0xF << 16) | ((50 & 0x3F) << 26),
+            0,
+            (1 << 16) | (4 << 8) | (1 << 31) | (1 << 30),
+        ];
+        // CF: loop(id0, skip->3) / exec @2 x1 / endloop(body->1) / exece end.
+        let p0 = cf_pair((7, 0x0000_0003, 0), (1, exec_w0(2, 1), 0));
+        let p1 = cf_pair((8, 0x0000_0001, 0), (2, exec_w0(2, 0), 0));
+        let mut words = vec![p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]];
+        words.extend_from_slice(&alu);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        // Loop id 0: count 3, start 0, step 0.
+        let st = run_cf_loops(&mut core, &words, &[], &[], &[3]).unwrap();
+        assert_eq!(core.temps[1], [3.0, 3.0, 3.0, 3.0]);
+        assert_eq!((st.cf_visited, st.alu_executed, st.ended), (8, 3, true));
+        assert_eq!(st.ctrl_taken, 2);
+        assert_eq!(core.loop_depth, 0);
+        // Count 0 skips the body entirely.
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        let st = run_cf_loops(&mut core, &words, &[], &[], &[0]).unwrap();
+        assert_eq!((st.alu_executed, st.ctrl_taken, st.ended), (0, 1, true));
+        assert_eq!(core.temps[1], [0.0; 4]);
+    }
+
+    #[test]
+    fn cf_calls_jumps_and_returns() {
+        // add r1, r4, r5 in the subroutine slot.
+        let alu = [
+            (1 & 0x3F) | (0xF << 16) | ((50 & 0x3F) << 26),
+            0,
+            (4 << 16) | (5 << 8) | (1 << 31) | (1 << 30),
+        ];
+        // CF: call ->2 / exece end / exec @2 x1 / ret.
+        let p0 = cf_pair((9, 0x0000_2002, 0), (2, exec_w0(2, 0), 0));
+        let p1 = cf_pair((1, exec_w0(2, 1), 0), (10, 0, 0));
+        let mut words = vec![p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]];
+        words.extend_from_slice(&alu);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        core.temps[5] = [2.0, 2.0, 2.0, 2.0];
+        let st = run_cf(&mut core, &words, &[], &[]).unwrap();
+        assert_eq!(core.temps[1], [3.0, 3.0, 3.0, 3.0]);
+        assert_eq!(
+            (st.cf_visited, st.alu_executed, st.ctrl_taken, st.ended),
+            (4, 1, 2, true)
+        );
+        // Unconditional jump skips the middle exec.
+        let p0 = cf_pair((11, 0x0000_2002, 0), (1, exec_w0(2, 1), 0));
+        let p1 = cf_pair((2, exec_w0(2, 0), 0), (0, 0, 0));
+        let mut words = vec![p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]];
+        words.extend_from_slice(&alu);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        core.temps[5] = [2.0, 2.0, 2.0, 2.0];
+        let st = run_cf(&mut core, &words, &[], &[]).unwrap();
+        assert_eq!(
+            (st.cf_visited, st.alu_executed, st.ctrl_taken, st.ended),
+            (2, 0, 1, true)
+        );
+        // Gated conditional jump falls through when the bool is clear.
+        let jmp_w1 = (5u32 << 2) | (1 << 10);
+        let p0 = cf_pair((11, 0x0000_0002, jmp_w1), (1, exec_w0(2, 1), 0));
+        let p1 = cf_pair((2, exec_w0(2, 0), 0), (0, 0, 0));
+        let mut words = vec![p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]];
+        words.extend_from_slice(&alu);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        core.temps[5] = [2.0, 2.0, 2.0, 2.0];
+        let st = run_cf(&mut core, &words, &[], &[0]).unwrap();
+        assert_eq!((st.cf_visited, st.alu_executed, st.ctrl_taken), (3, 1, 0));
+        assert_eq!(core.temps[1], [3.0, 3.0, 3.0, 3.0]);
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        core.temps[5] = [2.0, 2.0, 2.0, 2.0];
+        let st = run_cf(&mut core, &words, &[], &[1 << 5]).unwrap();
+        assert_eq!((st.cf_visited, st.ctrl_taken), (2, 1));
+    }
+
+    #[test]
+    fn loop_constant_bits_decode() {
+        let lc = LoopConstant::from_bits(3 | (1 << 8) | (2 << 16));
+        assert_eq!((lc.count, lc.start, lc.step), (3, 1, 2));
+        let lc = LoopConstant::from_bits(1 | (0xFE << 16));
+        assert_eq!((lc.count, lc.start, lc.step), (1, 0, -2));
     }
 
     #[test]

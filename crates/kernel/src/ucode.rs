@@ -80,6 +80,43 @@ impl CfInstr {
         (self.word1 >> 2) & 0xFF
     }
 
+    /// Control-flow target address (loop/call/jmp `address_ : 13`
+    /// at word0 bits 0-12; exec forms use the 12-bit [`Self::address`]
+    /// instead).
+    pub fn cf_target(&self) -> u32 {
+        self.word0 & 0x1FFF
+    }
+
+    /// Loop-constant id (`loop_id_ : 5` at word0 bits 16-20).
+    pub fn loop_id(&self) -> u32 {
+        (self.word0 >> 16) & 0x1F
+    }
+
+    /// Loop-start repeat flag (`is_repeat_` at word0 bit 13:
+    /// reuse the current iterator instead of resetting to 0).
+    pub fn is_repeat(&self) -> bool {
+        (self.word0 >> 13) & 1 != 0
+    }
+
+    /// Loop-end predicated break (`is_predicated_break_` at word0
+    /// bit 21).
+    pub fn is_predicated_break(&self) -> bool {
+        (self.word0 >> 21) & 1 != 0
+    }
+
+    /// Call/jmp unconditional flag (`is_unconditional_` at word0
+    /// bit 13: ignore bool/predicate gating).
+    pub fn is_unconditional(&self) -> bool {
+        (self.word0 >> 13) & 1 != 0
+    }
+
+    /// Call/jmp predicated-vs-bool gating (`is_predicated_` at
+    /// word0 bit 14: predicate check when set, bool-constant
+    /// check when clear).
+    pub fn is_ctrl_predicated(&self) -> bool {
+        (self.word0 >> 14) & 1 != 0
+    }
+
     /// Required bool/predicate value (`condition_ : 1` at word1
     /// bit 10 for cond-exec and predicated-exec forms).
     pub fn condition(&self) -> bool {

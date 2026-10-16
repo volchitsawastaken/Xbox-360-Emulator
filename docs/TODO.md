@@ -442,13 +442,24 @@ Terminal states only: impossible, done, or something rendering.
       (visited=6, alu=4, ended) and ps (visited=2, alu=1, ended).
       First retail code executing in the shader interpreter.
 - [x] CF clause driver (`kernel::uint::run_cf`, reference
-      `ShaderInterpreter::Execute` CF loop): straight-line walk over
+      `ShaderInterpreter::Execute` CF loop): walk over
       the validated CF program executing ALU slots via `eval_alu`
       (bool-constant + predicate gating, end-opcode stop, census).
       `nop`/`alloc`/`fetchdone` no-ops; texture-fetch slots write
       zeros (reference fallback), vertex fetches plus loops, calls,
       jumps, returns are explicit `Unsupported`. Unit-tested
       (run, gating, texture-zero/vertex-error, loop errors).
+- [x] CF control flow (`kernel::uint::run_cf`, reference `Execute`
+      `kLoopStart/kLoopEnd/kCondCall/kReturn/kCondJmp` dispatch +
+      `ucode.h` bit layouts): loops (depth 4, repeat/skip/count-0
+      skip, predicated break, balanced 0-based stack), conditional
+      calls/returns (depth 4, bool/predicate/unconditional gating),
+      conditional jumps; unmatched returns and overflowed nests are
+      faithful no-ops/skips, wild targets explicit errors, 4096-step
+      budget. Loop constants via `run_cf_loops` (`LoopConstant::
+      from_bits`: count/start/signed-step). Unit-tested (3-trip
+      accumulate + skip, call/ret, taken/gated jumps, malformed
+      target, bits decode).
 - [x] ALU relative addressing (`kernel::uint`, reference
       `GetTempRegisterIndex`/`GetFloatConstant`/`GetLoopAddress`):
       temp dests/sources fold aL (`(base + aL) & 63`, clamped
