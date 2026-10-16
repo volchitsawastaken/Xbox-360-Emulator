@@ -193,25 +193,32 @@ Terminal states only: impossible, done, or something rendering.
       signal source (GPU completion for init packets vs D3D
       device state) — draw backend / device work continues to be
       the unblocker, now with the callback's requirements mapped
-- [ ] Dash frontier (HostDirFs boot): 63 imports to a table walk at
-      `0x921B86BC` (`lwz r8,896(r11)`), fully decoded this session:
-      prologue sets r27=r31+896 (table = object itself +896),
-      r24=bound from the `[r31+872]` flag word via cntlzw/xoris/addic
-      (0x102A1101 -> 0x10002; the EQ-skip branch is dead — the walk
-      always runs), r25=r31+40 expansion cursor (+416/iter). Each
-      slot is read as a struct pointer (entry+r31, fields
-      +872/+896/+900); zero/small entries are safe, slot 6 holds
-      version-string bytes ("vs_3_0.2.0.9407.0" → r11=0x603400A2).
-      The 148B header (flag+ints+version) is one faithful static
-      memcpy (dst=obj+872, src=0x920376A8, len 0x94); the 1028B
-      object comes from H (0x921B8740, called from E70 via
-      0x92370E9C, backtraced) with static-derived size. The dash
-      opens ZERO files (no NtCreateFile/NtOpenFile traffic at all),
-      so the table is static+import driven; every link in the
-      H→copy→walk chain is statically determined, yet the walk
-      faults on static string bytes — same COUNT-vs-DATA class as
-      Braid, root cause still open (needs trace-diff harness or a
-      verified-good image hash to exclude loader/data drift)
+- [ ] Dash frontier (HostDirFs boot): walk starts ~1.16M steps in
+      (past the 1M gate — the gate stays a progress floor, not the
+      fault). Fully solved this session down to the mechanism:
+      bound chain verified CORRECT instruction by instruction
+      (`lwz r11,872(r31)` → `rlwinm ..,26,26` extracts flag bit5=0
+      → `cntlzw`=32 → `rlwinm ..,27,31,31`=1 → `xoris …,1`
+      (0x10001 — immediate is shifted, easy to mis-derive as 1) →
+      `addic_` = 0x10002; the `or r24,r11,r11` dest convention
+      confirmed empirically via register trace). Walk: r24=0x10002
+      init, r27 cursor from r31+896 striding +8/iter, -1 slot
+      marks at +416 stride (the "flag overwrite" is the walk's own
+      marking, not an anomalous writer — table otherwise
+      byte-identical to the static 148B copy, 36/37 words).
+      Fault at iteration 6: slot word 0x5F300032 (version-string
+      bytes "_0\02") read as an offset → r11=0x603400A2 wild →
+      AlignmentFault on `[r11+896]`. Thread states at fault: th0
+      in-walk, th1 parked pre-dispatch infinite KeWait (image obj),
+      th2 mid-import-return, rest spare. No vectored-exception
+      registrations (fault-tolerance theory ruled out); no
+      KeSetEvent anywhere in dash either (thunk exists, never
+      called). Root cause still open: identical static bytes must
+      fault identically on hardware, so either the walk should
+      never reach iteration 6 (early-exit evaluation differs?) or
+      the slots should hold live pointers by walk time (a
+      concurrent filler starved by scheduling?). Needs a
+      memory-map answer for 0x603400A2 or hardware trace-diff.
 
 ## Next (retail-driven, in expected order)
 
