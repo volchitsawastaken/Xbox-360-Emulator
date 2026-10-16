@@ -821,6 +821,75 @@ impl FetchInstr {
     pub fn pred_condition(&self) -> bool {
         (self.dwords[2] >> 31) & 1 != 0
     }
+
+    /// Vertex-fetch constant selector (`const_index_sel : 2` at
+    /// d0 bits 25-26; the effective index is
+    /// `const_index * 3 + sel`, reference
+    /// `VertexFetchInstruction::fetch_constant_index`).
+    pub fn vf_const_sel(&self) -> u32 {
+        (self.dwords[0] >> 25) & 3
+    }
+
+    /// Effective vertex-fetch constant index [0-95].
+    pub fn vf_const_index(&self) -> u32 {
+        self.const_index() * 3 + self.vf_const_sel()
+    }
+
+    /// Vertex source component (`src_swiz : 2` at d0 bits 30-31).
+    pub fn vf_src_swiz(&self) -> u32 {
+        (self.dwords[0] >> 30) & 3
+    }
+
+    /// Signed components (`fomat_comp_all`, d1 bit 12).
+    pub fn vf_signed(&self) -> bool {
+        (self.dwords[1] >> 12) & 1 != 0
+    }
+
+    /// Normalized [0,1]/[-1,1] range (`num_format_all == 0`, d1
+    /// bit 13 clear means normalized).
+    pub fn vf_normalized(&self) -> bool {
+        (self.dwords[1] >> 13) & 1 == 0
+    }
+
+    /// OpenGL-style no-zero repeating-fraction mode
+    /// (`signed_rf_mode_all`, d1 bit 14).
+    pub fn vf_rf_no_zero(&self) -> bool {
+        (self.dwords[1] >> 14) & 1 != 0
+    }
+
+    /// Rounded (floor(x + 0.5)) vs floored vertex index
+    /// (`is_index_rounded`, d1 bit 15).
+    pub fn vf_index_rounded(&self) -> bool {
+        (self.dwords[1] >> 15) & 1 != 0
+    }
+
+    /// Vertex data format (`format : 6`, d1 bits 16-21; reference
+    /// `xenos::VertexFormat`).
+    pub fn vf_format(&self) -> u32 {
+        (self.dwords[1] >> 16) & 0x3F
+    }
+
+    /// Exponent adjustment (`exp_adjust : 6`, d1 bits 24-29,
+    /// signed; results scale by 2^adjust).
+    pub fn vf_exp_adjust(&self) -> i32 {
+        (((self.dwords[1] >> 24) & 0x3F) as i32) << 26 >> 26
+    }
+
+    /// Mini fetch (`is_mini_fetch`, d1 bit 30: reuses the last full
+    /// fetch's constant and address).
+    pub fn vf_mini(&self) -> bool {
+        (self.dwords[1] >> 30) & 1 != 0
+    }
+
+    /// Dword stride (`stride : 8`, d2 bits 0-7).
+    pub fn vf_stride(&self) -> u32 {
+        self.dwords[2] & 0xFF
+    }
+
+    /// Dword offset (`offset : 23`, d2 bits 8-30, sign-extended).
+    pub fn vf_offset(&self) -> i32 {
+        (((self.dwords[2] >> 8) & 0x7F_FFFF) as i32) << 9 >> 9
+    }
 }
 
 /// Fetch opcode mnemonic (reference `ParseTextureFetchInstruction`
@@ -1142,6 +1211,35 @@ mod tests {
         assert_eq!(f.dst_swizzle(), 0x01E8);
         assert!(f.is_predicated());
         assert!(f.pred_condition());
+    }
+
+    #[test]
+    fn vertex_fetch_fields_decode() {
+        // Full vfetch: opcode 0, src r7, dst r3, const 11 sel 2,
+        // signed + normalized + index-rounded, format 36
+        // (k_32_FLOAT), exp_adjust -1, stride 16, offset -4.
+        let d0 = (7u32 << 5) | (3 << 12) | (11 << 20) | (2 << 25);
+        let d1 = (1 << 12) | (36 << 16) | (0x3F << 24);
+        let d2 = 16 | (((-4i32 as u32) & 0x7F_FFFF) << 8);
+        let f = parse_fetch(&[d0, d1, d2]);
+        assert_eq!(f.opcode(), 0);
+        assert_eq!(f.vf_const_index(), 11 * 3 + 2);
+        assert!(f.vf_signed());
+        assert!(f.vf_normalized());
+        assert!(!f.vf_index_rounded());
+        assert_eq!(f.vf_format(), 36);
+        assert_eq!(f.vf_exp_adjust(), -1);
+        assert!(!f.vf_mini());
+        assert_eq!(f.vf_stride(), 16);
+        assert_eq!(f.vf_offset(), -4);
+        // Mini fetch with unnormalized + rf-no-zero + rounded.
+        let d1 = (1 << 13) | (1 << 14) | (1 << 15) | (6 << 16) | (1 << 30);
+        let f = parse_fetch(&[d0, d1, d2]);
+        assert!(!f.vf_normalized());
+        assert!(f.vf_rf_no_zero());
+        assert!(f.vf_index_rounded());
+        assert!(f.vf_mini());
+        assert_eq!(f.vf_src_swiz(), 0);
     }
 
     #[test]
