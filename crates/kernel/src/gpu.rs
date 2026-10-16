@@ -96,6 +96,38 @@ const REG_VGT_DRAW_INITIATOR: u32 = 0x21FC;
 const REG_RB_SURFACE_INFO: u32 = 0x2000;
 const REG_RB_COLOR_INFO: u32 = 0x2001;
 
+/// Viewport registers (floats, reference `register_table.inc`).
+const REG_PA_CL_VPORT_XSCALE: u32 = 0x210F;
+const REG_PA_CL_VPORT_XOFFSET: u32 = 0x2110;
+const REG_PA_CL_VPORT_YSCALE: u32 = 0x2111;
+const REG_PA_CL_VPORT_YOFFSET: u32 = 0x2112;
+
+/// Viewport transform (reference `PA_CL_VPORT_*`): screen =
+/// NDC * scale + offset, applied after the w-divide.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Viewport {
+    /// X scale/offset.
+    pub xscale: f32,
+    /// X scale/offset.
+    pub xoffset: f32,
+    /// Y scale/offset.
+    pub yscale: f32,
+    /// Y scale/offset.
+    pub yoffset: f32,
+}
+
+impl Viewport {
+    /// NDC (post-w-divide) to screen pixels. A zero `w` never
+    /// reaches here (clipped at the draw site); NaN propagates
+    /// rather than inventing pixels.
+    pub fn ndc_to_screen(&self, ndc: [f32; 3]) -> [f32; 2] {
+        [
+            ndc[0].mul_add(self.xscale, self.xoffset),
+            ndc[1].mul_add(self.yscale, self.yoffset),
+        ]
+    }
+}
+
 /// Decoded color render surface (reference `RB_SURFACE_INFO` +
 /// `RB_COLOR_INFO` bit layouts). Facts only; use sites validate
 /// format/MSAA support explicitly.
@@ -375,6 +407,18 @@ impl Kernel {
             msaa: (info >> 16) & 3,
             base_tiles: (color & 0x7FF) | (((color >> 11) & 1) << 11),
             color_format: (color >> 16) & 0xF,
+        }
+    }
+
+    /// Decode the programmed viewport (reference `PA_CL_VPORT_*`;
+    /// unprogrammed reads as zeros, matching the zeroed file).
+    pub fn collect_viewport(&self) -> Viewport {
+        let f = |reg: u32| f32::from_bits(self.vd_regs.get(&reg).copied().unwrap_or(0));
+        Viewport {
+            xscale: f(REG_PA_CL_VPORT_XSCALE),
+            xoffset: f(REG_PA_CL_VPORT_XOFFSET),
+            yscale: f(REG_PA_CL_VPORT_YSCALE),
+            yoffset: f(REG_PA_CL_VPORT_YOFFSET),
         }
     }
 
@@ -1162,6 +1206,27 @@ mod tests {
         let si = kernel().collect_shader_inputs();
         assert_eq!(si.floats[0], [0.0; 4]);
         assert_eq!(si.bools, [0, 0]);
+    }
+
+    #[test]
+    fn viewport_decodes_and_maps() {
+        let mut k = kernel();
+        // 1280x720 viewport: scale (640, 360), offset (640, 360).
+        k.vd_regs.insert(0x210F, 640f32.to_bits());
+        k.vd_regs.insert(0x2110, 640f32.to_bits());
+        k.vd_regs.insert(0x2111, 360f32.to_bits());
+        k.vd_regs.insert(0x2112, 360f32.to_bits());
+        let v = k.collect_viewport();
+        assert_eq!(
+            (v.xscale, v.xoffset, v.yscale, v.yoffset),
+            (640.0, 640.0, 360.0, 360.0)
+        );
+        assert_eq!(v.ndc_to_screen([-1.0, -1.0, 0.0]), [0.0, 0.0]);
+        assert_eq!(v.ndc_to_screen([1.0, 1.0, 0.0]), [1280.0, 720.0]);
+        assert_eq!(v.ndc_to_screen([0.5, -0.5, 0.0]), [960.0, 180.0]);
+        // Zero regs map everything to the origin.
+        let v = kernel().collect_viewport();
+        assert_eq!(v.ndc_to_screen([1.0, 1.0, 0.0]), [0.0, 0.0]);
     }
 
     #[test]

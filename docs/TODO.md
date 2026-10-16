@@ -533,6 +533,9 @@ Terminal states only: impossible, done, or something rendering.
       reset, no-export error). First geometry out of the
       retail-format shader path (synthetic; retail draws await
       surface/device state).
+- [x] Viewport decode + NDC mapping (`kernel::gpu`, reference
+      `PA_CL_VPORT_*`): scale/offset collection, `ndc_to_screen`
+      (mul_add, NaN-propagating). Unit-tested.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
