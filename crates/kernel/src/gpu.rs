@@ -167,6 +167,50 @@ pub fn prim_type_name(prim: u32) -> &'static str {
     }
 }
 
+/// Fetch draw indices from guest memory (reference
+/// `primitive_processor.cc` index loading): DMA draws read
+/// `num_indices` clamped to `dma_num_words`, endian-swapped per
+/// lane width; auto-index draws yield `0..num_indices`;
+/// immediate draws are an explicit error (reference `VGT_IMMED_DATA`
+/// path is unimplemented there too).
+pub fn fetch_draw_indices(mem: &Memory, desc: &DrawDesc) -> Result<Vec<u32>> {
+    if desc.source == 2 {
+        return Ok((0..desc.num_indices).collect());
+    }
+    if desc.source != 0 {
+        return Err(EmuError::Unsupported(format!(
+            "draw immediate source {} pending",
+            desc.source
+        )));
+    }
+    let n = desc.num_indices.min(desc.dma_num_words);
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        if desc.index_32bit {
+            let bytes = desc
+                .dma_base_dwords
+                .wrapping_mul(4)
+                .wrapping_add(i.wrapping_mul(4));
+            let w = mem
+                .read_u32(bytes)
+                .map_err(|e| EmuError::Other(format!("draw index {:08x}: {}", bytes, e)))?;
+            out.push(gpu_swap(w, desc.dma_endian)?);
+        } else {
+            let byte = desc
+                .dma_base_dwords
+                .wrapping_mul(4)
+                .wrapping_add(i.wrapping_mul(2));
+            let half = (byte / 2) * 2;
+            let w = mem
+                .read_u32(half & !3)
+                .map_err(|e| EmuError::Other(format!("draw index {:08x}: {}", half, e)))?;
+            let w = gpu_swap(w, desc.dma_endian)?;
+            out.push(if byte & 2 != 0 { w & 0xFFFF } else { w >> 16 });
+        }
+    }
+    Ok(out)
+}
+
 /// Maximum IB nesting (reference recurses; real streams nest shallowly).
 const MAX_IB_DEPTH: u32 = 8;
 /// Runaway guard per pump call (packets, not steps).
@@ -1351,6 +1395,48 @@ mod tests {
             .gpu_exec_linear(&mut m, &[0xC000_3600], 0, &mut st, &mut seen)
             .is_err());
         assert_eq!(k.vd_draws.len(), 2);
+    }
+
+    #[test]
+    fn draw_indices_fetch_from_memory() {
+        let mut m = Memory::new();
+        // Auto-index yields 0..n without touching memory.
+        let auto = DrawDesc {
+            source: 2,
+            num_indices: 3,
+            ..DrawDesc::default()
+        };
+        assert_eq!(fetch_draw_indices(&m, &auto).unwrap(), vec![0, 1, 2]);
+        // Immediate source stays explicit.
+        let imm = DrawDesc {
+            source: 1,
+            ..DrawDesc::default()
+        };
+        assert!(fetch_draw_indices(&m, &imm).is_err());
+        // 32-bit DMA, clamped to the word count.
+        m.write_u32(0x0100_9000, 7).unwrap();
+        m.write_u32(0x0100_9004, 9).unwrap();
+        m.write_u32(0x0100_9008, 11).unwrap();
+        let dma32 = DrawDesc {
+            source: 0,
+            index_32bit: true,
+            num_indices: 5,
+            dma_base_dwords: 0x0100_9000 / 4,
+            dma_num_words: 3,
+            ..DrawDesc::default()
+        };
+        assert_eq!(fetch_draw_indices(&m, &dma32).unwrap(), vec![7, 9, 11]);
+        // 16-bit DMA halves in BE order.
+        m.write_u32(0x0100_9100, 0x0001_0002).unwrap();
+        m.write_u32(0x0100_9104, 0x0003_0004).unwrap();
+        let dma16 = DrawDesc {
+            source: 0,
+            num_indices: 4,
+            dma_base_dwords: 0x0100_9100 / 4,
+            dma_num_words: 4,
+            ..DrawDesc::default()
+        };
+        assert_eq!(fetch_draw_indices(&m, &dma16).unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[test]

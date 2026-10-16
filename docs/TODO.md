@@ -513,6 +513,11 @@ Terminal states only: impossible, done, or something rendering.
 - [x] Render-surface decode (`kernel::gpu`, reference
       `RB_SURFACE_INFO`/`RB_COLOR_INFO`): pitch-px, MSAA, 12-bit
       tile base, color format + tile-pitch helper. Unit-tested.
+- [x] Draw-index fetch (`kernel::gpu::fetch_draw_indices`,
+      reference `primitive_processor.cc` index loading): DMA reads
+      clamped to the word count (32-bit words / BE 16-bit halves,
+      endian-swapped); auto-index yields `0..n`; immediate is
+      explicit `Unsupported` (as in the reference). Unit-tested.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
