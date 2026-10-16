@@ -287,9 +287,14 @@ Terminal states only: impossible, done, or something rendering.
       `DRAW_INDX_2` (0x36) length-skips but COUNTS draws_seen (draw
       demand signal, never silent); unit-tested. Retail Braid uploads
       one shader in init (now stored); no draws issued pre-device.
-- [ ] Draw backend remainder (shader translation + EDRAM tiling for
-      patterned content — the substantial part; present path below
-      covers solid-cleared surfaces end to end)
+- [x] Draw-descriptor decode (`kernel::gpu` `DRAW_INDX_2`,
+      reference `ExecutePacketType3Draw` + `VGT_DRAW_INITIATOR` /
+      `VGT_DMA_SIZE` layouts): prim/source/major/index-size/count
+      + DMA base (CpuToGpu-masked, index-aligned), word count,
+      endian; initiator + DMA regs mirrored to `vd_regs`;
+      descriptors recorded in `vd_draws` (execution still pending,
+      `draws_seen` kept). Truncated packets are explicit errors.
+      Unit-tested (DMA/auto-index/short/mnemonics).
 - [x] EDRAM clear/resolve state (reference `xenos.h` 10 MiB sizing):
       10 MiB backing, solid-32bpp clear (tiling-independent, exact),
       linear resolve to DRAM with explicit OOB errors; unit-tested.

@@ -166,6 +166,11 @@ pub struct Kernel {
     /// yet, but each present queues the vblank interrupt exactly like
     /// reference `MarkVblank`).
     pub vd_swaps: u64,
+    /// Decoded draw descriptors (`DRAW_INDX_2`, reference
+    /// `ExecutePacketType3Draw` initiator/DMA parsing). Execution
+    /// is still pending, but descriptors + register mirroring are
+    /// genuine CPU-visible state for forensics.
+    pub vd_draws: Vec<crate::gpu::DrawDesc>,
     /// Free-running vblank beats since display init (reference
     /// `GraphicsSystem::MarkVblank` counter). Advanced by the
     /// frame-pacing path below, even with no swap yet.
@@ -391,6 +396,7 @@ impl Kernel {
             vd_ps_ucode: Vec::new(),
             vd_edram: vec![0; crate::gpu::EDRAM_SIZE],
             vd_swaps: 0,
+            vd_draws: Vec::new(),
             vd_vblank_count: 0,
             vd_last_vblank: None,
             vd_gpu_identifier: None,

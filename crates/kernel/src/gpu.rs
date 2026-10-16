@@ -86,6 +86,59 @@ pub const REG_SHADER_LOOP_BASE: u32 = 0x4908;
 /// Loop-constant count.
 pub const SHADER_LOOP_COUNT: usize = 32;
 
+/// VGT draw registers mirrored by draws (reference
+/// `register_table.inc`).
+const REG_VGT_DMA_BASE: u32 = 0x21FA;
+const REG_VGT_DMA_SIZE: u32 = 0x21FB;
+const REG_VGT_DRAW_INITIATOR: u32 = 0x21FC;
+
+/// Decoded draw descriptor (reference
+/// `ExecutePacketType3Draw` + `VGT_DRAW_INITIATOR` bit layout:
+/// prim_type :6, source_select :2, major_mode :2, index_size :1,
+/// num_indices :16; `VGT_DMA_SIZE`: num_words :24, swap :2 at 30).
+/// Execution is pending; the descriptor and the register mirror
+/// are genuine state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrawDesc {
+    /// Primitive type (6 bits, reference `PrimitiveType`).
+    pub prim_type: u32,
+    /// Index source (0 DMA, 1 immediate, 2 auto-index).
+    pub source: u32,
+    /// True when the major-mode explicit bit is set (reference
+    /// `IsMajorModeExplicit`; the primitive-forced case resolves
+    /// at execution).
+    pub major_explicit: bool,
+    /// 32-bit indices (else 16-bit).
+    pub index_32bit: bool,
+    /// Index/vertex count.
+    pub num_indices: u32,
+    /// DMA base in dwords (`CpuToGpu`: masked to 29 bits, aligned
+    /// down by index size; non-DMA draws use 0).
+    pub dma_base_dwords: u32,
+    /// DMA word count (0 for non-DMA draws).
+    pub dma_num_words: u32,
+    /// DMA endian swap mode (0-3).
+    pub dma_endian: u32,
+}
+
+/// Primitive-type mnemonic (reference `PrimitiveType` names;
+/// unknown values print raw, never fault).
+pub fn prim_type_name(prim: u32) -> &'static str {
+    match prim {
+        0 => "none",
+        1 => "pointlist",
+        2 => "linelist",
+        3 => "linestrip",
+        4 => "trilist",
+        5 => "trifan",
+        6 => "tristrip",
+        7 => "triwflags",
+        8 => "rectlist",
+        12 => "lineloop",
+        _ => "prim?",
+    }
+}
+
 /// Maximum IB nesting (reference recurses; real streams nest shallowly).
 const MAX_IB_DEPTH: u32 = 8;
 /// Runaway guard per pump call (packets, not steps).
@@ -758,13 +811,55 @@ impl Kernel {
                 Ok(c + 1 + cnt)
             }
             OP_DRAW_INDX_2 => {
-                // Indexed draw (reference `ExecutePacketType3_DRAW_INDX_2`
-                // → full draw). No draw backend yet: length-skip the
-                // whole packet but COUNT it explicitly (draw demand
-                // signal for backend prioritization, never silent).
-                if seen_opcodes.insert(opcode) {
-                    log::info!("kernel: PM4 op 36 (DRAW_INDX_2) seen, skipped (no draw backend)");
+                // Indexed draw descriptor (reference
+                // `ExecutePacketType3_DRAW_INDX_2` → `ExecutePacketType3Draw`
+                // with no viz token): `[VGT_DRAW_INITIATOR, ...]`.
+                // Decode + mirror + record (genuine CPU-visible
+                // state); execution is still pending, counted in
+                // `draws_seen` like before.
+                if cnt < 1 {
+                    return Err(EmuError::Other("PM4 short DRAW_INDX_2".into()));
                 }
+                let initiator = p(0);
+                self.vd_regs.insert(REG_VGT_DRAW_INITIATOR, initiator);
+                let source = (initiator >> 6) & 3;
+                let index_32bit = (initiator >> 11) & 1 != 0;
+                let mut desc = DrawDesc {
+                    prim_type: initiator & 0x3F,
+                    source,
+                    major_explicit: (initiator >> 8) & 3 != 0,
+                    index_32bit,
+                    num_indices: (initiator >> 16) & 0xFFFF,
+                    ..DrawDesc::default()
+                };
+                if source == 0 {
+                    // DMA-indexed: two more words or an explicit
+                    // truncation error (reference returns false).
+                    if cnt < 3 {
+                        return Err(EmuError::Other(
+                            "PM4 DRAW_INDX_2 short DMA base/size".into(),
+                        ));
+                    }
+                    // `CpuToGpu`: mask to 29 bits (dword-mapped
+                    // writeback/XPS window wraps in the translators).
+                    let base = p(1) & 0x1FFF_FFFF;
+                    let size = p(2);
+                    self.vd_regs.insert(REG_VGT_DMA_BASE, base);
+                    self.vd_regs.insert(REG_VGT_DMA_SIZE, size);
+                    let align = if index_32bit { 4 } else { 2 };
+                    desc.dma_base_dwords = base & !(align - 1);
+                    desc.dma_num_words = size & 0xFF_FFFF;
+                    desc.dma_endian = (size >> 30) & 3;
+                }
+                if seen_opcodes.insert(opcode) {
+                    log::info!(
+                        "kernel: PM4 DRAW_INDX_2 {} x{} ({}pending execution)",
+                        prim_type_name(desc.prim_type),
+                        desc.num_indices,
+                        if source == 0 { "dma, " } else { "" }
+                    );
+                }
+                self.vd_draws.push(desc);
                 st.draws_seen += 1;
                 Ok(c + 1 + cnt)
             }
@@ -1146,6 +1241,55 @@ mod tests {
         assert_eq!(st.invalidates, 1);
         assert_eq!(st.draws_seen, 1);
         assert_eq!(st.skipped_packets, 0);
+    }
+
+    #[test]
+    fn draw_indx2_decodes_and_mirrors() {
+        let mut k = kernel();
+        let mut m = Memory::new();
+        // DMA trilist, 32-bit indices, 6 indices; base odd aligns
+        // down, endian 3, 9 words.
+        let initiator = 4 | (1 << 11) | (6 << 16);
+        let words = vec![0xC002_3600, initiator, 0x0100_8001, (3 << 30) | 9];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .unwrap();
+        assert_eq!(st.draws_seen, 1);
+        assert_eq!(k.vd_draws.len(), 1);
+        assert_eq!(
+            k.vd_draws[0],
+            DrawDesc {
+                prim_type: 4,
+                source: 0,
+                major_explicit: false,
+                index_32bit: true,
+                num_indices: 6,
+                dma_base_dwords: 0x0100_8000,
+                dma_num_words: 9,
+                dma_endian: 3,
+            }
+        );
+        assert_eq!(k.vd_regs.get(&0x21FC), Some(&initiator));
+        assert_eq!(k.vd_regs.get(&0x21FA), Some(&0x0100_8001));
+        // Auto-index draw needs no DMA words.
+        let words = vec![0xC000_3600, 4 | (2 << 6) | (3 << 16)];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .unwrap();
+        assert_eq!(k.vd_draws.len(), 2);
+        assert_eq!(k.vd_draws[1].source, 2);
+        assert_eq!(k.vd_draws[1].dma_num_words, 0);
+        assert_eq!(prim_type_name(4), "trilist");
+        assert_eq!(prim_type_name(42), "prim?");
+        // Truncated packets are explicit errors, never partial draws.
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        assert!(k
+            .gpu_exec_linear(&mut m, &[0xC000_3600], 0, &mut st, &mut seen)
+            .is_err());
+        assert_eq!(k.vd_draws.len(), 2);
     }
 
     #[test]
