@@ -506,6 +506,9 @@ Terminal states only: impossible, done, or something rendering.
       Retail Braid programs none of these pre-device (verified 42
       control regs only), so this is draw-backend plumbing ahead of
       demand.
+- [x] Render-surface decode (`kernel::gpu`, reference
+      `RB_SURFACE_INFO`/`RB_COLOR_INFO`): pitch-px, MSAA, 12-bit
+      tile base, color format + tile-pitch helper. Unit-tested.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

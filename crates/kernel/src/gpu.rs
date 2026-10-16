@@ -92,6 +92,34 @@ const REG_VGT_DMA_BASE: u32 = 0x21FA;
 const REG_VGT_DMA_SIZE: u32 = 0x21FB;
 const REG_VGT_DRAW_INITIATOR: u32 = 0x21FC;
 
+/// Render-surface registers (reference `register_table.inc`).
+const REG_RB_SURFACE_INFO: u32 = 0x2000;
+const REG_RB_COLOR_INFO: u32 = 0x2001;
+
+/// Decoded color render surface (reference `RB_SURFACE_INFO` +
+/// `RB_COLOR_INFO` bit layouts). Facts only; use sites validate
+/// format/MSAA support explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderSurface {
+    /// Surface pitch in pixels (`surface_pitch :14`).
+    pub pitch_px: u32,
+    /// MSAA level (`msaa_samples :2`: 0=1x, 1=2x, 2=4x).
+    pub msaa: u32,
+    /// EDRAM base in tiles (`color_base :11` + bit 11).
+    pub base_tiles: u32,
+    /// Color format (`color_format :4`, reference
+    /// `ColorRenderTargetFormat`).
+    pub color_format: u32,
+}
+
+impl RenderSurface {
+    /// Pitch in 80-sample tiles (rounded up; a zero pixel pitch
+    /// stays zero and use sites reject it).
+    pub fn pitch_tiles(&self) -> u32 {
+        self.pitch_px.div_ceil(EDRAM_TILE_W)
+    }
+}
+
 /// Decoded draw descriptor (reference
 /// `ExecutePacketType3Draw` + `VGT_DRAW_INITIATOR` bit layout:
 /// prim_type :6, source_select :2, major_mode :2, index_size :1,
@@ -288,6 +316,21 @@ impl Kernel {
             fetch,
             bools,
             loops,
+        }
+    }
+
+    /// Decode the programmed color render surface (reference
+    /// `RB_SURFACE_INFO` pitch/MSAA + `RB_COLOR_INFO` base/format).
+    /// Unprogrammed registers decode as zeros (base 0, pitch 0,
+    /// 1x MSAA, `k_8_8_8_8`); use sites validate support.
+    pub fn collect_render_surface(&self) -> RenderSurface {
+        let info = self.vd_regs.get(&REG_RB_SURFACE_INFO).copied().unwrap_or(0);
+        let color = self.vd_regs.get(&REG_RB_COLOR_INFO).copied().unwrap_or(0);
+        RenderSurface {
+            pitch_px: info & 0x3FFF,
+            msaa: (info >> 16) & 3,
+            base_tiles: (color & 0x7FF) | (((color >> 11) & 1) << 11),
+            color_format: (color >> 16) & 0xF,
         }
     }
 
@@ -1075,6 +1118,24 @@ mod tests {
         let si = kernel().collect_shader_inputs();
         assert_eq!(si.floats[0], [0.0; 4]);
         assert_eq!(si.bools, [0, 0]);
+    }
+
+    #[test]
+    fn render_surface_decodes_regs() {
+        let mut k = kernel();
+        // Pitch 1280px, 4x MSAA; base tiles 0xABC, format 0.
+        k.vd_regs.insert(0x2000, 1280 | (2 << 16));
+        k.vd_regs.insert(0x2001, 0xABC);
+        let s = k.collect_render_surface();
+        assert_eq!(
+            (s.pitch_px, s.msaa, s.base_tiles, s.color_format),
+            (1280, 2, 0xABC, 0)
+        );
+        assert_eq!(s.pitch_tiles(), 16);
+        // Zero regs decode as the default surface.
+        let s = kernel().collect_render_surface();
+        assert_eq!((s.pitch_px, s.base_tiles), (0, 0));
+        assert_eq!(s.pitch_tiles(), 0);
     }
 
     #[test]
