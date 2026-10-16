@@ -465,6 +465,72 @@ impl AluInstr {
         (self.d0() >> 14) & 1 != 0
     }
 
+    /// Constant absolute flag (d0 bit 7, reference `abs_constants`).
+    /// Dead in the interpreter path (vector/1-operand scalar sources
+    /// only absolutize temps; the 2-operand const-reg form never
+    /// reaches it) but decoded for completeness.
+    pub fn abs_constants(&self) -> bool {
+        (self.d0() >> 7) & 1 != 0
+    }
+
+    /// Const-0 relative flag (d1 bit 31, reference `const_0_rel_abs`).
+    pub fn is_const_0_addressed(&self) -> bool {
+        (self.d1() >> 31) & 1 != 0
+    }
+
+    /// Const-1 relative flag (d1 bit 30, reference `const_1_rel_abs`).
+    pub fn is_const_1_addressed(&self) -> bool {
+        (self.d1() >> 30) & 1 != 0
+    }
+
+    /// Const base selector (d1 bit 29): true selects the address
+    /// register (a0), false selects the loop address (aL)
+    /// (reference `const_address_register_relative`; temps are only
+    /// absolute or aL-relative, never a0).
+    pub fn is_const_address_register_relative(&self) -> bool {
+        (self.d1() >> 29) & 1 != 0
+    }
+
+    /// Whether const operand `i` (1-3) uses relative addressing
+    /// (reference `src_const_is_addressed`: const_0 covers the first
+    /// const operand, const_1 once any earlier operand is a const).
+    pub fn src_const_is_addressed(&self, i: u32) -> bool {
+        match i {
+            1 => self.is_const_0_addressed(),
+            2 => {
+                if self.src_is_temp(1) {
+                    self.is_const_0_addressed()
+                } else {
+                    self.is_const_1_addressed()
+                }
+            }
+            _ => {
+                if self.src_is_temp(1) && self.src_is_temp(2) {
+                    self.is_const_0_addressed()
+                } else {
+                    self.is_const_1_addressed()
+                }
+            }
+        }
+    }
+
+    /// Temp base index (low 6 bits, reference `src_temp_reg`).
+    pub fn src_temp_reg(reg: u32) -> u32 {
+        reg & 0x3F
+    }
+
+    /// Temp aL-relative flag (bit 6, reference
+    /// `is_src_temp_relative`).
+    pub fn is_src_temp_relative(reg: u32) -> bool {
+        reg & 0x40 != 0
+    }
+
+    /// Temp absolute-value flag (bit 7, reference
+    /// `is_src_temp_value_absolute`).
+    pub fn is_src_temp_value_absolute(reg: u32) -> bool {
+        reg & 0x80 != 0
+    }
+
     /// One source operand in disassembly form (`[-]rN` / `[-]cN`).
     pub fn src_operand(&self, i: u32) -> String {
         let reg = if self.src_is_temp(i) {
@@ -691,6 +757,32 @@ impl FetchInstr {
     /// Texture dimension (0=1D, 1=2D, 2=3D, 3=Cube).
     pub fn dimension(&self) -> u32 {
         (self.dwords[2] >> 14) & 3
+    }
+
+    /// Destination swizzle (d1 low 12 bits, 3 bits per component,
+    /// reference `dst_swiz` + `GetFetchDestinationComponentSwizzle`).
+    pub fn dst_swizzle(&self) -> u32 {
+        self.dwords[1] & 0xFFF
+    }
+
+    /// Destination aL-relative flag (d0 bit 18, reference `dst_reg_am`).
+    pub fn is_dest_relative(&self) -> bool {
+        (self.dwords[0] >> 18) & 1 != 0
+    }
+
+    /// Source aL-relative flag (d0 bit 11, reference `src_reg_am`).
+    pub fn is_src_relative(&self) -> bool {
+        (self.dwords[0] >> 11) & 1 != 0
+    }
+
+    /// Predicated fetch (d1 bit 31, reference `is_predicated`).
+    pub fn is_predicated(&self) -> bool {
+        (self.dwords[1] >> 31) & 1 != 0
+    }
+
+    /// Required predicate value (d2 bit 31, reference `pred_condition`).
+    pub fn pred_condition(&self) -> bool {
+        (self.dwords[2] >> 31) & 1 != 0
     }
 }
 
@@ -983,6 +1075,36 @@ mod tests {
             disassemble_alu(&d),
             "(p0) alu mad_sat r1.xyzw adds_sat r2 src1=c4 src2=c5 src3=c6"
         );
+    }
+
+    #[test]
+    fn alu_relative_and_fetch_bits_decode() {
+        // ALU const-addressing bits built with code shifts (d1):
+        // const_0 (bit31) + a0-select (bit29).
+        let d0 = (1 & 0x3F) | (0xF << 16);
+        let d1 = (1 << 31) | (1 << 29);
+        let d2 = (4 << 16) | (5 << 8);
+        let a = parse_alu(&[d0, d1, d2]);
+        assert!(a.is_const_0_addressed());
+        assert!(!a.is_const_1_addressed());
+        assert!(a.is_const_address_register_relative());
+        assert!(!a.abs_constants());
+        // First const operand uses const_0; temp helpers split the pack.
+        assert!(a.src_const_is_addressed(1));
+        assert_eq!(AluInstr::src_temp_reg(4 | 0x40 | 0x80), 4);
+        assert!(AluInstr::is_src_temp_relative(4 | 0x40));
+        assert!(AluInstr::is_src_temp_value_absolute(4 | 0x80));
+        assert!(!AluInstr::is_src_temp_relative(4));
+        // Fetch dest/src relative + swizzle + predication bits.
+        let d0 = (1 & 0x1F) | ((7 & 0x3F) << 5) | (1 << 11) | ((3 & 0x3F) << 12) | (1 << 18);
+        let d1 = 0x01E8 | (1 << 31);
+        let d2 = (1 << 14) | (1 << 31);
+        let f = parse_fetch(&[d0, d1, d2]);
+        assert!(f.is_src_relative());
+        assert!(f.is_dest_relative());
+        assert_eq!(f.dst_swizzle(), 0x01E8);
+        assert!(f.is_predicated());
+        assert!(f.pred_condition());
     }
 
     #[test]

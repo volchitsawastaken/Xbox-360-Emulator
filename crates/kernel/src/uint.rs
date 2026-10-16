@@ -1,7 +1,8 @@
 //! CPU-side ALU clause interpreter (single invocation).
 //!
 //! Evaluation facts ported from the BSD-licensed Xenia
-//! `shader_interpreter.cc` `ExecuteAluInstruction` (+ helpers):
+//! `shader_interpreter.cc` `ExecuteAluInstruction` (+ helpers) and
+//! `shader_interpreter.h` address helpers:
 //! - 64 temp registers (`kMaxShaderTempRegisters`), index wrapped
 //!   mod 64; out-of-range float constants read as zeros.
 //! - `FlushDenormal`: denormals become signed zero (only the sign
@@ -9,6 +10,13 @@
 //! - Operand modifiers are bitwise: absolute clears the f32 sign
 //!   bit, negate flips it; swizzle selects per
 //!   `GetSwizzledComponentIndex` (`((sw >> 2j) + j) & 3`).
+//! - Temp sources/dests fold the loop address (aL) via
+//!   `GetTempRegisterIndex` (`(base + (rel ? aL : 0)) & 63`); const
+//!   sources fold `a0` or `aL` via `GetFloatConstant` (+ `a0` when
+//!   `const_address_register_relative`, else `aL`), negatives and
+//!   out-of-range read as zeros.
+//! - `GetLoopAddress` (`loop_iterators[depth] * step + start`,
+//!   clamped to [-256, 256]; 0 with no active loop).
 //! - Vector sources are always all 4 components; scalar ops read
 //!   src3 (a = W, b = X, or Z when the paired vector op takes
 //!   three operands).
@@ -23,22 +31,24 @@
 //!   written through the component masks (temps) or merged into
 //!   the export registers for exports.
 //!
-//! Scope: absolute addressing only (export dest bits excluded per
-//! the reference layout — `scalar_dest_rel` selects const-0 there);
-//! vector add/mul/max/min/seq/sgt/sge/sne/frc/trunc/floor/
+//! Scope: vector add/mul/max/min/seq/sgt/sge/sne/frc/trunc/floor/
 //! mad/dp4/dp3/dp2add; scalar adds/adds_prev/muls/muls_prev/
 //! muls_prev2/subs/subs_prev/maxas/maxasf/setp_eq/ne/gt/ge/inv/
 //! pop/clr/rstr/kills_eq/gt/ge/ne/one/retain_prev plus the
-//! exp/logc/log/rcpc/rcpf/rcp/rsqc/rsqf/rsq/sqrt/sin/cos batch.
-//! Everything else is an explicit `Unsupported`, never a wrong
-//! result. `eval_alu` skips predicated-out instructions itself
-//! (reference per-instruction check); CF-level predication lives in
-//! the clause driver.
+//! exp/logc/log/rcpc/rcpf/rcp/rsqc/rsqf/rsq/sqrt/sin/cos batch;
+//! temp-relative (aL) dests/sources and const-relative (a0/aL)
+//! addressing; texture-fetch slots write zeros per the reference
+//! fallback (`StoreFetchResult` with a zero result). Vertex fetches
+//! (memory + fetch constants) and CF control flow stay explicit
+//! `Unsupported`, never a wrong result. `eval_alu` skips
+//! predicated-out instructions itself (reference per-instruction
+//! check); CF-level predication lives in the clause driver.
 
 use x360_common::{EmuError, Result};
 
 use super::ucode::{
-    is_end_opcode, is_exec_opcode, parse_alu, unpack_cf_pair, validate_ucode, AluInstr, CfInstr,
+    is_end_opcode, is_exec_opcode, parse_alu, parse_fetch, unpack_cf_pair, validate_ucode,
+    AluInstr, CfInstr,
 };
 
 /// Temp register count (reference `kMaxShaderTempRegisters`).
@@ -53,8 +63,16 @@ pub struct ShaderCore {
     pub previous_scalar: f32,
     /// Current predicate (`p0`).
     pub predicate: bool,
-    /// Address register (`a0`, loop-relative base).
+    /// Address register (`a0`, const-relative base).
     pub address_register: i32,
+    /// Loop-stack depth (CF loops not yet driven, so this stays 0
+    /// and the loop address reads 0 per the reference guard).
+    pub loop_depth: u32,
+    /// Per-nest loop constants (only the top entry feeds
+    /// [`ShaderCore::loop_address`]).
+    pub loop_constants: [LoopConstant; 4],
+    /// Per-nest iterators.
+    pub loop_iters: [u32; 4],
     /// Export registers (reference `ExportRegister`: 0-63 cover
     /// VS interpolators/position/misc and PS colors/depth, plus
     /// memexport address/data at 32-37). Zero-initialized; each
@@ -73,8 +91,73 @@ impl Default for ShaderCore {
             previous_scalar: 0.0,
             predicate: false,
             address_register: 0,
+            loop_depth: 0,
+            loop_constants: [LoopConstant::default(); 4],
+            loop_iters: [0; 4],
             exports: [[0.0; 4]; 64],
             export_written: [0; 64],
+        }
+    }
+}
+
+/// Loop-constant address base (reference `xenos::LoopConstant`:
+/// `count` iterations with `aL = iterator * step + start`,
+/// clamped by `GetLoopAddress`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoopConstant {
+    /// Iteration count.
+    pub count: u32,
+    /// Address start.
+    pub start: i32,
+    /// Address step.
+    pub step: i32,
+}
+
+impl ShaderCore {
+    /// Loop address (aL) per reference `GetLoopAddress`: 0 with no
+    /// active loop, else `iterator * step + start` clamped to
+    /// [-256, 256].
+    pub fn loop_address(&self) -> i32 {
+        if self.loop_depth == 0 || self.loop_depth >= 4 {
+            return 0;
+        }
+        let top = (self.loop_depth - 1) as usize;
+        let lc = self.loop_constants[top];
+        let it = self.loop_iters[top] as i32;
+        it.wrapping_mul(lc.step)
+            .wrapping_add(lc.start)
+            .clamp(-256, 256)
+    }
+
+    /// Temp index with aL-relative bias (reference
+    /// `GetTempRegisterIndex`: `(base + (rel ? aL : 0)) & 63`).
+    pub fn temp_index(&self, address: u32, is_relative: bool) -> usize {
+        let base = (address & 0x3F) as i32;
+        let idx = if is_relative {
+            base.wrapping_add(self.loop_address())
+        } else {
+            base
+        };
+        idx.rem_euclid(64) as usize
+    }
+
+    /// Float-constant effective index (reference `GetFloatConstant`
+    /// addressing half: `index += rel ? (a0-or-aL) : 0`). Negative
+    /// indices read as zeros; range checks against the constant file
+    /// happen at the call site.
+    pub fn const_index(&self, address: u32, is_relative: bool, is_a0: bool) -> Option<usize> {
+        let mut idx = address as i32;
+        if is_relative {
+            idx = idx.wrapping_add(if is_a0 {
+                self.address_register
+            } else {
+                self.loop_address()
+            });
+        }
+        if idx < 0 {
+            None
+        } else {
+            Some(idx as usize)
         }
     }
 }
@@ -117,26 +200,35 @@ fn f32_neg(v: f32) -> f32 {
 }
 
 /// Fetch one fully swizzled/modified vector source (reference
-/// vector-operand loop).
+/// vector-operand loop: temps via `GetTempRegisterIndex` with the
+/// aL bias, consts via `GetFloatConstant` with the a0/aL bias).
 fn fetch_vec(core: &ShaderCore, consts: &[[f32; 4]], ins: &AluInstr, i: u32) -> Result<[f32; 4]> {
     let reg = ins.src_reg(i);
-    let base: [f32; 4] = if ins.src_is_temp(i) {
-        if reg & 0x40 != 0 {
-            return Err(EmuError::Unsupported(
-                "alu: relative temp addressing pending".into(),
-            ));
-        }
-        core.temps[(reg & 0x3F) as usize]
-    } else if (reg as usize) < consts.len() {
-        consts[reg as usize]
+    let is_temp = ins.src_is_temp(i);
+    let base: [f32; 4] = if is_temp {
+        let idx = core.temp_index(
+            AluInstr::src_temp_reg(reg),
+            AluInstr::is_src_temp_relative(reg),
+        );
+        core.temps[idx]
     } else {
-        [0.0; 4]
+        match core.const_index(
+            reg,
+            ins.src_const_is_addressed(i),
+            ins.is_const_address_register_relative(),
+        ) {
+            Some(ci) if ci < consts.len() => consts[ci],
+            _ => [0.0; 4],
+        }
     };
     let sw = ins.src_swizzle(i);
+    // Absolute applies to temp sources only (reference leaves the
+    // const path absolute-free).
+    let absolute = is_temp && AluInstr::is_src_temp_value_absolute(reg);
     let mut out = [0.0f32; 4];
     for j in 0..4u32 {
         let mut c = flush_denormal(base[swizzled(sw, j)]);
-        if reg & 0x80 != 0 && ins.src_is_temp(i) {
+        if absolute {
             c = f32_abs(c);
         }
         if ins.src_negate(i) {
@@ -157,24 +249,29 @@ fn fetch_scalar_pair(
     vec_three_operands: bool,
 ) -> Result<(f32, f32)> {
     let reg = ins.src_reg(3);
-    let base: [f32; 4] = if ins.src_is_temp(3) {
-        if reg & 0x40 != 0 {
-            return Err(EmuError::Unsupported(
-                "alu: relative temp addressing pending".into(),
-            ));
-        }
-        let t = core.temps[(reg & 0x3F) as usize];
+    let is_temp = ins.src_is_temp(3);
+    let base: [f32; 4] = if is_temp {
+        let idx = core.temp_index(
+            AluInstr::src_temp_reg(reg),
+            AluInstr::is_src_temp_relative(reg),
+        );
+        let t = core.temps[idx];
         let mut v = t;
-        if reg & 0x80 != 0 {
+        if AluInstr::is_src_temp_value_absolute(reg) {
             for c in v.iter_mut() {
                 *c = f32_abs(*c);
             }
         }
         v
-    } else if (reg as usize) < consts.len() {
-        consts[reg as usize]
     } else {
-        [0.0; 4]
+        match core.const_index(
+            reg,
+            ins.src_const_is_addressed(3),
+            ins.is_const_address_register_relative(),
+        ) {
+            Some(ci) if ci < consts.len() => consts[ci],
+            _ => [0.0; 4],
+        }
     };
     let sw = ins.src_swizzle(3);
     // Note: temp absolute (reg bit 0x80) was applied above;
@@ -250,11 +347,6 @@ fn d3d_mul(a: f32, b: f32) -> f32 {
 pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> Result<()> {
     if ins.is_predicated() && ins.pred_condition() != core.predicate {
         return Ok(());
-    }
-    if ins.has_relative_addressing() {
-        return Err(EmuError::Unsupported(
-            "alu: relative addressing pending".into(),
-        ));
     }
     let vop = ins.vector_opcode();
     // Sources needed per opcode (reference
@@ -584,20 +676,25 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
             }
         }
         42..=47 => {
-            // Const-reg form (reference case 2): c#.w by src3, r#.x
-            // by the opcode-derived temp index; flushed, negated,
-            // no abs (mirrors the reference, where `abs_constants`
-            // never reaches the interpreter path).
+            // Const-reg form (reference case 2): c#.w by src3 (with
+            // a0/aL bias), r#.x by the opcode-derived temp index
+            // (never relative); flushed, negated, no abs (mirrors
+            // the reference, where `abs_constants` never reaches the
+            // interpreter path).
             let sw = ins.src_swizzle(3);
-            let cidx = ins.src_reg(3) as usize;
-            let a = if cidx < consts.len() {
-                let mut v = flush_denormal(consts[cidx][swizzled(sw, 3)]);
-                if ins.src_negate(3) {
-                    v = f32_neg(v);
+            let a = match core.const_index(
+                ins.src_reg(3),
+                ins.src_const_is_addressed(3),
+                ins.is_const_address_register_relative(),
+            ) {
+                Some(ci) if ci < consts.len() => {
+                    let mut v = flush_denormal(consts[ci][swizzled(sw, 3)]);
+                    if ins.src_negate(3) {
+                        v = f32_neg(v);
+                    }
+                    v
                 }
-                v
-            } else {
-                0.0
+                _ => 0.0,
             };
             // Temp index per reference
             // `(opc & 1) | (sel << 1) | (swiz & 0x3C)`, wrapped mod 64.
@@ -792,16 +889,17 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
         }
         return Ok(());
     }
-    // Dest fields are 6 bits (always in range); relative dests
-    // were rejected above, so no wrapping is needed here.
-    let vd = (ins.vector_dest() & 0x3F) as usize;
+    // Dest fields are 6-bit bases plus the aL bias for plain
+    // temps (reference `GetTempRegister` on both dests; exports
+    // keep the malformed-dest guard above).
+    let vd = core.temp_index(ins.vector_dest(), ins.is_vector_dest_relative());
     let vmask = ins.vector_write_mask();
     for (i, (t, v)) in core.temps[vd].iter_mut().zip(vr.iter()).enumerate() {
         if vmask & (1 << i) != 0 {
             *t = *v;
         }
     }
-    let sd = (ins.scalar_dest() & 0x3F) as usize;
+    let sd = core.temp_index(ins.scalar_dest(), ins.is_scalar_dest_relative());
     let smask = ins.scalar_write_mask();
     for (i, t) in core.temps[sd].iter_mut().enumerate() {
         if smask & (1 << i) != 0 {
@@ -818,6 +916,9 @@ pub struct CfRunStats {
     pub cf_visited: u32,
     /// Clause slots executed as ALU.
     pub alu_executed: u32,
+    /// Fetch slots executed (texture-fetch zero writes; vertex
+    /// fetches are explicit errors, never counted).
+    pub fetch_executed: u32,
     /// Whether an end-opcode terminated the run.
     pub ended: bool,
 }
@@ -829,16 +930,42 @@ fn bool_set(words: &[u32], addr: u32) -> bool {
     words.get(w).map(|v| v & (1 << b) != 0).unwrap_or(false)
 }
 
+/// Fetch dest write with absolute swizzle (reference
+/// `StoreFetchResult` + `GetFetchDestinationComponentSwizzle`:
+/// 0-3 select the value component, 4 writes 0, 5 writes 1,
+/// 7 keeps, anything else (including the invalid 6) writes 0).
+fn store_fetch_result(
+    core: &mut ShaderCore,
+    dest: u32,
+    is_relative: bool,
+    swizzle: u32,
+    value: &[f32; 4],
+) {
+    let idx = core.temp_index(dest, is_relative);
+    for i in 0..4 {
+        let sel = (swizzle >> (3 * i)) & 7;
+        match sel {
+            0..=3 => core.temps[idx][i] = value[sel as usize],
+            5 => core.temps[idx][i] = 1.0,
+            7 => {}
+            _ => core.temps[idx][i] = 0.0,
+        }
+    }
+}
+
 /// Run the CF program of a validated upload straight through,
 /// executing ALU clause slots via [`eval_alu`] (reference
 /// `ShaderInterpreter::Execute` CF loop, minus control flow).
 ///
 /// Supported: `nop`, the full exec family (with bool-constant and
 /// predicate gating), `alloc` (no-op without an export sink),
-/// `fetchdone` (no-op). Fetch clause slots, loops, calls, jumps,
-/// and returns are explicit `Unsupported` — never silently
-/// skipped. Ends at the first end-opcode or at the CF program
-/// bound; Validate errors propagate.
+/// `fetchdone` (no-op). Texture-fetch clause slots write zeros with
+/// fetch dest swizzle (reference non-vertex fallback via
+/// `StoreFetchResult`); vertex fetches (opcode 0, needing vertex
+/// memory + fetch constants) and loops, calls, jumps, returns are
+/// explicit `Unsupported` — never silently skipped. Ends at the
+/// first end-opcode or at the CF program bound; Validate errors
+/// propagate.
 pub fn run_cf(
     core: &mut ShaderCore,
     dwords: &[u32],
@@ -886,10 +1013,26 @@ pub fn run_cf(
                     }
                     let seq = (ins.sequence() >> (2 * k)) & 3;
                     if seq & 1 != 0 {
-                        return Err(EmuError::Unsupported(format!(
-                            "cf: fetch clause slot {} pending",
-                            slot
-                        )));
+                        let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
+                        let fetch = parse_fetch(&w);
+                        if fetch.is_predicated() && fetch.pred_condition() != core.predicate {
+                            continue;
+                        }
+                        if fetch.opcode() == 0 {
+                            return Err(EmuError::Unsupported(format!(
+                                "cf: slot {}: vfetch needs draw backend (vertex memory + fetch constants)",
+                                slot
+                            )));
+                        }
+                        store_fetch_result(
+                            core,
+                            fetch.dst_reg(),
+                            fetch.is_dest_relative(),
+                            fetch.dst_swizzle(),
+                            &[0.0; 4],
+                        );
+                        stats.fetch_executed += 1;
+                        continue;
                     }
                     let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
                     eval_alu(core, consts, &parse_alu(&w)).map_err(|e| match e {
@@ -1223,10 +1366,26 @@ mod tests {
         let st = run_cf(&mut core, &words, &[], &[1 << 5]).unwrap();
         assert_eq!(st.alu_executed, 1);
         assert_eq!(core.temps[1], [3.0, 3.0, 3.0, 3.0]);
-        // Fetch slot is an explicit error, never silent.
-        let words = cf_upload(0x0001_1001, 0x0000_1200, alu);
+        // Texture-fetch slot writes zeros with dest swizzle (reference
+        // non-vertex fallback), never silent: tfetch2D r3 <- zeros.
+        let tfetch = [
+            (1 & 0x1F) | ((7 & 0x3F) << 5) | ((3 & 0x3F) << 12) | ((11 & 0x1F) << 20),
+            0x0000_01E8,
+            (1 << 14),
+        ];
+        let words = cf_upload(0x0001_1001, 0x0000_1200, tfetch);
         let mut core = ShaderCore::default();
-        assert!(run_cf(&mut core, &words, &[], &[]).is_err());
+        core.temps[3] = [9.0, 9.0, 9.0, 9.0];
+        let st = run_cf(&mut core, &words, &[], &[]).unwrap();
+        assert_eq!((st.fetch_executed, st.alu_executed), (1, 0));
+        // Swizzle 0x1E8: x<-X(0), y<-1, z<-keep(9), w<-X(0).
+        assert_eq!(core.temps[3], [0.0, 1.0, 9.0, 0.0]);
+        // Vertex-fetch slot needs draw-backend memory, explicit error.
+        let vfetch = [((7 & 0x3F) << 5) | ((3 & 0x3F) << 12), 0, 0];
+        let words = cf_upload(0x0001_1001, 0x0000_1200, vfetch);
+        let mut core = ShaderCore::default();
+        let err = run_cf(&mut core, &words, &[], &[]).unwrap_err();
+        assert!(err.to_string().contains("vfetch"));
         // Loop opcode is an explicit error.
         let words = vec![
             0x0000_0000,
@@ -1242,6 +1401,136 @@ mod tests {
         let mut core = ShaderCore::default();
         let err = run_cf(&mut core, &words, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("pending"));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn temp_relative_loop_address() {
+        // aL = iter * step + start, clamped to [-256, 256]; 0 idle.
+        let mut core = ShaderCore::default();
+        assert_eq!(core.loop_address(), 0);
+        core.loop_depth = 1;
+        core.loop_constants[0] = LoopConstant {
+            count: 4,
+            start: 2,
+            step: 1,
+        };
+        core.loop_iters[0] = 1;
+        assert_eq!(core.loop_address(), 3);
+        // Clamp high/low.
+        core.loop_constants[0] = LoopConstant {
+            count: 4,
+            start: 250,
+            step: 10,
+        };
+        core.loop_iters[0] = 1;
+        assert_eq!(core.loop_address(), 256);
+        core.loop_constants[0] = LoopConstant {
+            count: 40,
+            start: 0,
+            step: -10,
+        };
+        core.loop_iters[0] = 30;
+        assert_eq!(core.loop_address(), -256);
+        // Depth guard reads 0.
+        core.loop_depth = 0;
+        assert_eq!(core.loop_address(), 0);
+        core.loop_depth = 4;
+        assert_eq!(core.loop_address(), 0);
+        // Wrap: (63 + 2) & 63 == 1.
+        core.loop_depth = 1;
+        core.loop_constants[0] = LoopConstant {
+            count: 4,
+            start: 2,
+            step: 0,
+        };
+        core.loop_iters[0] = 0;
+        assert_eq!(core.temp_index(63, true), 1);
+        assert_eq!(core.temp_index(63, false), 63);
+        // Negative aL wraps too: (1 - 2) mod 64 == 63.
+        core.loop_constants[0] = LoopConstant {
+            count: 4,
+            start: -2,
+            step: 0,
+        };
+        assert_eq!(core.temp_index(1, true), 63);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn alu_temp_relative_sources_and_dest() {
+        // Source relative: aL=1, src1 base 4 + rel reads r5.
+        let mut core = ShaderCore::default();
+        core.loop_depth = 1;
+        core.loop_constants[0] = LoopConstant {
+            count: 2,
+            start: 1,
+            step: 0,
+        };
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        core.temps[5] = [7.0, 7.0, 7.0, 7.0];
+        core.temps[6] = [1.0, 1.0, 1.0, 1.0];
+        // add r1, r4+rel, r6.
+        let d0 = triple(1, 0xF, 0, 0, 0, 50)[0];
+        let d2 = ((4 | 0x40) << 16) | (6 << 8) | (1 << 31) | (1 << 30);
+        eval_alu(&mut core, &[], &parse_alu(&[d0, 0, d2])).unwrap();
+        assert_eq!(core.temps[1], [8.0, 8.0, 8.0, 8.0]);
+        // Dest relative: aL=2, vd base 1 + rel writes r3.
+        let mut core = ShaderCore::default();
+        core.loop_depth = 1;
+        core.loop_constants[0] = LoopConstant {
+            count: 4,
+            start: 2,
+            step: 0,
+        };
+        core.temps[4] = [1.0, 2.0, 3.0, 4.0];
+        core.temps[5] = [10.0, 20.0, 30.0, 40.0];
+        let d0 = (1 & 0x3F) | (1 << 6) | (0xF << 16) | ((50 & 0x3F) << 26);
+        let d2 = (4 << 16) | (5 << 8) | (1 << 31) | (1 << 30);
+        eval_alu(&mut core, &[], &parse_alu(&[d0, 0, d2])).unwrap();
+        assert_eq!(core.temps[3], [11.0, 22.0, 33.0, 44.0]);
+        assert_eq!(core.temps[1], [0.0; 4]);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn alu_const_relative_a0_and_loop() {
+        // Vector add r1 = c(src1) + r5, src1 const-relative.
+        // d1 bit31 = const_0_rel_abs, bit29 = a0-vs-aL.
+        let consts = [
+            [10.0, 0.0, 0.0, 0.0],
+            [20.0, 0.0, 0.0, 0.0],
+            [30.0, 0.0, 0.0, 0.0],
+        ];
+        // a0 path: c0 + a0(2) reads c2.
+        let mut core = ShaderCore::default();
+        core.address_register = 2;
+        core.temps[5] = [1.0, 1.0, 1.0, 1.0];
+        let d0 = triple(1, 0xF, 0, 0, 0, 50)[0];
+        let d1 = (1 << 31) | (1 << 29);
+        let d2 = (5 << 8) | (1 << 30);
+        eval_alu(&mut core, &consts, &parse_alu(&[d0, d1, d2])).unwrap();
+        assert_eq!(core.temps[1], [31.0, 1.0, 1.0, 1.0]);
+        // aL path: c0 + aL(1) reads c1 (a0 ignored).
+        let mut core = ShaderCore::default();
+        core.address_register = 99;
+        core.loop_depth = 1;
+        core.loop_constants[0] = LoopConstant {
+            count: 2,
+            start: 1,
+            step: 0,
+        };
+        core.temps[5] = [1.0, 1.0, 1.0, 1.0];
+        let d1 = 1 << 31;
+        eval_alu(&mut core, &consts, &parse_alu(&[d0, d1, d2])).unwrap();
+        assert_eq!(core.temps[1], [21.0, 1.0, 1.0, 1.0]);
+        // Negative effective index reads zeros.
+        let mut core = ShaderCore::default();
+        core.address_register = -5;
+        core.temps[5] = [1.0, 1.0, 1.0, 1.0];
+        let d1 = (1 << 31) | (1 << 29);
+        eval_alu(&mut core, &consts, &parse_alu(&[d0, d1, d2])).unwrap();
+        assert_eq!(core.temps[1], [1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]

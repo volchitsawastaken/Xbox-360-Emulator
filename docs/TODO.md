@@ -445,9 +445,24 @@ Terminal states only: impossible, done, or something rendering.
       `ShaderInterpreter::Execute` CF loop): straight-line walk over
       the validated CF program executing ALU slots via `eval_alu`
       (bool-constant + predicate gating, end-opcode stop, census).
-      `nop`/`alloc`/`fetchdone` no-ops; fetch slots, loops, calls,
+      `nop`/`alloc`/`fetchdone` no-ops; texture-fetch slots write
+      zeros (reference fallback), vertex fetches plus loops, calls,
       jumps, returns are explicit `Unsupported`. Unit-tested
-      (run, gating, fetch/loop errors).
+      (run, gating, texture-zero/vertex-error, loop errors).
+- [x] ALU relative addressing (`kernel::uint`, reference
+      `GetTempRegisterIndex`/`GetFloatConstant`/`GetLoopAddress`):
+      temp dests/sources fold aL (`(base + aL) & 63`, clamped
+      [-256, 256], 0 idle, wrap-tested); const sources fold a0-or-aL
+      per `src_const_is_addressed`/`const_address_register_relative`
+      (negative/OOB read zeros). Unit-tested (clamp/wrap, temp
+      src/dest, const a0/aL/negative).
+- [x] Fetch-slot handling (`kernel::uint::run_cf`, reference fetch
+      `Execute` branch + `StoreFetchResult`): predicated fetches
+      skip; texture slots (opcode != vfetch) write zeros with
+      absolute dest swizzle (0-3 select, 4=>0, 5=>1, 7=>keep, else
+      0, aL-relative dest); vertex fetches (opcode 0, needing vertex
+      memory + fetch constants) stay explicit `Unsupported`.
+      Unit-tested (zero + swizzle/keep, vertex error).
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
