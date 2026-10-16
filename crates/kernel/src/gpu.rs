@@ -33,7 +33,7 @@ use std::collections::HashSet;
 use x360_common::{EmuError, Result};
 use x360_memory::Memory;
 
-use crate::uint::VertexFetchConst;
+use crate::uint::{run_cf_mem, run_vs_vertex, ShaderCore, VertexFetchConst, VsStageInputs};
 use crate::Kernel;
 
 /// Type-3 opcodes with CPU-visible effects (reference `xenos.h`).
@@ -334,6 +334,15 @@ pub struct ShaderInputs {
     pub loops: [u32; SHADER_LOOP_COUNT],
 }
 
+/// Point-draw execution census.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PointDrawStats {
+    /// Pixels written to EDRAM.
+    pub pixels: u32,
+    /// Vertices clipped (w <= 0 or off-surface).
+    pub clipped: u32,
+}
+
 impl Kernel {
     /// Collect programmed shader inputs for the interpreter
     /// (reference `register_file.h` fetch/loop accessors +
@@ -420,6 +429,99 @@ impl Kernel {
             yscale: f(REG_PA_CL_VPORT_YSCALE),
             yoffset: f(REG_PA_CL_VPORT_YOFFSET),
         }
+    }
+
+    /// Execute a point-list draw to EDRAM (first live pixels:
+    /// indices → vertex shader → w-divide clip → viewport → pixel
+    /// shader → tiled 32bpp write). Only `pointlist` primitives on
+    /// 1x-MSAA `k_8_8_8_8` surfaces; anything else is explicit
+    /// `Unsupported`. Pixel-shader interpolators are not fed yet
+    /// (constant-output shaders only — varying reads see zeros);
+    /// the surface height is caller-provided (window/swap dims at
+    /// integration). W unwritten by the pixel shader defaults to
+    /// 1.0; out-of-surface pixels clip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exec_point_draw(
+        &mut self,
+        mem: &Memory,
+        desc: &DrawDesc,
+        vs_dwords: &[u32],
+        ps_dwords: &[u32],
+        inputs: &VsStageInputs,
+        surface: &RenderSurface,
+        viewport: &Viewport,
+        surface_h: u32,
+    ) -> Result<PointDrawStats> {
+        if desc.prim_type != 1 {
+            return Err(EmuError::Unsupported(format!(
+                "draw prim {} (only pointlist pending)",
+                prim_type_name(desc.prim_type)
+            )));
+        }
+        if surface.msaa != 0 {
+            return Err(EmuError::Unsupported(format!(
+                "draw MSAA {}x pending",
+                1 << surface.msaa
+            )));
+        }
+        if surface.color_format != 0 && surface.color_format != 1 {
+            return Err(EmuError::Unsupported(format!(
+                "draw color format {} pending",
+                surface.color_format
+            )));
+        }
+        let pitch = surface.pitch_tiles();
+        if pitch == 0 {
+            return Err(EmuError::Other("draw with zero pitch".into()));
+        }
+        let indices = fetch_draw_indices(mem, desc)?;
+        let mut core = ShaderCore::default();
+        let mut st = PointDrawStats::default();
+        for idx in indices {
+            let clip = run_vs_vertex(&mut core, vs_dwords, inputs, mem, idx)?;
+            if clip[3] <= 0.0 {
+                // Behind the camera (reference clipper drops these).
+                st.clipped += 1;
+                continue;
+            }
+            let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
+            let s = viewport.ndc_to_screen(ndc);
+            if !(0.0..surface.pitch_px as f32).contains(&s[0])
+                || !(0.0..surface_h as f32).contains(&s[1])
+            {
+                st.clipped += 1;
+                continue;
+            }
+            run_cf_mem(
+                &mut core,
+                ps_dwords,
+                inputs.floats,
+                inputs.bools,
+                inputs.loops,
+                inputs.fetch,
+                mem,
+            )?;
+            if core.export_written[0] & 0x7 != 0x7 {
+                return Err(EmuError::Other("draw ps: no xyz color export".into()));
+            }
+            let c = core.exports[0];
+            let w = if core.export_written[0] & 0x8 != 0 {
+                c[3]
+            } else {
+                1.0
+            };
+            let pack = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+            let argb = (pack(w) << 24) | (pack(c[0]) << 16) | (pack(c[1]) << 8) | pack(c[2]);
+            self.edram_write_pixel_32bpp(
+                s[0] as u32,
+                s[1] as u32,
+                surface.base_tiles,
+                pitch,
+                argb,
+            )?;
+            st.pixels += 1;
+        }
+        Ok(st)
     }
 
     /// Execute ring dwords `[start_dw, end_dw)`; `ring_dw` is the ring
@@ -1227,6 +1329,130 @@ mod tests {
         // Zero regs map everything to the origin.
         let v = kernel().collect_viewport();
         assert_eq!(v.ndc_to_screen([1.0, 1.0, 0.0]), [0.0, 0.0]);
+    }
+
+    /// Point vs: fetch f32x4 -> r1, add -> position export 62.
+    fn point_vs() -> Vec<u32> {
+        let fetch = [(4 << 5) | (1 << 12), 0x688 | (38 << 16), 4];
+        let alu = [
+            62 | (1 << 15) | (0xF << 16) | ((50 & 0x3F) << 26),
+            0,
+            (1 << 16) | (1 << 31) | (1 << 30),
+        ];
+        // Pair0: exec@1 fetch + exec@2 alu; pair1/2: the triples.
+        let p0 = [0x11001, 0x1002_1000, 0x1000_0000];
+        let mut words = vec![p0[0], p0[1], p0[2]];
+        words.extend_from_slice(&fetch);
+        words.extend_from_slice(&alu);
+        words
+    }
+
+    /// Point ps: constant white export 0.
+    fn point_ps() -> Vec<u32> {
+        let alu = [
+            (1 << 15) | (0xF << 16) | (0xF << 20) | ((50 & 0x3F) << 26),
+            0,
+            (1 << 31) | (1 << 30),
+        ];
+        let p0 = [0x1001, 0x2_1000, 0x2000_0000];
+        let mut words = vec![p0[0], p0[1], p0[2]];
+        words.extend_from_slice(&alu);
+        words
+    }
+
+    #[test]
+    fn point_draw_writes_edram_pixel() {
+        let mut k = kernel();
+        let mut m = Memory::new();
+        // One clip-space vertex at NDC origin (w = 1).
+        for (i, x) in [0.0f32, 0.0, 0.0, 1.0].iter().enumerate() {
+            m.write_u32(0x1000 + 4 * i as u32, x.to_bits()).unwrap();
+        }
+        let fc = VertexFetchConst {
+            address_dwords: 0x400,
+            size_dwords: 16,
+            endian: 0,
+        };
+        let floats = [[0.0f32; 4]; 512];
+        let fetch = [fc; 96];
+        let bools = [0u32; 2];
+        let loops = [0u32; 32];
+        let inputs = VsStageInputs {
+            floats: &floats,
+            fetch: &fetch,
+            bools: &bools,
+            loops: &loops,
+        };
+        let desc = DrawDesc {
+            prim_type: 1,
+            source: 2,
+            num_indices: 1,
+            ..DrawDesc::default()
+        };
+        let surface = RenderSurface {
+            pitch_px: 1280,
+            msaa: 0,
+            base_tiles: 0,
+            color_format: 0,
+        };
+        let viewport = Viewport {
+            xscale: 640.0,
+            xoffset: 640.0,
+            yscale: 360.0,
+            yoffset: 360.0,
+        };
+        let st = k
+            .exec_point_draw(
+                &m,
+                &desc,
+                &point_vs(),
+                &point_ps(),
+                &inputs,
+                &surface,
+                &viewport,
+                720,
+            )
+            .unwrap();
+        assert_eq!((st.pixels, st.clipped), (1, 0));
+        // Detiled resolve shows white at row 360, x 640.
+        k.edram_resolve_tiled(&mut m, 0x0100_A000, 1280, 720, 0, 16)
+            .unwrap();
+        assert_eq!(
+            m.read_u32(0x0100_A000 + 4 * (360 * 1280 + 640)).unwrap(),
+            0xFFFF_FFFF
+        );
+        // w = 0 clips without writing.
+        m.write_u32(0x1000 + 12, 0.0f32.to_bits()).unwrap();
+        let st = k
+            .exec_point_draw(
+                &m,
+                &desc,
+                &point_vs(),
+                &point_ps(),
+                &inputs,
+                &surface,
+                &viewport,
+                720,
+            )
+            .unwrap();
+        assert_eq!((st.pixels, st.clipped), (0, 1));
+        // Non-point primitives stay explicit.
+        let tri = DrawDesc {
+            prim_type: 4,
+            ..desc
+        };
+        assert!(k
+            .exec_point_draw(
+                &m,
+                &tri,
+                &point_vs(),
+                &point_ps(),
+                &inputs,
+                &surface,
+                &viewport,
+                720
+            )
+            .is_err());
     }
 
     #[test]

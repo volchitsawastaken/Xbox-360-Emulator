@@ -536,6 +536,12 @@ Terminal states only: impossible, done, or something rendering.
 - [x] Viewport decode + NDC mapping (`kernel::gpu`, reference
       `PA_CL_VPORT_*`): scale/offset collection, `ndc_to_screen`
       (mul_add, NaN-propagating). Unit-tested.
+- [x] Point-draw execution (`kernel::gpu::exec_point_draw`):
+      indices → vertex shader → w-clip → viewport → pixel shader
+      → tiled ARGB8 EDRAM write (1x 8_8_8_8 only, rest explicit;
+      interpolators unfed, height caller-provided, w defaults 1.0).
+      Unit-tested (white pixel at 640,360 detiled back, w-clip,
+      non-point explicit). First live pixels (synthetic).
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
