@@ -644,18 +644,14 @@ pub fn dispatch_import(
             kernel.vd_gpu_identifier = Some(arg(t, 0));
             Ok(())
         }
-        // VdSwap(...) (reference `graphics_system.cc` + `VdSwap_entry`:
-        // present posts to the GPU thread; `MarkVblank` then dispatches
-        // `DispatchInterruptCallback(0, 2)`). No draw backend yet, but
-        // the present is real: count it and queue the vblank interrupt
-        // so registered callbacks observe genuine vsync progress via
-        // the existing delivery path. Returns void.
-        (Lib::Xboxkrnl, 0x25B) => {
-            kernel.vd_swaps += 1;
-            kernel.vd_irq_pending.push_back((0, 2));
-            log::info!("kernel: VdSwap #{} queued vblank", kernel.vd_swaps);
-            Ok(())
-        }
+        // VdSwap(...) (reference `VdSwap_entry`): validate the ten
+        // args, write the 64-word ring sequence at `buffer_ptr`
+        // (Type0 fetch-constant load + `XE_SWAP` + Type2 NOP fill),
+        // count the present. The actual resolve+vblank happens when
+        // the ring executes `XE_SWAP` (see `gpu.rs`), exactly like the
+        // reference posting to the GPU thread. Frontbuffer resolve
+        // covers solid-cleared surfaces (see `edram_resolve`).
+        (Lib::Xboxkrnl, 0x25B) => vd_swap(kernel, mem, t),
         // VdInitializeScalerCommandBuffer(...) (reference
         // `VdInitializeScalerCommandBuffer_entry`, kImplemented): fill
         // `dest_count` words at `dest_ptr` with NOPs (`0x80000000`)
@@ -985,6 +981,140 @@ pub fn dispatch_import(
         }
     }?;
     *table.implemented_calls.entry(key).or_insert(0) += 1;
+    Ok(())
+}
+
+/// `VdSwap(buffer, fetch, unk2, unk3, unk4, fb_ptr, fmt_ptr, cs_ptr,
+/// width_ptr, height_ptr)` (reference `VdSwap_entry` + `xenos.h`
+/// fetch/`TextureFormat`/`MakePacket*` facts). All pointer args are
+/// REQUIRED in the reference; nulls are explicit errors. Validates
+/// the D3D9 fetch header (6 dwords), frontbuffer consistency,
+/// `k_8_8_8_8` format (6) + RGB colorspace (0), and dimensions, then
+/// writes the 64-word ring sequence (Type0 fetch load + `XE_SWAP` +
+/// Type2 NOP fill) and counts the present. The resolve+vblank itself
+/// happens at ring execution (`OP_XE_SWAP` in `gpu.rs`), exactly like
+/// the reference posting to the GPU thread. Returns void.
+fn vd_swap(kernel: &mut Kernel, mem: &mut Memory, t: &mut ThreadState) -> Result<()> {
+    let (buffer, fetch) = (arg(t, 0), arg(t, 1));
+    let (fb_ptr, fmt_ptr, cs_ptr) = (arg(t, 5), arg(t, 6), arg(t, 7));
+    let r1 = t.gpr[1] as u32;
+    let width_ptr = crate::fs::stack_arg(mem, r1, 0).unwrap_or(0);
+    let height_ptr = crate::fs::stack_arg(mem, r1, 1).unwrap_or(0);
+    for (name, v) in [
+        ("buffer", buffer),
+        ("fetch", fetch),
+        ("frontbuffer_ptr", fb_ptr),
+        ("texture_format_ptr", fmt_ptr),
+        ("color_space_ptr", cs_ptr),
+        ("width", width_ptr),
+        ("height", height_ptr),
+    ] {
+        if v == 0 {
+            return Err(EmuError::Other(format!("VdSwap null {}", name)));
+        }
+    }
+    let mut f = [0u32; 6];
+    for (i, d) in f.iter_mut().enumerate() {
+        *d = mem
+            .read_u32(fetch.wrapping_add(i as u32 * 4))
+            .map_err(|e| EmuError::Other(format!("VdSwap fetch: {}", e)))?;
+    }
+    // Fetch dword_1: format bits 0-5, base_address bits 12-31 (>>12).
+    // Fetch dword_2: 2D width/height minus 1 (13 bits each).
+    let base = (f[1] >> 12) & 0xF_FFFF;
+    let fw = (f[2] & 0x1FFF) + 1;
+    let fh = ((f[2] >> 13) & 0x1FFF) + 1;
+    let fb_virtual = base << 12;
+    if fb_virtual == 0 {
+        return Err(EmuError::Other("VdSwap null frontbuffer".into()));
+    }
+    let fb_claimed = mem
+        .read_u32(fb_ptr)
+        .map_err(|e| EmuError::Other(format!("VdSwap frontbuffer_ptr: {}", e)))?;
+    if fb_claimed != fb_virtual {
+        return Err(EmuError::Other(format!(
+            "VdSwap frontbuffer {:08x} != fetch {:08x}",
+            fb_claimed, fb_virtual
+        )));
+    }
+    let fb_phys = mem.to_physical(fb_virtual);
+    if fb_phys == 0 {
+        return Err(EmuError::Other(format!(
+            "VdSwap frontbuffer {:08x} unmapped",
+            fb_virtual
+        )));
+    }
+    let fmt = mem
+        .read_u32(fmt_ptr)
+        .map_err(|e| EmuError::Other(format!("VdSwap format: {}", e)))?;
+    if fmt != 6 {
+        return Err(EmuError::Unsupported(format!(
+            "VdSwap texture format {} (only k_8_8_8_8)",
+            fmt
+        )));
+    }
+    let cs = mem
+        .read_u32(cs_ptr)
+        .map_err(|e| EmuError::Other(format!("VdSwap colorspace: {}", e)))?;
+    if cs != 0 {
+        return Err(EmuError::Unsupported(format!("VdSwap colorspace {}", cs)));
+    }
+    let gw = mem
+        .read_u32(width_ptr)
+        .map_err(|e| EmuError::Other(format!("VdSwap width: {}", e)))?;
+    let gh = mem
+        .read_u32(height_ptr)
+        .map_err(|e| EmuError::Other(format!("VdSwap height: {}", e)))?;
+    if gw != fw || gh != fh {
+        return Err(EmuError::Other(format!(
+            "VdSwap size {}x{} != fetch {}x{}",
+            gw, gh, fw, fh
+        )));
+    }
+    if gw > 8192 || gh > 8192 {
+        return Err(EmuError::Other(format!(
+            "VdSwap size {}x{} too large",
+            gw, gh
+        )));
+    }
+    let px = (gw as u64)
+        .checked_mul(gh as u64)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| EmuError::Other("VdSwap size overflows".into()))?;
+    if px > crate::gpu::EDRAM_SIZE as u64 {
+        return Err(EmuError::Other(format!(
+            "VdSwap {}x{} exceeds EDRAM",
+            gw, gh
+        )));
+    }
+    // 64-word ring sequence: Type0 SHADER_CONSTANT_FETCH_00_0 (byte
+    // 0x4800 → index 0x1200) + 6 fetch dwords, XE_SWAP + magic +
+    // fb + w + h, Type2 NOP fill. Word values round-trip through the
+    // BE ring exactly like guest-written packets.
+    const TYPE0_FETCH: u32 = ((6 - 1) << 16) | 0x1200;
+    const TYPE3_SWAP: u32 = (3 << 30) | (((4 - 1) & 0x3FFF) << 16) | ((0x64 & 0x7F) << 8);
+    const SWAP_MAGIC: u32 = 0x5041_5753; // "SWAP"
+    const TYPE2_NOP: u32 = 2 << 30;
+    let mut seq = [TYPE2_NOP; 64];
+    seq[0] = TYPE0_FETCH;
+    seq[1..7].copy_from_slice(&f);
+    seq[7] = TYPE3_SWAP;
+    seq[8] = SWAP_MAGIC;
+    seq[9] = fb_phys;
+    seq[10] = gw;
+    seq[11] = gh;
+    for (i, w) in seq.iter().enumerate() {
+        mem.write_u32(buffer.wrapping_add(i as u32 * 4), *w)
+            .map_err(|e| EmuError::Other(format!("VdSwap ring: {}", e)))?;
+    }
+    kernel.vd_swaps += 1;
+    log::info!(
+        "kernel: VdSwap #{} {}x{} fb={:08x}",
+        kernel.vd_swaps,
+        gw,
+        gh,
+        fb_phys
+    );
     Ok(())
 }
 
@@ -3299,13 +3429,32 @@ mod tests {
     }
 
     #[test]
-    fn vd_swap_queues_vblank() {
+    fn vd_swap_writes_ring_defers_vblank_to_execution() {
         assert_eq!(ImportTable::name_of("xboxkrnl.exe", 0x25B), Some("VdSwap"));
         let mut k = Kernel::new();
         let mut m = Memory::new();
         let mut tab = ImportTable::new();
         let mut t = thread();
-        t.gpr[3] = 0x0115_5000_u64;
+        // Valid 64x64 k_8_8_8_8 frontbuffer at 0x0116_0000.
+        let (buffer, fetch) = (0x0115_5000, 0x0115_6000);
+        let (fb_ptr, fmt_ptr, cs_ptr) = (0x0115_6100, 0x0115_6104, 0x0115_6108);
+        let (w_ptr, h_ptr) = (0x0115_610C, 0x0115_6110);
+        let fb = 0x0116_0000;
+        m.write_u32(fetch + 4, 6 | (fb >> 12) << 12).unwrap();
+        m.write_u32(fetch + 8, 63 | (63 << 13)).unwrap();
+        m.write_u32(fb_ptr, fb).unwrap();
+        m.write_u32(fmt_ptr, 6).unwrap();
+        m.write_u32(cs_ptr, 0).unwrap();
+        m.write_u32(w_ptr, 64).unwrap();
+        m.write_u32(h_ptr, 64).unwrap();
+        t.gpr[3] = buffer as u64;
+        t.gpr[4] = fetch as u64;
+        t.gpr[8] = fb_ptr as u64;
+        t.gpr[9] = fmt_ptr as u64;
+        t.gpr[10] = cs_ptr as u64;
+        t.gpr[1] = 0x0115_7000;
+        m.write_u32(0x0115_7008, w_ptr).unwrap();
+        m.write_u32(0x0115_700C, h_ptr).unwrap();
         dispatch_import(
             &mut k,
             &mut m,
@@ -3316,19 +3465,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(k.vd_swaps, 1);
-        assert_eq!(k.vd_irq_pending.len(), 1);
-        assert_eq!(k.vd_irq_pending[0], (0, 2));
-        dispatch_import(
+        // No immediate vblank: the present executes when the ring does.
+        assert!(k.vd_irq_pending.is_empty());
+        // Ring sequence: Type0 fetch load + XE_SWAP + NOP fill.
+        assert_eq!(m.read_u32(buffer).unwrap(), ((6 - 1) << 16) | 0x1200);
+        assert_eq!(m.read_u32(buffer + 28).unwrap(), 0xC003_6400);
+        assert_eq!(m.read_u32(buffer + 32).unwrap(), 0x5041_5753);
+        assert_eq!(m.read_u32(buffer + 36).unwrap(), fb);
+        assert_eq!(m.read_u32(buffer + 40).unwrap(), 64);
+        assert_eq!(m.read_u32(buffer + 44).unwrap(), 64);
+        assert_eq!(m.read_u32(buffer + 48).unwrap(), 0x8000_0000);
+        // Null fetch is an explicit error, never a silent skip.
+        t.gpr[4] = 0;
+        assert!(dispatch_import(
             &mut k,
             &mut m,
             &mut tab,
             0,
             &mut t,
-            &imp("xboxkrnl.exe", 0x25B),
+            &imp("xboxkrnl.exe", 0x25B)
         )
-        .unwrap();
-        assert_eq!(k.vd_swaps, 2);
-        assert_eq!(k.vd_irq_pending.len(), 2);
+        .is_err());
     }
 
     #[test]

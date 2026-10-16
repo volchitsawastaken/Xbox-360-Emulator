@@ -53,6 +53,11 @@ const OP_ME_INIT: u32 = 0x48;
 const OP_DRAW_INDX_2: u32 = 0x36;
 const OP_IM_LOAD_IMMEDIATE: u32 = 0x2B;
 const OP_INVALIDATE_STATE: u32 = 0x3B;
+/// Xenia-only present hook (reference `xenos.h` `PM4_XE_SWAP` + `VdSwap`
+/// posting to the GPU thread + `ExecutePacketType3_XE_SWAP`).
+const OP_XE_SWAP: u32 = 0x64;
+/// `XE_SWAP` magic (`make_fourcc("SWAP")`, reference `xenos.h`).
+const SWAP_MAGIC: u32 = 0x5041_5753;
 
 /// Register indices with executor-visible roles (reference
 /// `register_table.inc`).
@@ -87,6 +92,8 @@ pub struct GpuExecStats {
     pub draws_seen: u64,
     /// `INVALIDATE_STATE` packets consumed (reference no-op).
     pub invalidates: u64,
+    /// `XE_SWAP` presents executed (EDRAM→DRAM resolve + vblank).
+    pub swaps: u64,
 }
 
 /// `GpuSwap` (reference `xenos.h` `GpuSwapInline`).
@@ -566,6 +573,46 @@ impl Kernel {
                 st.invalidates += 1;
                 Ok(c + 2)
             }
+            OP_XE_SWAP => {
+                // Present hook (reference
+                // `ExecutePacketType3_XE_SWAP` + `IssueSwap`): `[magic
+                // "SWAP", frontbuffer_phys, width, height]`; trailing
+                // pad words (reference `AdvanceRead(count - 4)`) are
+                // consumed as filler. Resolves solid-cleared EDRAM to
+                // the frontbuffer (see `edram_resolve`; patterned
+                // content needs detiling, pending), counts the swap,
+                // and queues the vblank interrupt `(0, 2)` exactly like
+                // the reference `MarkVblank` path. Consumes the whole
+                // packet like every other arm.
+                if cnt < 4 {
+                    return Err(EmuError::Other("PM4 short XE_SWAP".into()));
+                }
+                if p(0) != SWAP_MAGIC {
+                    return Err(EmuError::Other(format!(
+                        "PM4 XE_SWAP bad magic {:08x}",
+                        p(0)
+                    )));
+                }
+                let (fb, w, h) = (p(1), p(2), p(3));
+                if w == 0 || h == 0 || w > xenos_max_wh() || h > xenos_max_wh() {
+                    return Err(EmuError::Other(format!("PM4 XE_SWAP bad size {}x{}", w, h)));
+                }
+                let size = (w as u64)
+                    .checked_mul(h as u64)
+                    .and_then(|n| n.checked_mul(4))
+                    .ok_or_else(|| EmuError::Other("PM4 XE_SWAP size overflows".into()))?;
+                if size > EDRAM_SIZE as u64 {
+                    return Err(EmuError::Other(format!(
+                        "PM4 XE_SWAP {}x{} exceeds EDRAM",
+                        w, h
+                    )));
+                }
+                self.edram_resolve(mem, fb, size as usize)?;
+                st.swaps += 1;
+                self.vd_irq_pending.push_back((0, 2));
+                st.interrupts += 1;
+                Ok(c + 1 + cnt)
+            }
             OP_DRAW_INDX_2 => {
                 // Indexed draw (reference `ExecutePacketType3_DRAW_INDX_2`
                 // → full draw). No draw backend yet: length-skip the
@@ -873,5 +920,45 @@ mod tests {
             .edram_resolve(&mut m, 0x0100_A000, EDRAM_SIZE + 4)
             .is_err());
         assert!(k.edram_resolve(&mut m, 0xFFFF_FFF0, 16).is_err());
+    }
+
+    #[test]
+    fn xe_swap_resolves_and_vblanks() {
+        let mut k = kernel();
+        let mut m = Memory::new();
+        let fb = 0x0116_0000;
+        k.edram_clear_32bpp(0xFF00_00FF);
+        // XE_SWAP cnt 4: [magic, fb, w, h] + 2 NOP-pad words (cnt 6).
+        let words = vec![
+            0xC005_6400,
+            SWAP_MAGIC,
+            fb,
+            64,
+            64,
+            0x8000_0000,
+            0x8000_0000,
+        ];
+        let mut st = GpuExecStats::default();
+        let mut seen = HashSet::new();
+        k.gpu_exec_linear(&mut m, &words, 0, &mut st, &mut seen)
+            .unwrap();
+        assert_eq!(st.swaps, 1);
+        assert_eq!(st.interrupts, 1);
+        assert_eq!(m.read_u32(fb).unwrap(), 0xFF00_00FF);
+        assert_eq!(m.read_u32(fb + 64 * 64 * 4 - 4).unwrap(), 0xFF00_00FF);
+        assert_eq!(k.vd_irq_pending.len(), 1);
+        assert_eq!(k.vd_irq_pending[0], (0, 2));
+        // Bad magic, zero size, and short packets are explicit errors.
+        for bad in [
+            vec![0xC003_6400, 0xDEAD_BEEF, fb, 64, 64],
+            vec![0xC003_6400, SWAP_MAGIC, fb, 0, 64],
+            vec![0xC001_6400, SWAP_MAGIC, fb],
+        ] {
+            let mut st = GpuExecStats::default();
+            let mut seen = HashSet::new();
+            assert!(k
+                .gpu_exec_linear(&mut m, &bad, 0, &mut st, &mut seen)
+                .is_err());
+        }
     }
 }

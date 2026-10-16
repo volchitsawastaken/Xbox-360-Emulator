@@ -249,24 +249,28 @@ Terminal states only: impossible, done, or something rendering.
       `DRAW_INDX_2` (0x36) length-skips but COUNTS draws_seen (draw
       demand signal, never silent); unit-tested. Retail Braid uploads
       one shader in init (now stored); no draws issued pre-device.
-- [ ] Draw backend remainder (shader translation + resolve wiring
-      into swap/present + EDRAM tiling for patterned content — the
-      substantial part; solid clear/resolve state done below)
+- [ ] Draw backend remainder (shader translation + EDRAM tiling for
+      patterned content — the substantial part; present path below
+      covers solid-cleared surfaces end to end)
 - [x] EDRAM clear/resolve state (reference `xenos.h` 10 MiB sizing):
       10 MiB backing, solid-32bpp clear (tiling-independent, exact),
       linear resolve to DRAM with explicit OOB errors; unit-tested.
-      Patterned content needs detiling (pending); swap→present wiring
-      pending.
+      Patterned content needs detiling (pending).
 - [x] Dash pipeline test (`dash_pipeline`, gated on `X360_DASH_DIR`):
       dash.xex parses/decompresses to 10 PE sections with entry
       `0x92196610` covered, 1628 imports — loader drift excluded for
       the table-walk frontier (fault is logic/data, not placement)
-- [x] `VdSwap` present (reference `VdSwap_entry` + `MarkVblank`):
-      counts presents, queues vblank `(0, 2)` through the existing
-      interrupt-delivery path; unit-tested. No draw backend yet —
-      queued vblanks deliver only once a callback is registered
-      (retail Braid registers one but never swaps; queue stays empty
-      there, documented)
+- [x] `VdSwap` present (reference `VdSwap_entry` + `MarkVblank` +
+      `ExecutePacketType3_XE_SWAP`): validates all ten args (fetch
+      header format/base/size, frontbuffer consistency, k_8_8_8_8 +
+      RGB, dimensions within EDRAM), writes the 64-word ring sequence
+      (Type0 fetch load + `XE_SWAP` + Type2 NOP fill), counts the
+      present. Ring execution resolves solid-cleared EDRAM to the
+      frontbuffer and queues vblank `(0, 2)` through the existing
+      interrupt-delivery path; unit-tested end to end (ring write →
+      execute → DRAM bytes + vblank). Patterned surfaces need
+      detiling (pending). Retail Braid registers a vblank callback
+      but never swaps; queue stays empty there.
 - [x] `VdInitializeScalerCommandBuffer` (0x1C5) per reference
       (`VdInitializeScalerCommandBuffer_entry`, kImplemented): fills
       `dest_count` words with NOPs (`0x80000000`), returns the count;
