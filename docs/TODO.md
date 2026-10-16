@@ -175,6 +175,20 @@ Terminal states only: impossible, done, or something rendering.
       tails call into `0x821836B0`/`0x82192490` (untraced).
       Init method `0x82150248` disassembled around the fault: the
       `bctr` consumes `[r31+16]` with r3=0 (device-null call).
+      Worker map (thread-creation probe + static disassembly):
+      2x XAPI wrappers `0x82349E20` (exit, never wait) + 2x
+      `0x8219E7B8` with ctx `0x010462DC`/`0x0104632C` — each waits
+      its own ctx+0x20 event (`...62FC`/`...634C`) with a
+      `0xFFFB6C20` (~28ms) timeout built on-stack. Worker1
+      TIMEOUT-cycles through pure-compute callees
+      (`0x82192C08`/`0x82192C10`, zero kernel calls) and never
+      signals; worker2 parks on its FIRST wait because the
+      timeout flows through uninitialized frame slot `[r1+80]`
+      (stale 0 = infinite on a zeroed stack — an artifact, not
+      the cause: even finite it would spin like worker1 since no
+      event is ever set). Signal map exhausted everywhere except
+      GPU completion: no KeSetEvent/Pulse, no semaphore posts,
+      no timer fires, callback registered but sourceless.
       NEXT: spinlock shims (callback path), then the missing
       signal source (GPU completion for init packets vs D3D
       device state) — draw backend / device work continues to be
