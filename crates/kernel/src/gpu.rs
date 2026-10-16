@@ -923,6 +923,44 @@ mod tests {
     }
 
     #[test]
+    fn xe_swap_flows_through_pump() {
+        use x360_memory::MMIO_BASE;
+        let mut k = kernel();
+        let mut m = Memory::new();
+        // In-ring present exactly like the reference: VdSwap fills
+        // 64 words at the ring head, the kick retires them, the
+        // frontbuffer resolves and vblank queues.
+        let ring = 0x0110_0000;
+        k.vd_ring = Some((ring, 20));
+        let fb = 0x0116_0000u32;
+        let mut seq = vec![
+            ((6 - 1) << 16) | 0x1200,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            (3 << 30) | (((4 - 1) & 0x3FFF) << 16) | ((0x64 & 0x7F) << 8),
+            SWAP_MAGIC,
+            fb,
+            64,
+            64,
+        ];
+        seq.extend(std::iter::repeat_n(0x8000_0000, 64 - seq.len()));
+        for (i, w) in seq.iter().enumerate() {
+            m.write_u32(ring + i as u32 * 4, *w).unwrap();
+        }
+        k.edram_clear_32bpp(0xFF00_00FF);
+        m.write_u32(MMIO_BASE + 0x01C5 * 4, 64).unwrap();
+        k.pump_gpu(&mut m).unwrap();
+        assert_eq!((k.vd_wptr_seen, k.vd_rptr), (64, 64));
+        assert_eq!(m.read_u32(fb).unwrap(), 0xFF00_00FF);
+        assert_eq!(k.vd_irq_pending.len(), 1);
+        assert_eq!(k.vd_irq_pending[0], (0, 2));
+    }
+
+    #[test]
     fn xe_swap_resolves_and_vblanks() {
         let mut k = kernel();
         let mut m = Memory::new();
