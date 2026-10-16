@@ -388,6 +388,12 @@ Terminal states only: impossible, done, or something rendering.
       masked absolute writeback. Relative addressing, exports,
       and remaining ops are explicit `Unsupported`. Unit-tested
       incl. writeback, clamps, D3D9/NaN edges.
+- [x] ALU transcendentals (`kernel::uint`, reference scalar arms):
+      exact `ReduceFloatPrecision` (round-to-nearest, never to
+      infinity, inf/NaN passthrough) under exp/logc/log/rcpc/
+      rcpf/rcp/rsqc/rsqf/rsq/sqrt plus plain sin/cos, with the
+      per-suffix -inf/+inf fixups (-MAX/MAX, -0/+0). Exact-output
+      unit tests incl. a bit-level reduce case.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

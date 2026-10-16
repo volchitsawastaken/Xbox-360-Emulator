@@ -168,6 +168,31 @@ fn fetch_scalar_pair(
     Ok((a, b))
 }
 
+/// Mantissa reduction (reference `ReduceFloatPrecision`):
+/// round-to-nearest on the low `23 - mantissa_bits` mantissa bits,
+/// never rounding a finite result up to infinity; infinities and
+/// NaN pass through.
+fn reduce_float_precision(value: f32, mantissa_bits: u32) -> f32 {
+    let bits = value.to_bits();
+    if bits & 0x7F80_0000 == 0x7F80_0000 {
+        return value;
+    }
+    let truncate_bits = 23 - mantissa_bits;
+    let discarded_mask = (1u32 << truncate_bits) - 1;
+    let truncated_bits = bits & !discarded_mask;
+    let mut rounded_bits = truncated_bits + (1u32 << truncate_bits);
+    if rounded_bits & 0x7F80_0000 == 0x7F80_0000 {
+        rounded_bits = truncated_bits;
+    }
+    let round_bit = 1u32 << (truncate_bits - 1);
+    let result_bits = if bits & discarded_mask >= round_bit {
+        rounded_bits
+    } else {
+        truncated_bits
+    };
+    f32::from_bits(result_bits)
+}
+
 /// D3D9 multiply: 0 (or flushed denormal) times anything is +0.
 fn d3d_mul(a: f32, b: f32) -> f32 {
     if a != 0.0 && b != 0.0 {
@@ -316,6 +341,68 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
                 _ => a - b,
             };
         }
+        14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 40 | 48 | 49 => {
+            let (a, _) = fetch_scalar_pair(core, consts, ins, vec_three)?;
+            // Exact fixups per op (reference arms): reduced-precision
+            // transcendentals with -inf/+inf mapped per suffix.
+            core.previous_scalar = match sop {
+                14 => reduce_float_precision(a.exp2(), 21),
+                15 => {
+                    let v = reduce_float_precision(a.log2(), 21);
+                    if v == f32::NEG_INFINITY {
+                        -f32::MAX
+                    } else {
+                        v
+                    }
+                }
+                16 => reduce_float_precision(a.log2(), 21),
+                17 => {
+                    let v = reduce_float_precision(1.0 / a, 21);
+                    if v == f32::NEG_INFINITY {
+                        -f32::MAX
+                    } else if v == f32::INFINITY {
+                        f32::MAX
+                    } else {
+                        v
+                    }
+                }
+                18 => {
+                    let v = reduce_float_precision(1.0 / a, 21);
+                    if v == f32::NEG_INFINITY {
+                        -0.0
+                    } else if v == f32::INFINITY {
+                        0.0
+                    } else {
+                        v
+                    }
+                }
+                19 => reduce_float_precision(1.0 / a, 21),
+                20 => {
+                    let v = reduce_float_precision(1.0 / a.sqrt(), 21);
+                    if v == f32::NEG_INFINITY {
+                        -f32::MAX
+                    } else if v == f32::INFINITY {
+                        f32::MAX
+                    } else {
+                        v
+                    }
+                }
+                21 => {
+                    let v = reduce_float_precision(1.0 / a.sqrt(), 21);
+                    if v == f32::NEG_INFINITY {
+                        -0.0
+                    } else if v == f32::INFINITY {
+                        0.0
+                    } else {
+                        v
+                    }
+                }
+                22 => reduce_float_precision(1.0 / a.sqrt(), 21),
+                40 => reduce_float_precision(a.sqrt(), 21),
+                48 => a.sin(),
+                _ => a.cos(),
+            };
+        }
         _ => {
             return Err(EmuError::Unsupported(format!(
                 "alu: scalar op {} pending",
@@ -441,5 +528,40 @@ mod tests {
         assert!(core.previous_scalar.is_nan());
         assert_eq!(core.temps[3][0], 0.0);
         assert!(core.temps[3][0].is_sign_positive());
+    }
+
+    #[test]
+    fn scalar_transcendentals_exact() {
+        // Scalar op template: dest r3.x, vector max masked out.
+        fn op(sop: u32) -> [u32; 3] {
+            [(3 << 8) | (1 << 20) | ((sop & 0x3F) << 26), 0, (2 << 24)]
+        }
+        let mut core = ShaderCore::default();
+        // rcp(4.0) = 0.25 exactly (no low mantissa bits to reduce).
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 4.0]], &parse_alu(&op(19))).unwrap();
+        assert_eq!(core.previous_scalar, 0.25);
+        // rcp(3.0): 1/3 rounds to 0x3EAAAAAC at 21 mantissa bits.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 3.0]], &parse_alu(&op(19))).unwrap();
+        assert_eq!(core.previous_scalar.to_bits(), 0x3EAA_AAAC);
+        // Fixups: rcpc(0)=+MAX, rcpf(0)=+0, rsqf(-0)=-0, logc(0)=-MAX.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(17))).unwrap();
+        assert_eq!(core.previous_scalar, f32::MAX);
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(18))).unwrap();
+        assert_eq!(core.previous_scalar, 0.0);
+        assert!(core.previous_scalar.is_sign_positive());
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, -0.0]], &parse_alu(&op(21))).unwrap();
+        assert_eq!(core.previous_scalar, -0.0);
+        assert!(core.previous_scalar.is_sign_negative());
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(15))).unwrap();
+        assert_eq!(core.previous_scalar, -f32::MAX);
+        // Exact small cases: logc(1)=0, sin(0)=0, cos(0)=1, sqrt(4)=2.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 1.0]], &parse_alu(&op(15))).unwrap();
+        assert_eq!(core.previous_scalar, 0.0);
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(48))).unwrap();
+        assert_eq!(core.previous_scalar, 0.0);
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(49))).unwrap();
+        assert_eq!(core.previous_scalar, 1.0);
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 4.0]], &parse_alu(&op(40))).unwrap();
+        assert_eq!(core.previous_scalar, 2.0);
     }
 }
