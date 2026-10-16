@@ -486,6 +486,14 @@ Terminal states only: impossible, done, or something rendering.
       packed/signed-clamp/half/unknown-format, const bits, swaps).
       The shader interpreter is now complete (no remaining
       `Unsupported` on the CF path).
+- [x] Shader-constant plumbing (`kernel::gpu::collect_shader_inputs`,
+      reference `register_table.inc` + `register_file.h`): float
+      consts (512 vec4 at 0x4000), vertex-fetch pairs (96 at
+      0x4800), bool bits (0x4900), loop words (32 at 0x4908) from
+      programmed `vd_regs` (unprogrammed read zero). Unit-tested.
+      Retail Braid programs none of these pre-device (verified 42
+      control regs only), so this is draw-backend plumbing ahead of
+      demand.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

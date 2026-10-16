@@ -33,6 +33,7 @@ use std::collections::HashSet;
 use x360_common::{EmuError, Result};
 use x360_memory::Memory;
 
+use crate::uint::VertexFetchConst;
 use crate::Kernel;
 
 /// Type-3 opcodes with CPU-visible effects (reference `xenos.h`).
@@ -65,6 +66,25 @@ const REG_WRITEBACK_START: u32 = 0x0A04;
 const REG_WRITEBACK_SIZE: u32 = 0x0A05;
 const REG_VGT_EVENT_INITIATOR: u32 = 0x21F9;
 const REG_RB_SAMPLE_COUNT_ADDR: u32 = 0x2325;
+/// Shader float-constant vec4 base (512 entries, reference
+/// `SHADER_CONSTANT_000_X` 0x4000).
+pub const REG_SHADER_FLOAT_BASE: u32 = 0x4000;
+/// Shader float-constant count.
+pub const SHADER_FLOAT_COUNT: usize = 512;
+/// Vertex-fetch constant pair base (2 dwords each, reference
+/// `SHADER_CONSTANT_FETCH_00_0` 0x4800; vertex index n reads
+/// regs base+2n/base+2n+1 per `GetVertexFetch`).
+pub const REG_SHADER_FETCH_BASE: u32 = 0x4800;
+/// Vertex-fetch constant count.
+pub const SHADER_FETCH_COUNT: usize = 96;
+/// Bool-constant base (2 dwords, reference
+/// `SHADER_CONSTANT_BOOL_000_031` 0x4900).
+pub const REG_SHADER_BOOL_BASE: u32 = 0x4900;
+/// Loop-constant base (32 dwords, reference
+/// `SHADER_CONSTANT_LOOP_00` 0x4908).
+pub const REG_SHADER_LOOP_BASE: u32 = 0x4908;
+/// Loop-constant count.
+pub const SHADER_LOOP_COUNT: usize = 32;
 
 /// Maximum IB nesting (reference recurses; real streams nest shallowly).
 const MAX_IB_DEPTH: u32 = 8;
@@ -122,7 +142,81 @@ fn match_value_and_ref(value: u32, reference: u32, wait_info: u32) -> bool {
     ((flags >> (wait_info & 7)) & 1) != 0
 }
 
+/// Interpreter inputs collected from programmed GPU registers
+/// (see [`Kernel::collect_shader_inputs`]).
+#[derive(Debug, Clone)]
+pub struct ShaderInputs {
+    /// Float constants (512 vec4).
+    pub floats: [[f32; 4]; SHADER_FLOAT_COUNT],
+    /// Vertex-fetch constants (96 pairs).
+    pub fetch: [VertexFetchConst; SHADER_FETCH_COUNT],
+    /// Bool-constant bits (2 dwords).
+    pub bools: [u32; 2],
+    /// Loop constants (32 register words).
+    pub loops: [u32; SHADER_LOOP_COUNT],
+}
+
 impl Kernel {
+    /// Collect programmed shader inputs for the interpreter
+    /// (reference `register_file.h` fetch/loop accessors +
+    /// `shader_interpreter.cc` register reads): float constants
+    /// (512 vec4 at 0x4000), vertex-fetch pairs (96 at 0x4800),
+    /// bool bits (2 dwords at 0x4900), loop constants (32 at
+    /// 0x4908). Unprogrammed registers read as zeros, matching the
+    /// zeroed register file. Verified against retail: Braid programs
+    /// none of these pre-device (42 control regs only), so this is
+    /// draw-backend plumbing ahead of demand, unit-tested
+    /// synthetically.
+    pub fn collect_shader_inputs(&self) -> ShaderInputs {
+        let mut floats = [[0.0f32; 4]; SHADER_FLOAT_COUNT];
+        for (i, v) in floats.iter_mut().enumerate() {
+            for (c, f) in v.iter_mut().enumerate() {
+                *f = f32::from_bits(
+                    self.vd_regs
+                        .get(&(REG_SHADER_FLOAT_BASE + 4 * i as u32 + c as u32))
+                        .copied()
+                        .unwrap_or(0),
+                );
+            }
+        }
+        let mut fetch = [VertexFetchConst::default(); SHADER_FETCH_COUNT];
+        for (i, f) in fetch.iter_mut().enumerate() {
+            let w = [
+                self.vd_regs
+                    .get(&(REG_SHADER_FETCH_BASE + 2 * i as u32))
+                    .copied()
+                    .unwrap_or(0),
+                self.vd_regs
+                    .get(&(REG_SHADER_FETCH_BASE + 2 * i as u32 + 1))
+                    .copied()
+                    .unwrap_or(0),
+            ];
+            *f = VertexFetchConst::from_words(&w);
+        }
+        let mut bools = [0u32; 2];
+        for (i, b) in bools.iter_mut().enumerate() {
+            *b = self
+                .vd_regs
+                .get(&(REG_SHADER_BOOL_BASE + i as u32))
+                .copied()
+                .unwrap_or(0);
+        }
+        let mut loops = [0u32; SHADER_LOOP_COUNT];
+        for (i, l) in loops.iter_mut().enumerate() {
+            *l = self
+                .vd_regs
+                .get(&(REG_SHADER_LOOP_BASE + i as u32))
+                .copied()
+                .unwrap_or(0);
+        }
+        ShaderInputs {
+            floats,
+            fetch,
+            bools,
+            loops,
+        }
+    }
+
     /// Execute ring dwords `[start_dw, end_dw)`; `ring_dw` is the ring
     /// size in dwords for wraparound. Returns batch stats.
     pub fn gpu_exec_ring(
@@ -757,6 +851,41 @@ mod tests {
         assert_eq!(m.read_u32(0x0100_7014).unwrap(), 0x1234_5678);
         assert_eq!(st.mem_writes, 3);
         let _ = t3(0x10, 1);
+    }
+
+    #[test]
+    fn shader_inputs_collect_from_regs() {
+        let mut k = kernel();
+        // Float const 3 = [1, 2, 3, 4]; fetch const 5 = base/size;
+        // bool1 bit 5; loop 0 = count 3.
+        for (c, f) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+            k.vd_regs
+                .insert(REG_SHADER_FLOAT_BASE + 4 * 3 + c as u32, f.to_bits());
+        }
+        k.vd_regs.insert(REG_SHADER_FETCH_BASE + 2 * 5, 0x400 << 2);
+        k.vd_regs
+            .insert(REG_SHADER_FETCH_BASE + 2 * 5 + 1, (16 << 2) | 2);
+        k.vd_regs.insert(REG_SHADER_BOOL_BASE + 1, 1 << 5);
+        k.vd_regs.insert(REG_SHADER_LOOP_BASE, 3);
+        let si = k.collect_shader_inputs();
+        assert_eq!(si.floats[3], [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(si.floats[4], [0.0; 4]);
+        assert_eq!(
+            (
+                si.fetch[5].address_dwords,
+                si.fetch[5].size_dwords,
+                si.fetch[5].endian
+            ),
+            (0x400, 16, 2)
+        );
+        assert_eq!(si.fetch[6].address_dwords, 0);
+        assert_eq!(si.bools, [0, 1 << 5]);
+        assert_eq!(si.loops[0], 3);
+        assert_eq!(si.loops[1], 0);
+        // Empty register file collects zeros.
+        let si = kernel().collect_shader_inputs();
+        assert_eq!(si.floats[0], [0.0; 4]);
+        assert_eq!(si.bools, [0, 0]);
     }
 
     #[test]
