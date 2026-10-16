@@ -344,6 +344,14 @@ Terminal states only: impossible, done, or something rendering.
       `opcode_NN` placeholders), dests, write masks, export bit,
       per-source reg/sel/swizzle/negate with `r#`/`c#`
       resolution. One-line disassembly. Exact-output unit tests.
+- [x] Fetch clause decode + full shader listing
+      (`kernel::ucode`, reference `FetchInstruction::Data` LSB0
+      layout): opcode/src/dst/const-index/dimension, exact
+      family names (`vfetch`, `tfetch{1D,2D,3D,Cube}`,
+      `getBCF*`, `getCompTexLOD*`, `getGradients`, `getWeights*`,
+      `setTexLOD`, `setGradientH/V`). `disassemble_shader` walks
+      exec sequence bits (ALU vs fetch + serialize marker) and
+      lists every covered clause slot. Exact-output unit tests.
 - [x] Spinlocks (`KfAcquireSpinLock` 0xB1 /
       `KeAcquireSpinLockAtRaisedIrql` 0x4D, `KfReleaseSpinLock`
       0xB4 / `KeReleaseSpinLockFromRaisedIrql` 0x89,

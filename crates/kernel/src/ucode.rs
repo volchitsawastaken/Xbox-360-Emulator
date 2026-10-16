@@ -556,6 +556,131 @@ pub fn disassemble_alu(dwords: &[u32; 3]) -> String {
     )
 }
 
+/// One decoded fetch clause instruction (3 dwords).
+///
+/// Bit layout facts ported from the BSD-licensed Xenia `ucode.h`
+/// `FetchInstruction::Data` (LSB0): d0 = opcode[0:5],
+/// src_reg[5:11], src_reg_am[11], dst_reg[12:18], dst_reg_am[18],
+/// const_index[20:25]; d1 = dst_swiz[0:12], is_predicated[31];
+/// d2 = use_reg_gradients[0], sample_location[1], lod_bias[2:9],
+/// dimension[14:16], offset_x[16:21], offset_y[21:26],
+/// offset_z[26:31], pred_condition[31]. Vertex-specific detail
+/// (stride, format) is not decoded yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchInstr {
+    /// Raw clause dwords.
+    pub dwords: [u32; 3],
+}
+
+/// Wrap 3 clause dwords as a fetch instruction.
+pub fn parse_fetch(dwords: &[u32; 3]) -> FetchInstr {
+    FetchInstr { dwords: *dwords }
+}
+
+impl FetchInstr {
+    /// Fetch opcode (5 bits).
+    pub fn opcode(&self) -> u32 {
+        self.dwords[0] & 0x1F
+    }
+
+    /// Source register.
+    pub fn src_reg(&self) -> u32 {
+        (self.dwords[0] >> 5) & 0x3F
+    }
+
+    /// Destination register.
+    pub fn dst_reg(&self) -> u32 {
+        (self.dwords[0] >> 12) & 0x3F
+    }
+
+    /// Fetch-constant index (0-31).
+    pub fn const_index(&self) -> u32 {
+        (self.dwords[0] >> 20) & 0x1F
+    }
+
+    /// Texture dimension (0=1D, 1=2D, 2=3D, 3=Cube).
+    pub fn dimension(&self) -> u32 {
+        (self.dwords[2] >> 14) & 3
+    }
+}
+
+/// Fetch opcode mnemonic (reference `ParseTextureFetchInstruction`
+/// names; `vfetch` covers full/mini, whose bit is in
+/// vertex-specific detail not decoded here).
+pub fn fetch_opcode_name(op: u32, dim: u32) -> String {
+    let d = (dim & 3) as usize;
+    const DIM1: [&str; 4] = ["1D", "2D", "3D", "Cube"];
+    match op {
+        0 => "vfetch".to_string(),
+        1 => format!("tfetch{}", DIM1[d]),
+        16 => format!("getBCF{}", DIM1[d]),
+        17 => format!("getCompTexLOD{}", DIM1[d]),
+        18 => "getGradients".to_string(),
+        19 => format!("getWeights{}", DIM1[d]),
+        24 => "setTexLOD".to_string(),
+        25 => "setGradientH".to_string(),
+        26 => "setGradientV".to_string(),
+        _ => format!("fetch_op_{}", op),
+    }
+}
+
+/// One-line fetch disassembly (`<name> dst src const`).
+pub fn disassemble_fetch(dwords: &[u32; 3]) -> String {
+    let f = parse_fetch(dwords);
+    format!(
+        "{} r{} r{} tf{}",
+        fetch_opcode_name(f.opcode(), f.dimension()),
+        f.dst_reg(),
+        f.src_reg(),
+        f.const_index()
+    )
+}
+
+/// Full shader listing: CF lines from [`disassemble_cf`] plus one
+/// clause line per covered slot (`  @slot: ...`), in exec order.
+/// The exec sequence bits select ALU vs fetch per instruction
+/// (reference `GatherExecInformation`: bit0 fetch, bit1
+/// serialize); unknown fetch detail stays raw-hex inside its line.
+pub fn disassemble_shader(dwords: &[u32], is_vertex_shader: bool) -> Result<Vec<String>> {
+    let st = validate_ucode(dwords)?;
+    let mut out = disassemble_cf(dwords, is_vertex_shader)?;
+    let pairs = st.cf_pairs as usize;
+    for pair in 0..pairs {
+        let g = [dwords[3 * pair], dwords[3 * pair + 1], dwords[3 * pair + 2]];
+        for ins in unpack_cf_pair(&g) {
+            if is_exec_opcode(ins.opcode) {
+                for k in 0..ins.count() {
+                    let slot = (ins.address() + k) as usize;
+                    let seq = (ins.sequence() >> (2 * k)) & 3;
+                    let base = slot * 3;
+                    let line = if base + 3 <= dwords.len() {
+                        let w = [dwords[base], dwords[base + 1], dwords[base + 2]];
+                        if seq & 1 != 0 {
+                            format!(
+                                "  @{}: {}{}",
+                                slot,
+                                disassemble_fetch(&w),
+                                if seq & 2 != 0 { " serialize" } else { "" }
+                            )
+                        } else {
+                            format!(
+                                "  @{}: {}{}",
+                                slot,
+                                disassemble_alu(&w),
+                                if seq & 2 != 0 { " serialize" } else { "" }
+                            )
+                        }
+                    } else {
+                        format!("  @{}: <out of range>", slot)
+                    };
+                    out.push(line);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +884,45 @@ mod tests {
         // Reference placeholder names for undefined opcodes.
         assert_eq!(alu_scalar_opcode_name(41), "opcode_41");
         assert_eq!(alu_vector_opcode_name(30), "opcode_30");
+    }
+
+    #[test]
+    fn fetch_decode_and_shader_listing() {
+        // Synthetic fetch triple: tfetch2D, dst r3, src r7, tf11.
+        // d0: opc=1 | src=7<<5 | dst=3<<12 | const=11<<20.
+        // d2: dim=1<<14.
+        let d = [0x00B0_30E1u32, 0x0000_0000, 0x0000_4000];
+        let f = parse_fetch(&d);
+        assert_eq!((f.opcode(), f.dimension()), (1, 1));
+        assert_eq!((f.dst_reg(), f.src_reg(), f.const_index()), (3, 7, 11));
+        assert_eq!(disassemble_fetch(&d), "tfetch2D r3 r7 tf11");
+        assert_eq!(fetch_opcode_name(18, 0), "getGradients");
+        assert_eq!(fetch_opcode_name(31, 0), "fetch_op_31");
+        // Shader listing: CF exec@1 x1 (ALU) over a 2-pair upload.
+        // Pair0: exec@1 (word0 0x1001, d1lo 0x1200) + nop.
+        // Pair1 (slot 1): the ALU triple above.
+        let words = vec![
+            0x0000_1001,
+            0x0000_1200,
+            0x0000_0000,
+            0x000F_0201,
+            0x0000_0000,
+            0x0B04_0506,
+        ];
+        let listed = disassemble_shader(&words, true).unwrap();
+        assert_eq!(listed[0], "0: exec @1 x1");
+        assert_eq!(listed[1], "1: cnop w0=00000000 w1=0000");
+        assert_eq!(
+            listed[2],
+            "  @1: alu mad r1.xyzw adds r2 src1=c4 src2=c5 src3=c6"
+        );
+        // Serialize bit appends the marker.
+        let mut seq = words.clone();
+        seq[0] = 0x0002_1001; // sequence bits: instr0 = ALU+serialize (0b11).
+        let listed = disassemble_shader(&seq, true).unwrap();
+        assert_eq!(
+            listed[2],
+            "  @1: alu mad r1.xyzw adds r2 src1=c4 src2=c5 src3=c6 serialize"
+        );
     }
 }
