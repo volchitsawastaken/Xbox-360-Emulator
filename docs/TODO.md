@@ -192,7 +192,11 @@ Terminal states only: impossible, done, or something rendering.
       delivers the callback 94x per boot on source 0 with no
       effect (its source-0 path sets no events); source==1 still
       needs genuine GPU completion the game never submits
-      pre-device. Shaders unblocked separately: retail vs/ps run
+      pre-device. Forensics census (measured, not inferred):
+      `0x010462FC` (0, 9313, 0), `0x0104634C` (0, 0, 353792),
+      all signal counters 0, swaps 0 — and 24 real DRAW packets
+      (all pointlist/1/auto-index, device-init kick draws, no
+      scene content). Shaders unblocked separately: retail vs/ps run
       end to end in `run_cf` (`retail_shaders_interpret` gate).
       NEXT: the missing signal source (GPU completion for init
       packets vs D3D device state) — draw backend / device work continues to be
