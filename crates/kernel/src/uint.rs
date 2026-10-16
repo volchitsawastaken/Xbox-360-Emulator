@@ -24,10 +24,13 @@
 //!
 //! Scope (slice 1): absolute addressing only; no exports (explicit
 //! error); vector add/mul/max/min/seq/sgt/sge/sne/frc/trunc/floor/
-//! mad/dp4/dp3/dp2add; scalar adds/muls/subs/retain_prev. Everything
-//! else is an explicit `Unsupported`, never a wrong result.
-//! Predication is driver business (the reference skips predicated
-//! instructions before evaluation); `eval_alu` executes
+//! mad/dp4/dp3/dp2add; scalar adds/adds_prev/muls/muls_prev/
+//! muls_prev2/subs/subs_prev/maxas/maxasf/setp_eq/ne/gt/ge/inv/
+//! pop/clr/rstr/kills_eq/gt/ge/ne/one/retain_prev plus the
+//! exp/logc/log/rcpc/rcpf/rcp/rsqc/rsqf/rsq/sqrt/sin/cos batch.
+//! Everything else is an explicit `Unsupported`, never a wrong
+//! result. Predication is driver business (the reference skips
+//! predicated instructions before evaluation); `eval_alu` executes
 //! unconditionally.
 
 use x360_common::{EmuError, Result};
@@ -46,6 +49,8 @@ pub struct ShaderCore {
     pub previous_scalar: f32,
     /// Current predicate (`p0`).
     pub predicate: bool,
+    /// Address register (`a0`, loop-relative base).
+    pub address_register: i32,
 }
 
 impl Default for ShaderCore {
@@ -54,6 +59,7 @@ impl Default for ShaderCore {
             temps: [[0.0; 4]; TEMP_COUNT],
             previous_scalar: 0.0,
             predicate: false,
+            address_register: 0,
         }
     }
 }
@@ -191,6 +197,17 @@ fn reduce_float_precision(value: f32, mantissa_bits: u32) -> f32 {
         truncated_bits
     };
     f32::from_bits(result_bits)
+}
+
+/// Clamp with reference `clamp_float` NaN semantics (NaN takes
+/// the min boundary).
+fn clamp_float(v: f32, min: f32, max: f32) -> f32 {
+    let c = if v > min { v } else { min };
+    if c < max {
+        c
+    } else {
+        max
+    }
 }
 
 /// D3D9 multiply: 0 (or flushed denormal) times anything is +0.
@@ -333,13 +350,46 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
     let vec_three = matches!(vop, 11 | 17);
     match sop {
         50 => {}
-        0 | 2 | 25 => {
+        0 | 1 | 2 | 3 | 4 | 23 | 24 | 25 | 26 => {
             let (a, b) = fetch_scalar_pair(core, consts, ins, vec_three)?;
-            core.previous_scalar = match sop {
-                0 => a + b,
-                2 => d3d_mul(a, b),
-                _ => a - b,
-            };
+            match sop {
+                0 => core.previous_scalar = a + b,
+                1 => core.previous_scalar += a,
+                2 => core.previous_scalar = d3d_mul(a, b),
+                3 => {
+                    let product = a * core.previous_scalar;
+                    core.previous_scalar = if a != 0.0 && core.previous_scalar != 0.0 {
+                        product
+                    } else {
+                        0.0
+                    };
+                }
+                4 => {
+                    if core.previous_scalar == -f32::MAX
+                        || !core.previous_scalar.is_finite()
+                        || !b.is_finite()
+                        || b <= 0.0
+                    {
+                        core.previous_scalar = -f32::MAX;
+                    } else if a != 0.0 && core.previous_scalar != 0.0 {
+                        let product = a * core.previous_scalar;
+                        core.previous_scalar = product;
+                    } else {
+                        core.previous_scalar = 0.0;
+                    }
+                }
+                23 | 24 => {
+                    // max-and-set-address (reference `kMaxAs(f)`).
+                    let clamped = clamp_float(a, -256.0, 255.0);
+                    core.address_register = if sop == 23 {
+                        (clamped + 0.5).floor() as i32
+                    } else {
+                        clamped.floor() as i32
+                    };
+                    core.previous_scalar = if a < b { b } else { a };
+                }
+                _ => core.previous_scalar = a - b,
+            }
         }
         14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 40 | 48 | 49 => {
             let (a, _) = fetch_scalar_pair(core, consts, ins, vec_three)?;
@@ -402,6 +452,67 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
                 48 => a.sin(),
                 _ => a.cos(),
             };
+        }
+        27..=39 => {
+            // Predicate writers (reference `kSetp*`; kills only set
+            // ps — pixel kill itself is unimplemented in the
+            // reference interpreter too).
+            let (a, _) = fetch_scalar_pair(core, consts, ins, vec_three)?;
+            match sop {
+                27 => {
+                    core.predicate = a == 0.0;
+                    core.previous_scalar = if !core.predicate { 1.0 } else { 0.0 };
+                }
+                28 => {
+                    core.predicate = a != 0.0;
+                    core.previous_scalar = if !core.predicate { 1.0 } else { 0.0 };
+                }
+                29 => {
+                    core.predicate = a > 0.0;
+                    core.previous_scalar = if !core.predicate { 1.0 } else { 0.0 };
+                }
+                30 => {
+                    // isgreaterequal: quiet-true on NaN (partial_cmp
+                    // makes the unordered case explicit).
+                    core.predicate = a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less);
+                    core.previous_scalar = if !core.predicate { 1.0 } else { 0.0 };
+                }
+                31 => {
+                    core.predicate = a == 1.0;
+                    core.previous_scalar = if core.predicate {
+                        0.0
+                    } else if a == 0.0 {
+                        1.0
+                    } else {
+                        a
+                    };
+                }
+                32 => {
+                    let counter = a - 1.0;
+                    core.predicate = counter <= 0.0;
+                    core.previous_scalar = if core.predicate { 0.0 } else { counter };
+                }
+                33 => {
+                    core.predicate = false;
+                    core.previous_scalar = f32::MAX;
+                }
+                34 => {
+                    core.predicate = a == 0.0;
+                    core.previous_scalar = if core.predicate { 0.0 } else { a };
+                }
+                35 => core.previous_scalar = if a == 0.0 { 1.0 } else { 0.0 },
+                36 => core.previous_scalar = if a > 0.0 { 1.0 } else { 0.0 },
+                37 => {
+                    core.previous_scalar = if a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less)
+                    {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                38 => core.previous_scalar = if a != 0.0 { 1.0 } else { 0.0 },
+                _ => core.previous_scalar = if a == 1.0 { 1.0 } else { 0.0 },
+            }
         }
         _ => {
             return Err(EmuError::Unsupported(format!(
@@ -563,5 +674,31 @@ mod tests {
         assert_eq!(core.previous_scalar, 1.0);
         eval_alu(&mut core, &[[0.0, 0.0, 0.0, 4.0]], &parse_alu(&op(40))).unwrap();
         assert_eq!(core.previous_scalar, 2.0);
+    }
+
+    #[test]
+    fn setp_predicate_and_prev_chain() {
+        fn op(sop: u32) -> [u32; 3] {
+            [(3 << 8) | (1 << 20) | ((sop & 0x3F) << 26), 0, (2 << 24)]
+        }
+        let mut core = ShaderCore::default();
+        // setp_gt on c0.w = 5.0: predicate true, ps = 0.0.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 5.0]], &parse_alu(&op(29))).unwrap();
+        assert!(core.predicate);
+        assert_eq!(core.previous_scalar, 0.0);
+        // setp_eq on c0.w = 5.0: predicate false, ps = 1.0.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 5.0]], &parse_alu(&op(27))).unwrap();
+        assert!(!core.predicate);
+        assert_eq!(core.previous_scalar, 1.0);
+        // adds_prev chains onto ps = 1.0: 5.0 + 1.0 = 6.0.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 5.0]], &parse_alu(&op(1))).unwrap();
+        assert_eq!(core.previous_scalar, 6.0);
+        // maxas sets a0 = floor(5.0 + 0.5) = 5 and max(a, b).
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 5.0]], &parse_alu(&op(23))).unwrap();
+        assert_eq!(core.address_register, 5);
+        // setp_clr clears predicate with ps = MAX.
+        eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(33))).unwrap();
+        assert!(!core.predicate);
+        assert_eq!(core.previous_scalar, f32::MAX);
     }
 }

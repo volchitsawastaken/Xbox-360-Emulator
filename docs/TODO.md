@@ -394,6 +394,14 @@ Terminal states only: impossible, done, or something rendering.
       rcpf/rcp/rsqc/rsqf/rsq/sqrt plus plain sin/cos, with the
       per-suffix -inf/+inf fixups (-MAX/MAX, -0/+0). Exact-output
       unit tests incl. a bit-level reduce case.
+- [x] ALU prev/setp/address ops (`kernel::uint`, reference arms):
+      adds_prev/muls_prev/muls_prev2/subs_prev chaining `ps`,
+      maxas/maxasf writing the address register (exact clamp+
+      floor), setp_eq/ne/gt/ge/inv/pop/clr/rstr driving the
+      predicate, kills_* setting `ps` only (kill unimplemented
+      in the reference too). NaN-quiet comparison semantics kept
+      explicit (`partial_cmp`-style, no negated comparisons).
+      Unit-tested incl. chaining and address output.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
