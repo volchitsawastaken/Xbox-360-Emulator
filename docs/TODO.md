@@ -344,6 +344,9 @@ Terminal states only: impossible, done, or something rendering.
       `opcode_NN` placeholders), dests, write masks, export bit,
       per-source reg/sel/swizzle/negate with `r#`/`c#`
       resolution. One-line disassembly. Exact-output unit tests.
+      Clamp/predication accessors with exact reference tokens
+      (`_sat`, `(p0)`/`(!p0)`) in the line; swizzles, export
+      routing, and NOP collapsing pending translation work.
 - [x] Fetch clause decode + full shader listing
       (`kernel::ucode`, reference `FetchInstruction::Data` LSB0
       layout): opcode/src/dst/const-index/dimension, exact

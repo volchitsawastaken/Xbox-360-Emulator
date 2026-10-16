@@ -369,6 +369,26 @@ impl AluInstr {
         (self.d0() >> 15) & 1 != 0
     }
 
+    /// Result clamp flags.
+    pub fn vector_clamp(&self) -> bool {
+        (self.d0() >> 24) & 1 != 0
+    }
+
+    /// Result clamp flags.
+    pub fn scalar_clamp(&self) -> bool {
+        (self.d0() >> 25) & 1 != 0
+    }
+
+    /// Predicated execution.
+    pub fn is_predicated(&self) -> bool {
+        (self.d1() >> 28) & 1 != 0
+    }
+
+    /// Required predicate value when predicated.
+    pub fn pred_condition(&self) -> bool {
+        (self.d1() >> 27) & 1 != 0
+    }
+
     /// Source register index (1-3) and temp-select bit.
     pub fn src_reg(&self, i: u32) -> u32 {
         match i {
@@ -535,20 +555,41 @@ fn mask_letters(mask: u32) -> String {
     s
 }
 
-/// One-line ALU disassembly (`alu <vec> <vdest> <scal> <sdest>
-/// src1=.. src2=.. src3=..`). Swizzles, clamps, predication, and
-/// export routing are not decoded yet (pending translation work).
+/// One-line ALU disassembly (`[(p0)/(!p0)] alu <vec>[_sat]
+/// <vdest> <scal>[_sat] <sdest> src1=.. src2=.. src3=..`).
+/// Swizzles, export routing, and NOP collapsing are not decoded
+/// yet (pending translation work); `_sat`/`(p0)` tokens match the
+/// reference disassembler exactly.
 pub fn disassemble_alu(dwords: &[u32; 3]) -> String {
     let a = parse_alu(dwords);
     let vd = match mask_letters(a.vector_write_mask()) {
         m if m.is_empty() => format!("r{}", a.vector_dest()),
         m => format!("r{}.{}", a.vector_dest(), m),
     };
+    let vec_op = if a.vector_clamp() {
+        format!("{}_sat", alu_vector_opcode_name(a.vector_opcode()))
+    } else {
+        alu_vector_opcode_name(a.vector_opcode()).to_string()
+    };
+    let scal_op = if a.scalar_clamp() {
+        format!("{}_sat", alu_scalar_opcode_name(a.scalar_opcode()))
+    } else {
+        alu_scalar_opcode_name(a.scalar_opcode()).to_string()
+    };
     format!(
-        "alu {} {} {} r{} src1={} src2={} src3={}",
-        alu_vector_opcode_name(a.vector_opcode()),
+        "{}alu {} {} {} r{} src1={} src2={} src3={}",
+        if a.is_predicated() {
+            if a.pred_condition() {
+                "(p0) "
+            } else {
+                "(!p0) "
+            }
+        } else {
+            ""
+        },
+        vec_op,
         vd,
-        alu_scalar_opcode_name(a.scalar_opcode()),
+        scal_op,
         a.scalar_dest(),
         a.src_operand(1),
         a.src_operand(2),
@@ -884,6 +925,15 @@ mod tests {
         // Reference placeholder names for undefined opcodes.
         assert_eq!(alu_scalar_opcode_name(41), "opcode_41");
         assert_eq!(alu_vector_opcode_name(30), "opcode_30");
+        // Clamp + predication markers use exact reference tokens.
+        let d = [0x030F_0201u32, 0x1800_0000, 0x0B04_0506];
+        let a = parse_alu(&d);
+        assert!(a.vector_clamp() && a.scalar_clamp());
+        assert!(a.is_predicated() && a.pred_condition());
+        assert_eq!(
+            disassemble_alu(&d),
+            "(p0) alu mad_sat r1.xyzw adds_sat r2 src1=c4 src2=c5 src3=c6"
+        );
     }
 
     #[test]
