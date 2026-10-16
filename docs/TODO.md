@@ -378,6 +378,16 @@ Terminal states only: impossible, done, or something rendering.
       events (spinlocks live behind the source==1 branch, which
       needs genuine GPU completion the game never submits
       pre-device). Faithful subsystem, honest negative result.
+- [x] ALU interpreter core (`kernel::uint`, reference
+      `shader_interpreter.cc` `ExecuteAluInstruction`): 64 temps,
+      previous-scalar, predicate; flush-denormal, bitwise
+      abs/negate, swizzle select, OOB-const zeros; exact vector
+      add/mul/max/min/seq/sgt/sge/sne/frc/trunc/floor/mad/dp4/
+      dp3/dp2add (+D3D9 zero rule, NaN-keeping max) and scalar
+      adds/muls/subs/retain_prev; NaN-becomes-+0 saturate;
+      masked absolute writeback. Relative addressing, exports,
+      and remaining ops are explicit `Unsupported`. Unit-tested
+      incl. writeback, clamps, D3D9/NaN edges.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

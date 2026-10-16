@@ -416,6 +416,22 @@ impl AluInstr {
         }
     }
 
+    /// Source swizzle byte (component-relative).
+    pub fn src_swizzle(&self, i: u32) -> u32 {
+        match i {
+            1 => (self.d1() >> 16) & 0xFF,
+            2 => (self.d1() >> 8) & 0xFF,
+            _ => self.d1() & 0xFF,
+        }
+    }
+
+    /// Any relative addressing (a0/aL): temp-relative dests or
+    /// const-addressing bits. Slice-1 evaluation is absolute-only;
+    /// see `has_relative_addressing`.
+    pub fn has_relative_addressing(&self) -> bool {
+        ((self.d1() >> 29) & 7) != 0 || ((self.d0() >> 6) & 1) != 0 || ((self.d0() >> 14) & 1) != 0
+    }
+
     /// One source operand in disassembly form (`[-]rN` / `[-]cN`).
     pub fn src_operand(&self, i: u32) -> String {
         let reg = if self.src_is_temp(i) {
