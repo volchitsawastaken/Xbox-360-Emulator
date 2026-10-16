@@ -273,6 +273,12 @@ mod integration {
             image.len() as u32,
             info.title_id.unwrap_or(0),
         );
+        kernel.set_xex_resources(
+            info.resources
+                .iter()
+                .map(|r| (r.name, r.address, r.size))
+                .collect(),
+        );
         let sysflags = info
             .dirs
             .iter()
@@ -446,6 +452,12 @@ mod integration {
             info.base_address,
             image.len() as u32,
             info.title_id.unwrap_or(0),
+        );
+        kernel.set_xex_resources(
+            info.resources
+                .iter()
+                .map(|r| (r.name, r.address, r.size))
+                .collect(),
         );
         // System flags for privilege queries (inline dir value, default 0).
         let sysflags = info

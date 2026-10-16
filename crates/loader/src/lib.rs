@@ -144,6 +144,53 @@ pub struct StaticLib {
     pub name: String,
 }
 
+/// One XEX resource descriptor (`xex2_resource` layout facts: 8-byte
+/// name, BE address, BE size; count = (size - 4) / 16). The address
+/// is served to the guest as-is (reference `UserModule::GetSection`
+/// returns `res.address` directly); what backs it in guest memory is
+/// load-time work, not loader work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XexResource {
+    /// Raw 8-byte name (NUL-padded; compare trims trailing NULs).
+    pub name: [u8; 8],
+    pub address: u32,
+    pub size: u32,
+}
+
+/// Parse the `RESOURCE_INFO` body at `data_off` (reference
+/// `xex2_opt_resource_info` + `xex2_resource`). A non-multiple body
+/// is an explicit error, never silently truncated.
+pub(crate) fn parse_resources(image: &[u8], data_off: usize) -> Result<Vec<XexResource>> {
+    if data_off + 4 > image.len() {
+        return Err(EmuError::InvalidExecutable("resource info OOB".into()));
+    }
+    let size = read_u32(image, data_off)? as usize;
+    if size < 4 || !(size - 4).is_multiple_of(16) {
+        return Err(EmuError::InvalidExecutable(format!(
+            "resource info bad size {}",
+            size
+        )));
+    }
+    if data_off + size > image.len() {
+        return Err(EmuError::InvalidExecutable(format!(
+            "resource info OOB (off {} size {})",
+            data_off, size
+        )));
+    }
+    let mut out = Vec::new();
+    for i in 0..(size - 4) / 16 {
+        let ent = data_off + 4 + i * 16;
+        let mut name = [0u8; 8];
+        name.copy_from_slice(&image[ent..ent + 8]);
+        out.push(XexResource {
+            name,
+            address: read_u32(image, ent + 8)?,
+            size: read_u32(image, ent + 12)?,
+        });
+    }
+    Ok(out)
+}
+
 /// One import library from `IMPORT_LIBRARIES` (`xex2_import_library`
 /// layout facts: size-prefixed entries after a padded string table;
 /// each entry carries name index, id, versions, import count, then
@@ -205,6 +252,9 @@ pub struct XexInfo {
     /// public retail key for `enc=Normal` bodies. Absent when the
     /// security header is missing or truncated.
     pub aes_key: Option<[u8; 16]>,
+    /// Resource descriptors when key `0x000002FF` is present. Served
+    /// as-is by `XexGetModuleSection`; empty when absent.
+    pub resources: Vec<XexResource>,
 }
 
 /// File-format info (`xex2_opt_file_format_info` layout facts:
@@ -564,6 +614,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
     let mut format_info: Option<FormatInfo> = None;
     let mut static_libs: Vec<StaticLib> = Vec::new();
     let mut import_libs: Vec<ImportLibrary> = Vec::new();
+    let mut resources: Vec<XexResource> = Vec::new();
     let mut dirs = Vec::new();
 
     for i in 0..header_count {
@@ -666,13 +717,23 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
                         },
                     });
                     format_info = Some(info);
+                } else if key == KEY_RESOURCE_INFO {
+                    let entries = parse_resources(image, data_off)?;
+                    let size = read_u32(image, data_off)? as u32;
+                    dirs.push(XexDir {
+                        key,
+                        data: XexDirData::AtOffset {
+                            offset: value,
+                            size,
+                        },
+                    });
+                    resources = entries;
                 } else {
                     // Only these keys are documented size-prefixed (first
                     // word = total size). Anything else (timestamps,
                     // version pairs, logo blobs) must not be misread as a
                     // size, so it is recorded with unverified length.
-                    const SIZE_PREFIXED: [u32; 7] = [
-                        KEY_RESOURCE_INFO,
+                    const SIZE_PREFIXED: [u32; 6] = [
                         KEY_BOUNDING_PATH,
                         KEY_ORIGINAL_PE_NAME,
                         KEY_IMPORT_LIBRARIES,
@@ -749,6 +810,7 @@ pub fn parse_xex(image: &[u8]) -> Result<(XexHeader, XexInfo)> {
             format_info,
             import_libs,
             aes_key: sec.aes_key,
+            resources,
         },
     ))
 }
@@ -1197,6 +1259,40 @@ mod tests {
         let mut payload = vec![0u8; 4];
         put_u32(&mut payload, 0, 0x100);
         let img = dir_image_with_payload(KEY_STATIC_LIBRARIES, &payload);
+        let err = parse_xex(&img).unwrap_err();
+        assert!(matches!(err, EmuError::InvalidExecutable(_)));
+    }
+
+    #[test]
+    fn resources_parsed() {
+        // size 20 = one 16-byte entry: name + BE address + BE size.
+        let mut payload = vec![0u8; 20];
+        put_u32(&mut payload, 0, 20);
+        payload[4..12].copy_from_slice(b"SHADR\x00\x00\x00");
+        put_u32(&mut payload, 12, 0x8200_4000);
+        put_u32(&mut payload, 16, 0x1000);
+        let img = dir_image_with_payload(KEY_RESOURCE_INFO, &payload);
+        let (_, info) = parse_xex(&img).unwrap();
+        assert_eq!(info.resources.len(), 1);
+        assert_eq!(&info.resources[0].name, b"SHADR\x00\x00\x00");
+        assert_eq!(info.resources[0].address, 0x8200_4000);
+        assert_eq!(info.resources[0].size, 0x1000);
+    }
+
+    #[test]
+    fn resources_malformed_size_rejected() {
+        // 10 is not 4 + 16k.
+        let mut payload = vec![0u8; 10];
+        put_u32(&mut payload, 0, 10);
+        let img = dir_image_with_payload(KEY_RESOURCE_INFO, &payload);
+        assert!(parse_xex(&img).is_err());
+    }
+
+    #[test]
+    fn resources_oob_rejected() {
+        let mut payload = vec![0u8; 4];
+        put_u32(&mut payload, 0, 0x100);
+        let img = dir_image_with_payload(KEY_RESOURCE_INFO, &payload);
         let err = parse_xex(&img).unwrap_err();
         assert!(matches!(err, EmuError::InvalidExecutable(_)));
     }

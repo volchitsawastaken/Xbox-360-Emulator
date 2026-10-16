@@ -157,6 +157,10 @@ pub struct Kernel {
     pub image_base: u32,
     pub image_size: u32,
     pub title_id: u32,
+    /// XEX resource descriptors `(name8, guest_address, size)` for
+    /// `XexGetModuleSection` (reference `UserModule::GetSection`;
+    /// addresses are guest VAs served as-is).
+    xex_resources: Vec<([u8; 8], u32, u32)>,
     /// Dash context word (reference `KernelState::dash_context_`,
     /// set by `XamSetDashContext`, read by `XamGetDashContext`).
     pub dash_context: u32,
@@ -167,6 +171,15 @@ pub struct Kernel {
     stack_base: u32,
     stack_size: u32,
     system_flags: u32,
+}
+
+/// Trailing-NUL-trimmed view (XEX 8-byte names are NUL-padded).
+fn trim_nul(name: &[u8]) -> &[u8] {
+    let mut end = name.len();
+    while end > 0 && name[end - 1] == 0 {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// NT handle-tracked event (reference `xevent.cc`: manual vs auto-reset).
@@ -343,6 +356,7 @@ impl Kernel {
             image_base: 0,
             image_size: 0,
             title_id: 0,
+            xex_resources: Vec::new(),
             dash_context: 0,
             xex_header: Vec::new(),
             entry_point_val: 0,
@@ -359,6 +373,22 @@ impl Kernel {
         self.image_base = base;
         self.image_size = size;
         self.title_id = title_id;
+    }
+
+    /// Record XEX resource descriptors for `XexGetModuleSection`.
+    /// Entries are `(raw 8-byte name, guest address, size)`, exactly
+    /// as parsed from `RESOURCE_INFO` (loader `XexResource`).
+    pub fn set_xex_resources(&mut self, resources: Vec<([u8; 8], u32, u32)>) {
+        self.xex_resources = resources;
+    }
+
+    /// Resource `(address, size)` by name, trimming trailing NULs on
+    /// both sides (reference `utf8::equal_z` NUL-padded compare).
+    pub fn xex_resource(&self, name: &[u8]) -> Option<(u32, u32)> {
+        let want = trim_nul(name);
+        self.xex_resources
+            .iter()
+            .find_map(|(n, a, s)| (trim_nul(n) == want).then_some((*a, *s)))
     }
 
     /// Store the XEX file header (up to `header_size`) plus entry point

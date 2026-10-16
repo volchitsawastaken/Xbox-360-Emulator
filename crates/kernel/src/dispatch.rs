@@ -3446,33 +3446,60 @@ fn resolve_xex_module(kernel: &Kernel, hmodule: u32) -> Option<XexModule> {
 }
 
 /// `XexGetModuleSection(hmodule, name, data_ptr, size_ptr)`
-/// (reference `XexGetModuleSection_entry` + `XModule::GetSection`).
-/// Bad handles are `INVALID_HANDLE`; null out pointers are
-/// `INVALID_PARAMETER`. Section data itself needs the XEX resource
-/// table (pending loader work); until then every valid module
-/// reports `UNSUCCESSFUL`, exactly like the reference base-class
-/// `GetSection` with no table. Never a fabricated pointer.
+/// (reference `XexGetModuleSection_entry` + `UserModule::GetSection`
+/// over `RESOURCE_INFO`). Bad handles are `INVALID_HANDLE`; null
+/// out pointers are `INVALID_PARAMETER`. The executable resolves
+/// against the loader-parsed resource table (guest-VA addresses
+/// served as-is, exactly like the reference): hits return `SUCCESS`,
+/// misses return `NOT_FOUND` (0xC0000225). System modules have no
+/// table here yet and report `UNSUCCESSFUL`, exactly like the
+/// reference base-class `GetSection`. Never a fabricated pointer.
 fn xex_get_module_section(
     kernel: &Kernel,
-    _mem: &mut Memory,
+    mem: &mut Memory,
     hmodule: u32,
     name_ptr: u32,
     data_ptr: u32,
     size_ptr: u32,
     t: &mut ThreadState,
 ) -> Result<()> {
-    if resolve_xex_module(kernel, hmodule).is_none() {
-        t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
-        return Ok(());
-    }
+    let module = match resolve_xex_module(kernel, hmodule) {
+        Some(m) => m,
+        None => {
+            t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
+            return Ok(());
+        }
+    };
     if name_ptr == 0 || data_ptr == 0 || size_ptr == 0 {
         t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
         return Ok(());
     }
-    // Reference `XModule::GetSection`: no table, no section.
-    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
-    t.gpr[3] = (STATUS_UNSUCCESSFUL) as u64;
-    Ok(())
+    if module != XexModule::Executable {
+        // Reference `XModule::GetSection`: no table, no section.
+        const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+        t.gpr[3] = (STATUS_UNSUCCESSFUL) as u64;
+        return Ok(());
+    }
+    // Fixed 8-byte descriptor form (reference `equal_z`
+    // NUL-padded compare); short reads are explicit errors.
+    let raw = mem
+        .read_bytes(name_ptr, 8)
+        .map_err(|e| EmuError::Other(format!("XexGetModuleSection name: {}", e)))?;
+    let mut name = [0u8; 8];
+    name.copy_from_slice(raw);
+    match kernel.xex_resource(&name) {
+        Some((addr, size)) => {
+            mem.write_u32(data_ptr, addr)?;
+            mem.write_u32(size_ptr, size)?;
+            t.gpr[3] = (ERROR_SUCCESS) as u64;
+            Ok(())
+        }
+        None => {
+            const STATUS_NOT_FOUND: u32 = 0xC000_0225;
+            t.gpr[3] = (STATUS_NOT_FOUND) as u64;
+            Ok(())
+        }
+    }
 }
 
 /// `XexGetProcedureAddress(hmodule, ordinal, out_ptr)` (reference
@@ -3635,34 +3662,42 @@ mod tests {
     }
 
     #[test]
-    fn xex_get_module_section_validates() {
+    fn xex_get_module_section_resolves() {
         let mut k = Kernel::new();
         k.set_module_info(0x8200_0000, 0x1000, 0x5841_08CE);
+        k.set_xex_resources(vec![(*b"584108CE", 0x82AD_0000, 0x296EA)]);
         let mut m = Memory::new();
         let mut tab = ImportTable::new();
         let mut t = thread();
         let sec = imp("xboxkrnl.exe", 0x196);
+        let (name_ptr, data_ptr, size_ptr) = (0x0115_6000, 0x0115_6100, 0x0115_6104);
+        m.write_bytes(name_ptr, b"584108CE").unwrap();
+        // Executable hit: SUCCESS + served-as-is address/size.
+        t.gpr[3] = 0;
+        t.gpr[4] = name_ptr as u64;
+        t.gpr[5] = data_ptr as u64;
+        t.gpr[6] = size_ptr as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
+        assert_eq!(t.gpr[3] as u32, ERROR_SUCCESS);
+        assert_eq!(m.read_u32(data_ptr).unwrap(), 0x82AD_0000);
+        assert_eq!(m.read_u32(size_ptr).unwrap(), 0x296EA);
+        // Executable miss: NOT_FOUND (reference UserModule behavior).
+        m.write_bytes(name_ptr, b"NOPE\x00\x00\x00\x00").unwrap();
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0xC000_0225);
+        // System module: UNSUCCESSFUL like the reference base class.
+        m.write_bytes(name_ptr, b"584108CE").unwrap();
+        t.gpr[3] = XAM_HANDLE as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0xC000_0001);
         // Bad handle and null pointers are plain statuses.
         t.gpr[3] = 0xDEAD_0000;
-        t.gpr[4] = 0x0115_6000;
-        t.gpr[5] = 0x0115_6100;
-        t.gpr[6] = 0x0115_6104;
         dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
         assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
         t.gpr[3] = 0;
-        t.gpr[4] = 0x0115_6000;
         t.gpr[5] = 0;
-        t.gpr[6] = 0x0115_6104;
         dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
         assert_eq!(t.gpr[3] as u32, STATUS_INVALID_PARAMETER);
-        // Valid module, no resource table yet: UNSUCCESSFUL like the
-        // reference base class — never a fabricated pointer.
-        t.gpr[3] = 0;
-        t.gpr[4] = 0x0115_6000;
-        t.gpr[5] = 0x0115_6100;
-        t.gpr[6] = 0x0115_6104;
-        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
-        assert_eq!(t.gpr[3] as u32, 0xC000_0001);
     }
 
     #[test]

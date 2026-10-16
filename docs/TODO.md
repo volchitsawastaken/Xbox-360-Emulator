@@ -287,10 +287,13 @@ Terminal states only: impossible, done, or something rendering.
       `ENTRYPOINT_NOT_FOUND` (0xC0000263); string form + executable
       self-lookup are explicit `Unsupported`. Unit-tested incl.
       thunk routing. `XexGetModuleSection` (0x196) validates handles
-      (`INVALID_HANDLE`/`INVALID_PARAMETER`) and reports
-      `UNSUCCESSFUL` until the XEX resource table is plumbed
-      (reference base-class behavior; Braid has 1 resource entry —
-      loader parsing pending).
+      (`INVALID_HANDLE`/`INVALID_PARAMETER`) and resolves the
+      executable against the loader-parsed `RESOURCE_INFO` table
+      (guest-VA addresses served as-is per `UserModule::GetSection`;
+      retail Braid's single entry `584108CE -> 0x82AD0000` verified):
+      hits return `SUCCESS`, misses `NOT_FOUND`, system modules
+      `UNSUCCESSFUL` (reference base-class behavior). Boot setups
+      plumb `info.resources`; unit-tested incl. served values.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
