@@ -554,15 +554,27 @@ impl Kernel {
                     ucode.push(p(2 + k));
                 }
                 // Structural check only (storage is unconditional):
-                // valid uploads log their census, malformed ones warn
-                // loudly but still store exactly what the game sent.
+                // valid uploads log their census plus a full listing
+                // for offline forensics, malformed ones warn loudly
+                // but still store exactly what the game sent.
                 match crate::ucode::validate_ucode(&ucode) {
-                    Ok(st) => log::debug!(
-                        "kernel: IM_LOAD type {} size {}: {:?}",
-                        shader_type,
-                        size,
-                        st
-                    ),
+                    Ok(st) => {
+                        log::debug!(
+                            "kernel: IM_LOAD type {} size {}: {:?}",
+                            shader_type,
+                            size,
+                            st
+                        );
+                        if log::log_enabled!(log::Level::Debug) {
+                            if let Ok(lines) =
+                                crate::ucode::disassemble_shader(&ucode, shader_type == 0)
+                            {
+                                for line in lines {
+                                    log::debug!("kernel: ucode {}", line);
+                                }
+                            }
+                        }
+                    }
                     Err(e) => log::warn!(
                         "kernel: IM_LOAD type {} size {} invalid: {}",
                         shader_type,
