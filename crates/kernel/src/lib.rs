@@ -208,6 +208,10 @@ pub struct Kernel {
     /// Dash context word (reference `KernelState::dash_context_`,
     /// set by `XamSetDashContext`, read by `XamGetDashContext`).
     pub dash_context: u32,
+    /// Last vibration per user (`[left, right]` motor speeds from
+    /// `XamInputSetState`; no host rumble backend, so values are
+    /// recorded, never actuated).
+    pub input_vibration: [[u16; 2]; 4],
     xex_header: Vec<u8>,
     entry_point_val: u32,
     module_name: String,
@@ -413,6 +417,7 @@ impl Kernel {
             title_id: 0,
             xex_resources: Vec::new(),
             dash_context: 0,
+            input_vibration: [[0; 2]; 4],
             xex_header: Vec::new(),
             entry_point_val: 0,
             module_name: String::new(),

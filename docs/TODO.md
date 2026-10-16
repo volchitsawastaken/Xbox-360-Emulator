@@ -518,6 +518,14 @@ Terminal states only: impossible, done, or something rendering.
       clamped to the word count (32-bit words / BE 16-bit halves,
       endian-swapped); auto-index yields `0..n`; immediate is
       explicit `Unsupported` (as in the reference). Unit-tested.
+- [x] Headless input (`XamInputGetCapabilities/GetState/SetState/
+      GetKeystroke`, ordinals 0x190-0x193, reference `am_input.cc`
+      + `hid/input.h` layouts/codes): user 0 connected-neutral
+      (zeroed state/caps/keystroke, packet 0, gamepad type 1/sub 1),
+      ANY pins to 0, users 1-3 `NOT_CONNECTED` (0x48F), vibration
+      recorded per user, HRESULT form on detached SetState,
+      `BAD_ARGUMENTS` on null structs, `EMPTY` on keystroke polls.
+      Unit-tested (neutral + ANY + all error paths).
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

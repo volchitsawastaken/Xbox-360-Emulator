@@ -945,6 +945,14 @@ pub fn dispatch_import(
         // fatal errors, so the text names the real frontier.
         (Lib::Xam, 0x2CA) => xam_message_box(mem, t, false),
         (Lib::Xam, 0x2DC) => xam_message_box(mem, t, true),
+        // Headless input (reference `am_input.cc` + `hid/input.h`
+        // layouts): with no host input backend, user 0 is a
+        // connected neutral gamepad; users 1-3 report
+        // DEVICE_NOT_CONNECTED like detached pads.
+        (Lib::Xam, 0x190) => xam_input_get_capabilities(mem, t),
+        (Lib::Xam, 0x191) => xam_input_get_state(mem, t),
+        (Lib::Xam, 0x192) => xam_input_set_state(kernel, mem, t),
+        (Lib::Xam, 0x193) => xam_input_get_keystroke(mem, t),
         // Title launch data (reference `am_info.cc`
         // `XamLoaderSetLaunchData`/`GetLaunchData(Size)`): empty until
         // set; empty reads report NOT_FOUND (2) exactly like the
@@ -1145,6 +1153,90 @@ fn vd_swap(kernel: &mut Kernel, mem: &mut Memory, t: &mut ThreadState) -> Result
         gh,
         fb_phys
     );
+    Ok(())
+}
+
+/// Headless input shims (reference `am_input.cc` + `hid/input.h`
+/// struct layouts; `X_INPUT_STATE` 16 bytes, `X_INPUT_CAPABILITIES`
+/// 20 bytes, `X_INPUT_KEYSTROKE` 8 bytes, all big-endian).
+/// Headless policy: user 0 is a connected neutral gamepad (zeroed
+/// state, packet 0 — nothing ever changes so the packet never
+/// advances); `XUserIndexAny` (0xFF) pins to 0 like the reference.
+/// Users 1-3 report `DEVICE_NOT_CONNECTED` (0x48F).
+fn xam_input_get_state(mem: &mut Memory, t: &mut ThreadState) -> Result<()> {
+    let (user, flags, ptr) = (arg(t, 0), arg(t, 1), arg(t, 2));
+    if ptr != 0 {
+        mem.write_bytes(ptr, &[0; 16])?;
+    }
+    // Connected set is user 0 only; ANY index/flag pins to 0
+    // like the reference. Users 1-3 read as detached pads.
+    if user == 0 || user == 0xFF || flags & (1 << 30) != 0 {
+        t.gpr[3] = 0_u64;
+    } else {
+        t.gpr[3] = 0x48F_u64;
+    }
+    Ok(())
+}
+
+/// `XamInputGetCapabilities` (ordinal 0x190, reference
+/// `XamInputGetCapabilities_entry` via the Ex form): user 0 reports
+/// a plain gamepad (type 1, subtype 1, no special caps, neutral
+/// sticks); others report not-connected. Null struct is
+/// `BAD_ARGUMENTS` (0xA0).
+fn xam_input_get_capabilities(mem: &mut Memory, t: &mut ThreadState) -> Result<()> {
+    let (user, flags, caps) = (arg(t, 0), arg(t, 1), arg(t, 2));
+    if caps == 0 {
+        t.gpr[3] = 0xA0_u64;
+        return Ok(());
+    }
+    mem.write_bytes(caps, &[0; 20])?;
+    if user != 0 && user != 0xFF && flags & (1 << 30) == 0 {
+        t.gpr[3] = 0x48F_u64;
+        return Ok(());
+    }
+    mem.write_bytes(caps, &[1, 1])?;
+    t.gpr[3] = 0_u64;
+    Ok(())
+}
+
+/// `XamInputSetState` (ordinal 0x192, reference
+/// `XamInputSetState_entry`): records vibration per user (no host
+/// rumble backend). Disconnected users report the HRESULT form
+/// (0x8007048F); null vibration is `BAD_ARGUMENTS`.
+fn xam_input_set_state(kernel: &mut Kernel, mem: &mut Memory, t: &mut ThreadState) -> Result<()> {
+    let (user, vib) = (arg(t, 0), arg(t, 2));
+    if user >= 4 {
+        t.gpr[3] = 0x8007_048F_u64;
+        return Ok(());
+    }
+    if vib == 0 {
+        t.gpr[3] = 0xA0_u64;
+        return Ok(());
+    }
+    let b = mem.read_bytes(vib, 4)?;
+    kernel.input_vibration[user as usize] = [
+        u16::from_be_bytes([b[0], b[1]]),
+        u16::from_be_bytes([b[2], b[3]]),
+    ];
+    t.gpr[3] = 0_u64;
+    Ok(())
+}
+
+/// `XamInputGetKeystroke` (ordinal 0x193, reference the Ex form):
+/// the headless queue is always empty (`EMPTY`, 0x10D2) after
+/// zeroing the 8-byte struct; null is `BAD_ARGUMENTS`.
+fn xam_input_get_keystroke(mem: &mut Memory, t: &mut ThreadState) -> Result<()> {
+    let (user, flags, ks) = (arg(t, 0), arg(t, 1), arg(t, 2));
+    if ks == 0 {
+        t.gpr[3] = 0xA0_u64;
+        return Ok(());
+    }
+    mem.write_bytes(ks, &[0; 8])?;
+    if user == 0 || user == 0xFF || flags & (1 << 30) != 0 {
+        t.gpr[3] = 0x10D2_u64;
+    } else {
+        t.gpr[3] = 0x48F_u64;
+    }
     Ok(())
 }
 
@@ -5204,6 +5296,94 @@ mod tests {
         dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x2DC)).unwrap();
         assert_eq!(t.gpr[3] as u32, 0);
         assert_eq!(m.read_u32(0x4400).unwrap(), 0);
+    }
+
+    #[test]
+    fn input_headless_neutral_and_errors() {
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x190),
+            Some("XamInputGetCapabilities")
+        );
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x191),
+            Some("XamInputGetState")
+        );
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x192),
+            Some("XamInputSetState")
+        );
+        assert_eq!(
+            ImportTable::name_of("xam.xex", 0x193),
+            Some("XamInputGetKeystroke")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        // GetState user 0: neutral zeros, SUCCESS.
+        t.gpr[3] = 0;
+        t.gpr[4] = 0;
+        t.gpr[5] = 0x5000;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x191)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u32(0x5000).unwrap(), 0);
+        assert_eq!(m.read_u32(0x500C).unwrap(), 0);
+        // ANY user pins to 0.
+        t.gpr[3] = 0xFF;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x191)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        // Users 1-3 detached (zeroed + NOT_CONNECTED); null ptr skips.
+        t.gpr[3] = 2;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x191)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x48F);
+        t.gpr[3] = 0;
+        t.gpr[5] = 0;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x191)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        // Capabilities user 0: gamepad type/subtype, rest zero.
+        t.gpr[5] = 0x5100;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x190)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(m.read_u8(0x5100).unwrap(), 1);
+        assert_eq!(m.read_u8(0x5101).unwrap(), 1);
+        assert_eq!(m.read_u32(0x5104).unwrap(), 0);
+        // Capabilities errors: detached, null.
+        t.gpr[3] = 3;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x190)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x48F);
+        t.gpr[3] = 0;
+        t.gpr[5] = 0;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x190)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0xA0);
+        // SetState records vibration (BE halves).
+        m.write_u32(0x5200, 0x1234_5678).unwrap();
+        t.gpr[3] = 0;
+        t.gpr[5] = 0x5200;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x192)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        assert_eq!(k.input_vibration[0], [0x1234, 0x5678]);
+        // SetState errors: detached HRESULT, null BAD_ARGUMENTS.
+        t.gpr[3] = 7;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x192)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x8007_048F);
+        t.gpr[3] = 0;
+        t.gpr[5] = 0;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x192)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0xA0);
+        // Keystroke: empty queue (zeroed + EMPTY).
+        t.gpr[3] = 0;
+        t.gpr[5] = 0x5300;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x193)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x10D2);
+        assert_eq!(m.read_u32(0x5300).unwrap(), 0);
+        // Keystroke errors: detached, null.
+        t.gpr[3] = 5;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x193)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0x48F);
+        t.gpr[3] = 0;
+        t.gpr[5] = 0;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &imp("xam.xex", 0x193)).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0xA0);
     }
 
     #[test]
