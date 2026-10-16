@@ -394,6 +394,11 @@ Terminal states only: impossible, done, or something rendering.
       rcpf/rcp/rsqc/rsqf/rsq/sqrt plus plain sin/cos, with the
       per-suffix -inf/+inf fixups (-MAX/MAX, -0/+0). Exact-output
       unit tests incl. a bit-level reduce case.
+- [x] ALU const-reg scalar forms (`kernel::uint`, reference
+      case-2 fetch): mulsc/addsc/subsc (both suffixes, identical
+      eval) with the opcode-derived temp index, flushed + negated
+      operands, `abs_constants` correctly ignored (dead in the
+      reference interpreter too). Unit-tested.
 - [x] ALU prev/setp/address ops (`kernel::uint`, reference arms):
       adds_prev/muls_prev/muls_prev2/subs_prev chaining `ps`,
       maxas/maxasf writing the address register (exact clamp+

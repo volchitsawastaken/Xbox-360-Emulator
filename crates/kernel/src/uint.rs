@@ -512,6 +512,36 @@ pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> R
                 _ => core.previous_scalar = a - b,
             }
         }
+        42..=47 => {
+            // Const-reg form (reference case 2): c#.w by src3, r#.x
+            // by the opcode-derived temp index; flushed, negated,
+            // no abs (mirrors the reference, where `abs_constants`
+            // never reaches the interpreter path).
+            let sw = ins.src_swizzle(3);
+            let cidx = ins.src_reg(3) as usize;
+            let a = if cidx < consts.len() {
+                let mut v = flush_denormal(consts[cidx][swizzled(sw, 3)]);
+                if ins.src_negate(3) {
+                    v = f32_neg(v);
+                }
+                v
+            } else {
+                0.0
+            };
+            // Temp index per reference
+            // `(opc & 1) | (sel << 1) | (swiz & 0x3C)`, wrapped mod 64.
+            let sel = if ins.src_is_temp(3) { 1 } else { 0 };
+            let t = (((sop & 1) | (sel << 1) | (sw & 0x3C)) & 0x3F) as usize;
+            let mut b = flush_denormal(core.temps[t][swizzled(sw, 0)]);
+            if ins.src_negate(3) {
+                b = f32_neg(b);
+            }
+            core.previous_scalar = match sop {
+                42 | 43 => d3d_mul(a, b),
+                44 | 45 => a + b,
+                _ => a - b,
+            };
+        }
         14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 40 | 48 | 49 => {
             let (a, _) = fetch_scalar_pair(core, consts, ins, vec_three)?;
             // Exact fixups per op (reference arms): reduced-precision
@@ -821,6 +851,23 @@ mod tests {
         eval_alu(&mut core, &[[0.0, 0.0, 0.0, 0.0]], &parse_alu(&op(33))).unwrap();
         assert!(!core.predicate);
         assert_eq!(core.previous_scalar, f32::MAX);
+    }
+
+    #[test]
+    fn scalar_const_reg_form() {
+        // mulsc0: c0.w=3.0 times r4.x=4.0 (temp index derived as
+        // (42&1)|(0<<1)|(0x04&0x3C) = 4; swizzle picks W and X).
+        let mut core = ShaderCore::default();
+        core.temps[4] = [4.0, 0.0, 0.0, 0.0];
+        let consts = [[0.0, 0.0, 0.0, 3.0]];
+        let d = [(3 << 8) | (1 << 20) | (42 << 26), 0x04, (2 << 24)];
+        eval_alu(&mut core, &consts, &parse_alu(&d)).unwrap();
+        assert_eq!(core.previous_scalar, 12.0);
+        assert_eq!(core.temps[3][0], 12.0);
+        // subsc0: 3.0 - 4.0 = -1.0.
+        let d = [(3 << 8) | (1 << 20) | (46 << 26), 0x04, (2 << 24)];
+        eval_alu(&mut core, &consts, &parse_alu(&d)).unwrap();
+        assert_eq!(core.previous_scalar, -1.0);
     }
 
     #[test]
