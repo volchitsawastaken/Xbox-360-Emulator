@@ -300,6 +300,26 @@ pub fn dispatch_import(
             }
             Ok(())
         }
+        // Spinlocks (reference `xboxkrnl_hal.cc`; NT IRQL levels
+        // 0=PASSIVE, 2=DISPATCH). Single-threaded: uncontended by
+        // construction, so acquire/take always succeeds; only the
+        // IRQL level is tracked (acquire returns the old level and
+        // raises, release restores). The guest lock word itself is
+        // never touched — nothing can contend with us.
+        (Lib::Xboxkrnl, 0xB1) | (Lib::Xboxkrnl, 0x4D) => {
+            let old = kernel.irql;
+            kernel.irql = 2;
+            t.gpr[3] = old as u64;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0xB4) | (Lib::Xboxkrnl, 0x89) => {
+            kernel.irql = arg(t, 1) & 0xFF;
+            Ok(())
+        }
+        (Lib::Xboxkrnl, 0xAE) => {
+            t.gpr[3] = 1_u64; // TRUE: uncontended, lock taken
+            Ok(())
+        }
         // KeInitializeEvent(ptr, type, initial) (reference
         // `KeInitializeEvent_entry`): zero the 0x10-byte header, set
         // type/signal_state, track by guest address. Type 0 =
@@ -6513,6 +6533,94 @@ mod tests {
             &imp("xboxkrnl.exe", 0x0F),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn spinlock_irql_tracking() {
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x4D),
+            Some("KeAcquireSpinLockAtRaisedIrql")
+        );
+        assert_eq!(
+            ImportTable::name_of("xboxkrnl.exe", 0x89),
+            Some("KeReleaseSpinLockFromRaisedIrql")
+        );
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let lock = 0x0115_5000;
+        // Acquire returns PASSIVE(0) and raises to DISPATCH(2).
+        t.gpr[3] = lock as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x4D),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
+        // Nested acquire returns the raised level.
+        t.gpr[3] = lock as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB1),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 2);
+        // Try-acquire always succeeds uncontended.
+        t.gpr[3] = lock as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xAE),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 1);
+        // Release restores the passed level (inner then outer).
+        t.gpr[3] = lock as u64;
+        t.gpr[4] = 2;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x89),
+        )
+        .unwrap();
+        t.gpr[3] = lock as u64;
+        t.gpr[4] = 0;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0xB4),
+        )
+        .unwrap();
+        // Back at PASSIVE: a fresh acquire returns 0 again.
+        t.gpr[3] = lock as u64;
+        dispatch_import(
+            &mut k,
+            &mut m,
+            &mut tab,
+            0,
+            &mut t,
+            &imp("xboxkrnl.exe", 0x4D),
+        )
+        .unwrap();
+        assert_eq!(t.gpr[3] as u32, 0);
     }
 
     #[test]

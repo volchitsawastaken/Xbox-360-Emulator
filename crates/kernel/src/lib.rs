@@ -70,6 +70,10 @@ pub struct Kernel {
     /// Game-allocated events by guest struct address (reference
     /// `KeInitializeEvent`; no handles involved).
     pub ke_events: HashMap<u32, KeEvent>,
+    /// Current IRQL (reference `KfAcquireSpinLock` raises to
+    /// DISPATCH_LEVEL=2 and returns the old level; single-threaded,
+    /// so 0=PASSIVE unless a lock is held).
+    irql: u32,
     /// NT-thread spawn queue for the boot runner (handles, in creation
     /// order). Dispatch cannot reach Xenon CPU state, so the runner
     /// drains this and installs each thread's registers.
@@ -329,6 +333,7 @@ impl Kernel {
             nt_timers: HashMap::new(),
             nt_threads: HashMap::new(),
             ke_events: HashMap::new(),
+            irql: 0,
             pending_spawns: Vec::new(),
             files: fs::FileTable::default(),
             guest_fs: None,

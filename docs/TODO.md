@@ -160,19 +160,25 @@ Terminal states only: impossible, done, or something rendering.
       the original `bctr` to `0x67735C65` (+16 stale) — worker
       starvation eliminated as a cause (workers run, signal, contend;
       KeWait succeeds via worker signaling). +120/+16 and the
-      post-kick callbacks stay virgin. Deadlock refined this session
-      (polling watch + timeout logging): game-heap `X_KEVENT`s
-      `0x010462FC` (finite timeout `0xFFFB6C20`, main polls → immediate
-      TIMEOUT, spins ~2425x) vs `0x0104634C` (NULL/infinite, workers
-      Block forever); ZERO `KeSetEvent` calls in the whole run and
-      zero post-init writes to either header — signalers do not exist
-      in executed code, and the ring carries zero INTERRUPT packets,
-      so the GPU callback (registered `0x82181718`) never runs either.
-      Main gives up polling and takes the graphics-failure path whose
-      lazy block reads never-written +16 on BOTH null-check sides
-      (verified: no writer in executed code). NEXT: draw backend /
-      device state substantial enough for init to succeed (or find the
-      queueing trigger that precedes the waits)
+      post-kick callbacks stay virgin. Deadlock refined further
+      (wait-argument histogram over a full 2M-step boot): worker
+      thread parks on `0x0104634C` with NULL timeout (353k
+      rewind-retries); main polls `0x010462FC` with relative
+      timeout `0xFFFB6C20` (~28ms, 9313 TIMEOUT spins). ZERO sets
+      of either object anywhere (no KeSetEvent/Pulse, no semaphore
+      posts, no timer fires). Static disassembly of the registered
+      GPU callback `0x82181718`: branches on source==1, uses
+      `KeAcquire/ReleaseSpinLockAtRaisedIrql` (currently
+      unimplemented — needed when interrupts ever fire), compares
+      against a game-local `0x0BADF00D` sentinel (distinct from the
+      PM4 `0xBAADF00D` skip word); no KeSetEvent in its head,
+      tails call into `0x821836B0`/`0x82192490` (untraced).
+      Init method `0x82150248` disassembled around the fault: the
+      `bctr` consumes `[r31+16]` with r3=0 (device-null call).
+      NEXT: spinlock shims (callback path), then the missing
+      signal source (GPU completion for init packets vs D3D
+      device state) — draw backend / device work continues to be
+      the unblocker, now with the callback's requirements mapped
 - [ ] Dash frontier (HostDirFs boot): 63 imports to a table walk at
       `0x921B86BC` (`lwz r8,896(r11)`), fully decoded this session:
       prologue sets r27=r31+896 (table = object itself +896),
@@ -304,6 +310,15 @@ Terminal states only: impossible, done, or something rendering.
       log-only (storage unconditional); retail Braid vs24/ps9
       validate clean (vs: 3 CF pairs, 4 execs, 2 allocs; ps:
       1 pair, exec_end, colors alloc). Unit-tested synthetic.
+- [x] Spinlocks (`KfAcquireSpinLock` 0xB1 /
+      `KeAcquireSpinLockAtRaisedIrql` 0x4D, `KfReleaseSpinLock`
+      0xB4 / `KeReleaseSpinLockFromRaisedIrql` 0x89,
+      `KeTryToAcquireSpinLockAtRaisedIrql` 0xAE): single-threaded
+      IRQL tracking (0=PASSIVE, 2=DISPATCH; acquire returns old +
+      raises, release restores, try always TRUE uncontended).
+      Required by the registered GPU callback `0x82181718`
+      (statically disassembled: source==1 branch uses
+      acquire/release). Unit-tested incl. nesting.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.
