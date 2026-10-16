@@ -419,6 +419,10 @@ Terminal states only: impossible, done, or something rendering.
       unimplemented like the reference), dst swizzle, maxA
       (address + max). NaN-quiet comparisons via an explicit
       `ge_quiet` helper. Unit-tested.
+- [x] ALU predication skip (`kernel::uint::eval_alu`, reference
+      per-instruction check): predicated-out ALU instructions skip
+      entirely before fetch/eval; accessors on `AluInstr`.
+      Unit-tested (skip + execute paths).
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

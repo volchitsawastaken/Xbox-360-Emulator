@@ -29,9 +29,9 @@
 //! pop/clr/rstr/kills_eq/gt/ge/ne/one/retain_prev plus the
 //! exp/logc/log/rcpc/rcpf/rcp/rsqc/rsqf/rsq/sqrt/sin/cos batch.
 //! Everything else is an explicit `Unsupported`, never a wrong
-//! result. Predication is driver business (the reference skips
-//! predicated instructions before evaluation); `eval_alu` executes
-//! unconditionally.
+//! result. `eval_alu` skips predicated-out instructions itself
+//! (reference per-instruction check); CF-level predication lives in
+//! the clause driver.
 
 use x360_common::{EmuError, Result};
 
@@ -227,9 +227,13 @@ fn d3d_mul(a: f32, b: f32) -> f32 {
 
 /// Evaluate one ALU clause instruction against the core, writing
 /// masked results (reference `ExecuteAluInstruction` vector op +
-/// scalar op + writeback; predicated-skip and exports excluded —
-/// exports are an explicit error, predication is the driver's).
+/// scalar op + writeback; exports are an explicit error).
+/// Predicated-out instructions skip entirely (reference
+/// per-instruction check ahead of evaluation).
 pub fn eval_alu(core: &mut ShaderCore, consts: &[[f32; 4]], ins: &AluInstr) -> Result<()> {
+    if ins.is_predicated() && ins.pred_condition() != core.predicate {
+        return Ok(());
+    }
     if ins.has_relative_addressing() {
         return Err(EmuError::Unsupported(
             "alu: relative addressing pending".into(),
@@ -991,5 +995,27 @@ mod tests {
         assert_eq!(core.previous_scalar, -1.0);
         eval_alu(&mut core, &[[0.0, 0.0, 0.0, -1.5]], &parse_alu(&op(13))).unwrap();
         assert_eq!(core.previous_scalar, -2.0);
+    }
+
+    #[test]
+    fn predicated_alu_skips() {
+        // add r1, r4, r5 with predicate required true, core false:
+        // skipped, temps and ps untouched.
+        let mut core = ShaderCore::default();
+        core.temps[4] = [1.0, 1.0, 1.0, 1.0];
+        core.temps[5] = [2.0, 2.0, 2.0, 2.0];
+        core.predicate = false;
+        // d1: is_predicated bit 28 + pred_condition bit 27.
+        let d = [
+            (1 & 0x3F) | ((0xF) << 16) | ((50 & 0x3F) << 26),
+            (1 << 28) | (1 << 27),
+            (4 << 16) | (5 << 8) | (1 << 31) | (1 << 30),
+        ];
+        eval_alu(&mut core, &[], &parse_alu(&d)).unwrap();
+        assert_eq!(core.temps[1], [0.0; 4]);
+        // Same with matching predicate: executes.
+        core.predicate = true;
+        eval_alu(&mut core, &[], &parse_alu(&d)).unwrap();
+        assert_eq!(core.temps[1], [3.0, 3.0, 3.0, 3.0]);
     }
 }
