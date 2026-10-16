@@ -278,6 +278,19 @@ Terminal states only: impossible, done, or something rendering.
 - [x] `dash_boot_steps` progress floor (HostDirFs, 1M steps
       fault-free, 59 imports, zero unimplemented — permanent gate):
       locks the 63-import Dash init path below the table-walk fault
+- [x] `XexGetProcedureAddress` (0x197, reference
+      `XexGetProcedureAddress_entry`): ordinal form mints a real
+      `sc; blr` thunk (deduped, heap-allocated, registered) so the
+      game calls it through normal dispatch — this is Braid's D3D
+      path (no static D3D imports; resolves `D3DDevice_*` at
+      runtime). Unknown ordinals zero the out pointer +
+      `ENTRYPOINT_NOT_FOUND` (0xC0000263); string form + executable
+      self-lookup are explicit `Unsupported`. Unit-tested incl.
+      thunk routing. `XexGetModuleSection` (0x196) validates handles
+      (`INVALID_HANDLE`/`INVALID_PARAMETER`) and reports
+      `UNSUCCESSFUL` until the XEX resource table is plumbed
+      (reference base-class behavior; Braid has 1 resource entry —
+      loader parsing pending).
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

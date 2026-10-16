@@ -77,6 +77,20 @@ impl ImportTable {
         self.imports.get(&thunk_addr)
     }
 
+    /// Register a dynamically minted import (see
+    /// `XexGetProcedureAddress`): same shape as `apply` records.
+    pub fn insert(&mut self, imp: ResolvedImport) {
+        self.imports.insert(imp.thunk_addr, imp);
+    }
+
+    /// Existing thunk for `(lib, ordinal)`, if any (dynamic-resolution
+    /// dedup: the same export resolves to the same address twice).
+    pub fn find(&self, lib: &str, ordinal: u16) -> Option<u32> {
+        self.imports
+            .iter()
+            .find_map(|(addr, r)| (r.lib == lib && r.ordinal == ordinal).then_some(*addr))
+    }
+
     /// Name for diagnostics (`None` when the ordinal is unknown).
     pub fn name_of(lib: &str, ordinal: u16) -> Option<&'static str> {
         ordinals::kernel_export_name(lib, ordinal)

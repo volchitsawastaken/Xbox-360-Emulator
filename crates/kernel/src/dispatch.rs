@@ -15,7 +15,7 @@ use x360_common::{EmuError, Result};
 use x360_cpu::regs::ThreadState;
 use x360_memory::Memory;
 
-use super::imports::{ImportTable, ResolvedImport};
+use super::imports::{ImportTable, ResolvedImport, THUNK_BLR, THUNK_NOP, THUNK_SC};
 use super::Kernel;
 
 // NTSTATUS codes (reference `xbox.h`).
@@ -32,6 +32,10 @@ pub const STATUS_INVALID_PARAMETER_3: u32 = 0xC000_00F1;
 pub const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_PENDING: u32 = 0x0000_0103;
+/// `XexGetProcedureAddress` miss (reference `xbox.h`
+/// `X_STATUS_DRIVER_ENTRYPOINT_NOT_FOUND`): the module is valid but
+/// the ordinal is not exported. The out pointer still gets zeroed.
+pub const STATUS_DRIVER_ENTRYPOINT_NOT_FOUND: u32 = 0xC000_0263;
 // Win32-flavored errors for module APIs (reference `xbox.h`).
 pub const ERROR_SUCCESS: u32 = 0x0000_0000;
 pub const ERROR_NOT_FOUND: u32 = 0x0000_0490;
@@ -697,6 +701,12 @@ pub fn dispatch_import(
         (Lib::Xboxkrnl, 0x12A) => rtl_get_stack_limits(kernel, mem, arg(t, 0), arg(t, 1), t),
         (Lib::Xboxkrnl, 0x135) => rtl_nt_status_to_dos_error(arg(t, 0), t),
         (Lib::Xboxkrnl, 0x195) => xex_get_module_handle(kernel, mem, arg(t, 0), arg(t, 1), t),
+        (Lib::Xboxkrnl, 0x196) => {
+            xex_get_module_section(kernel, mem, arg(t, 0), arg(t, 1), arg(t, 2), arg(t, 3), t)
+        }
+        (Lib::Xboxkrnl, 0x197) => {
+            xex_get_procedure_address(kernel, mem, table, arg(t, 0), arg(t, 1), arg(t, 2), t)
+        }
         (Lib::Xboxkrnl, 0x194) => xex_check_privilege(kernel, arg(t, 0), t),
         (Lib::Xboxkrnl, 0x03) => {
             let fmt = read_cstr(mem, arg(t, 0)).unwrap_or_default();
@@ -3394,8 +3404,6 @@ fn xex_get_module_handle(
     // Opaque pseudo-handles for the two linked system modules; the
     // only valid use sites (GetModuleSection/GetProcedureAddress)
     // validate them explicitly.
-    const XAM_HANDLE: u32 = 0x9000_0001;
-    const XRNL_HANDLE: u32 = 0x9000_0002;
     if want == "xam.xex" {
         mem.write_u32(out_ptr, XAM_HANDLE)?;
         t.gpr[3] = (ERROR_SUCCESS) as u64;
@@ -3406,6 +3414,143 @@ fn xex_get_module_handle(
         mem.write_u32(out_ptr, 0)?;
         t.gpr[3] = (ERROR_NOT_FOUND) as u64;
     }
+    Ok(())
+}
+
+/// Opaque module handles minted by `xex_get_module_handle`
+/// (reference `XModule::GetFromHModule` handle objects; we keep the
+/// two linked system modules plus the executable).
+pub const XAM_HANDLE: u32 = 0x9000_0001;
+pub const XRNL_HANDLE: u32 = 0x9000_0002;
+
+/// Which module a `XexGet*` handle names (reference
+/// `XModule::GetFromHModule`; null names the executable, exactly
+/// like `XexGetProcedureAddress_entry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XexModule {
+    Executable,
+    Xam,
+    Xboxkrnl,
+}
+
+fn resolve_xex_module(kernel: &Kernel, hmodule: u32) -> Option<XexModule> {
+    if hmodule == 0 || hmodule == kernel.image_base {
+        Some(XexModule::Executable)
+    } else if hmodule == XAM_HANDLE {
+        Some(XexModule::Xam)
+    } else if hmodule == XRNL_HANDLE {
+        Some(XexModule::Xboxkrnl)
+    } else {
+        None
+    }
+}
+
+/// `XexGetModuleSection(hmodule, name, data_ptr, size_ptr)`
+/// (reference `XexGetModuleSection_entry` + `XModule::GetSection`).
+/// Bad handles are `INVALID_HANDLE`; null out pointers are
+/// `INVALID_PARAMETER`. Section data itself needs the XEX resource
+/// table (pending loader work); until then every valid module
+/// reports `UNSUCCESSFUL`, exactly like the reference base-class
+/// `GetSection` with no table. Never a fabricated pointer.
+fn xex_get_module_section(
+    kernel: &Kernel,
+    _mem: &mut Memory,
+    hmodule: u32,
+    name_ptr: u32,
+    data_ptr: u32,
+    size_ptr: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    if resolve_xex_module(kernel, hmodule).is_none() {
+        t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
+        return Ok(());
+    }
+    if name_ptr == 0 || data_ptr == 0 || size_ptr == 0 {
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
+        return Ok(());
+    }
+    // Reference `XModule::GetSection`: no table, no section.
+    const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+    t.gpr[3] = (STATUS_UNSUCCESSFUL) as u64;
+    Ok(())
+}
+
+/// `XexGetProcedureAddress(hmodule, ordinal, out_ptr)` (reference
+/// `XexGetProcedureAddress_entry`). Ordinal form only: the high bit
+/// pattern names a guest string in the reference, and kernel-module
+/// by-name lookup has no table here yet (explicit `Unsupported`,
+/// never a wrong address). A known system ordinal mints a real
+/// `sc; blr` thunk registered in `table`, so the game calls it
+/// through the normal dispatch path (implemented shims run; the
+/// rest report `Unsupported` naming the function). Unknown ordinals
+/// zero the out pointer and return `DRIVER_ENTRYPOINT_NOT_FOUND`,
+/// exactly like the reference miss path. Null module = executable;
+/// the game has no export table here yet (explicit `Unsupported`).
+#[allow(clippy::too_many_arguments)]
+fn xex_get_procedure_address(
+    kernel: &mut Kernel,
+    mem: &mut Memory,
+    table: &mut ImportTable,
+    hmodule: u32,
+    ordinal: u32,
+    out_ptr: u32,
+    t: &mut ThreadState,
+) -> Result<()> {
+    if out_ptr == 0 {
+        t.gpr[3] = (STATUS_INVALID_PARAMETER) as u64;
+        return Ok(());
+    }
+    let module = match resolve_xex_module(kernel, hmodule) {
+        Some(m) => m,
+        None => {
+            t.gpr[3] = (STATUS_INVALID_HANDLE) as u64;
+            return Ok(());
+        }
+    };
+    if ordinal & 0xFFFF_0000 != 0 {
+        return Err(EmuError::Unsupported(format!(
+            "XexGetProcedureAddress by name {:08x} (no name table)",
+            ordinal
+        )));
+    }
+    let (lib, ord) = match module {
+        XexModule::Executable => {
+            return Err(EmuError::Unsupported(
+                "XexGetProcedureAddress on the executable (no game export table)".into(),
+            ));
+        }
+        XexModule::Xam => ("xam.xex", ordinal as u16),
+        XexModule::Xboxkrnl => ("xboxkrnl.exe", ordinal as u16),
+    };
+    if ImportTable::name_of(lib, ord).is_none() {
+        mem.write_u32(out_ptr, 0)?;
+        t.gpr[3] = (STATUS_DRIVER_ENTRYPOINT_NOT_FOUND) as u64;
+        return Ok(());
+    }
+    if let Some(addr) = table.find(lib, ord) {
+        mem.write_u32(out_ptr, addr)?;
+        t.gpr[3] = (ERROR_SUCCESS) as u64;
+        return Ok(());
+    }
+    let addr = kernel.alloc_mem(16, 16)?;
+    mem.write_u32(addr, THUNK_SC)?;
+    mem.write_u32(addr.wrapping_add(4), THUNK_BLR)?;
+    mem.write_u32(addr.wrapping_add(8), THUNK_NOP)?;
+    mem.write_u32(addr.wrapping_add(12), THUNK_NOP)?;
+    table.insert(ResolvedImport {
+        lib: lib.to_string(),
+        ordinal: ord,
+        kind: crate::imports::ImportKind::Function,
+        thunk_addr: addr,
+    });
+    mem.write_u32(out_ptr, addr)?;
+    log::info!(
+        "kernel: XexGetProcedureAddress {}!{} -> thunk {:08x}",
+        lib,
+        ImportTable::name_of(lib, ord).unwrap_or("?"),
+        addr
+    );
+    t.gpr[3] = (ERROR_SUCCESS) as u64;
     Ok(())
 }
 
@@ -3426,6 +3571,98 @@ mod tests {
             kind: crate::imports::ImportKind::Function,
             thunk_addr: 0x8200_2000,
         }
+    }
+
+    #[test]
+    fn xex_get_procedure_address_mints_thunks() {
+        let mut k = Kernel::new();
+        k.set_module_info(0x8200_0000, 0x1000, 0x5841_08CE);
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let out = 0x0115_5000;
+        let proc = imp("xboxkrnl.exe", 0x197);
+        // Known xam D3D ordinal: SUCCESS + a real sc;blr thunk.
+        t.gpr[3] = XAM_HANDLE as u64;
+        t.gpr[4] = 0x89A;
+        t.gpr[5] = out as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &proc).unwrap();
+        assert_eq!(t.gpr[3] as u32, ERROR_SUCCESS);
+        let thunk = m.read_u32(out).unwrap();
+        assert_ne!(thunk, 0);
+        assert_eq!(m.read_u32(thunk).unwrap(), 0x4400_0042);
+        assert_eq!(m.read_u32(thunk + 4).unwrap(), 0x4E80_0020);
+        // Same ordinal twice → same thunk (dedup, like the reference).
+        t.gpr[3] = XAM_HANDLE as u64;
+        t.gpr[4] = 0x89A;
+        t.gpr[5] = out as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &proc).unwrap();
+        assert_eq!(m.read_u32(out).unwrap(), thunk);
+        // The minted thunk routes through normal dispatch (here: an
+        // explicit Unsupported naming the D3D function, never silent).
+        let minted = tab.get(thunk).cloned().unwrap();
+        assert_eq!(minted.ordinal, 0x89A);
+        let err = dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &minted).unwrap_err();
+        assert!(err.to_string().contains("D3DDevice_CreateTexture"));
+        // Unknown ordinal: zeroed out pointer + ENTRYPOINT_NOT_FOUND.
+        t.gpr[3] = XAM_HANDLE as u64;
+        t.gpr[4] = 0x7777;
+        t.gpr[5] = out as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &proc).unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_DRIVER_ENTRYPOINT_NOT_FOUND);
+        assert_eq!(m.read_u32(out).unwrap(), 0);
+        // Bad handle and null out pointer are plain statuses.
+        t.gpr[3] = 0xDEAD_0000;
+        t.gpr[4] = 0x89A;
+        t.gpr[5] = out as u64;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &proc).unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
+        t.gpr[3] = XAM_HANDLE as u64;
+        t.gpr[4] = 0x89A;
+        t.gpr[5] = 0;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &proc).unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_PARAMETER);
+        // String-name form and the executable's own table are honest
+        // Unsupported, never wrong addresses.
+        t.gpr[3] = XAM_HANDLE as u64;
+        t.gpr[4] = 0x0115_6000;
+        t.gpr[5] = out as u64;
+        assert!(dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &proc).is_err());
+        t.gpr[3] = 0;
+        t.gpr[4] = 0x89A;
+        t.gpr[5] = out as u64;
+        assert!(dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &proc).is_err());
+    }
+
+    #[test]
+    fn xex_get_module_section_validates() {
+        let mut k = Kernel::new();
+        k.set_module_info(0x8200_0000, 0x1000, 0x5841_08CE);
+        let mut m = Memory::new();
+        let mut tab = ImportTable::new();
+        let mut t = thread();
+        let sec = imp("xboxkrnl.exe", 0x196);
+        // Bad handle and null pointers are plain statuses.
+        t.gpr[3] = 0xDEAD_0000;
+        t.gpr[4] = 0x0115_6000;
+        t.gpr[5] = 0x0115_6100;
+        t.gpr[6] = 0x0115_6104;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_HANDLE);
+        t.gpr[3] = 0;
+        t.gpr[4] = 0x0115_6000;
+        t.gpr[5] = 0;
+        t.gpr[6] = 0x0115_6104;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
+        assert_eq!(t.gpr[3] as u32, STATUS_INVALID_PARAMETER);
+        // Valid module, no resource table yet: UNSUCCESSFUL like the
+        // reference base class — never a fabricated pointer.
+        t.gpr[3] = 0;
+        t.gpr[4] = 0x0115_6000;
+        t.gpr[5] = 0x0115_6100;
+        t.gpr[6] = 0x0115_6104;
+        dispatch_import(&mut k, &mut m, &mut tab, 0, &mut t, &sec).unwrap();
+        assert_eq!(t.gpr[3] as u32, 0xC000_0001);
     }
 
     #[test]
