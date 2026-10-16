@@ -347,6 +347,19 @@ Terminal states only: impossible, done, or something rendering.
       Required by the registered GPU callback `0x82181718`
       (statically disassembled: source==1 branch uses
       acquire/release). Unit-tested incl. nesting.
+- [x] Free-running vblank (reference `graphics_system.cc`
+      frame-limiter worker + `MarkVblank`): real CRTCs raise
+      vblank on display timing with no swap yet, and Xenia beats
+      `(0, 2)` on a timer for the same reason. `pump_gpu` beats
+      every 16ms wall-time once the ring exists and a callback is
+      registered (counter bump + queued `(0, 2)` through the
+      existing delivery path; single-threaded, no host threads).
+      Retail Braid takes ~150 real deliveries per boot with no
+      crash (delivery-path robustness proof) but does NOT advance:
+      the callback's source-0 path doesn't touch the waited
+      events (spinlocks live behind the source==1 branch, which
+      needs genuine GPU completion the game never submits
+      pre-device). Faithful subsystem, honest negative result.
 - [x] Kernel shims on demand: NO current demand — both retail gates
       (`retail_braid_steps` 2M, `dash_boot_steps` 1M) assert zero
       unimplemented imports; every called import is implemented.

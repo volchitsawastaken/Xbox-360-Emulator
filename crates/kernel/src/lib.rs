@@ -152,6 +152,13 @@ pub struct Kernel {
     /// yet, but each present queues the vblank interrupt exactly like
     /// reference `MarkVblank`).
     pub vd_swaps: u64,
+    /// Free-running vblank beats since display init (reference
+    /// `GraphicsSystem::MarkVblank` counter). Advanced by the
+    /// frame-pacing path below, even with no swap yet.
+    pub vd_vblank_count: u64,
+    /// Last beat timestamp for frame pacing (multi-turn display
+    /// timing without host threads).
+    vd_last_vblank: Option<std::time::Instant>,
     /// System command-buffer GPU identifier address (reference
     /// `VdSetSystemCommandBufferGpuIdentifierAddress`).
     pub vd_gpu_identifier: Option<u32>,
@@ -357,6 +364,8 @@ impl Kernel {
             vd_ps_ucode: Vec::new(),
             vd_edram: vec![0; crate::gpu::EDRAM_SIZE],
             vd_swaps: 0,
+            vd_vblank_count: 0,
+            vd_last_vblank: None,
             vd_gpu_identifier: None,
             vd_studio_rgb: None,
             image_base: 0,
@@ -633,6 +642,9 @@ impl Kernel {
             Some(v) => v,
             None => return Ok(()),
         };
+        // Display timing free-runs whether or not the game kicked
+        // work (CRTC beats on wall time, not on kicks).
+        self.maybe_vblank();
         const WPTR_MMIO: u32 = x360_memory::MMIO_BASE + 0x01C5 * 4;
         let wptr = mem.read_u32(WPTR_MMIO)?;
         if wptr == 0xBAAD_F00D || wptr == self.vd_wptr_seen {
@@ -650,6 +662,36 @@ impl Kernel {
             }
         }
         Ok(())
+    }
+
+    /// Frame pacing without host threads (reference
+    /// `graphics_system.cc` frame-limiter worker + `MarkVblank`):
+    /// real display hardware raises vblank on CRTC timing whether or
+    /// not the game has swapped yet, and Xenia beats `(0, 2)` on a
+    /// 1ms/vsync timer for the same reason. Once the ring exists
+    /// (GPU initialized) and a callback is registered, beat every
+    /// 16ms of wall time: bump the vblank counter and queue the
+    /// interrupt for boot-runner delivery. No callback, no beats
+    /// (unobservable); first call only arms the timer. Genuine
+    /// completions, never synthesized game state.
+    fn maybe_vblank(&mut self) {
+        if self.vd_interrupt.is_none() {
+            return;
+        }
+        const PERIOD: std::time::Duration = std::time::Duration::from_millis(16);
+        let now = std::time::Instant::now();
+        match self.vd_last_vblank {
+            None => {
+                self.vd_last_vblank = Some(now);
+            }
+            Some(last) => {
+                if now.duration_since(last) >= PERIOD {
+                    self.vd_last_vblank = Some(now);
+                    self.vd_vblank_count = self.vd_vblank_count.wrapping_add(1);
+                    self.vd_irq_pending.push_back((0, 2));
+                }
+            }
+        }
     }
 
     /// Release a tracked range. Memory is left as-is (no reuse).
@@ -1612,6 +1654,39 @@ mod tests {
         assert_eq!(k.take_pending_spawns().len(), 5);
         assert!(k.take_pending_spawns().is_empty());
     }
+    #[test]
+    fn vblank_beats_only_with_ring_and_callback() {
+        use std::time::{Duration, Instant};
+        use x360_memory::Memory;
+        let mut k = Kernel::new();
+        let mut m = Memory::new();
+        // No ring: silent, timer never arms.
+        k.vd_interrupt = Some((0x8218_1718, 0));
+        k.pump_gpu(&mut m).unwrap();
+        assert!(k.vd_irq_pending.is_empty());
+        assert_eq!(k.vd_vblank_count, 0);
+        assert!(k.vd_last_vblank.is_none());
+        // Ring but no callback: silent.
+        k.vd_interrupt = None;
+        k.vd_ring = Some((0x0110_0000, 20));
+        k.pump_gpu(&mut m).unwrap();
+        assert!(k.vd_irq_pending.is_empty());
+        // Callback, first beat only arms.
+        k.vd_interrupt = Some((0x8218_1718, 0));
+        k.pump_gpu(&mut m).unwrap();
+        assert!(k.vd_irq_pending.is_empty());
+        assert!(k.vd_last_vblank.is_some());
+        // Fresh beat: nothing queued.
+        k.pump_gpu(&mut m).unwrap();
+        assert!(k.vd_irq_pending.is_empty());
+        // Stale beat: counter bumps and (0, 2) queues.
+        k.vd_last_vblank = Some(Instant::now() - Duration::from_millis(100));
+        k.pump_gpu(&mut m).unwrap();
+        assert_eq!(k.vd_vblank_count, 1);
+        assert_eq!(k.vd_irq_pending.len(), 1);
+        assert_eq!(k.vd_irq_pending[0], (0, 2));
+    }
+
     #[test]
     fn gpu_pump_retires_kicks() {
         use x360_memory::{Memory, MMIO_BASE};
